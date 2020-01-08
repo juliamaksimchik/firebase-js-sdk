@@ -32,8 +32,7 @@ export interface Settings {
 }
 
 export interface PersistenceSettings {
-  synchronizeTabs?: boolean;
-  experimentalTabSynchronization?: boolean;
+  synchronizeTabs?: boolean
 }
 
 export type LogLevel = 'debug' | 'error' | 'silent';
@@ -51,8 +50,6 @@ export class FirebaseFirestore {
 
   settings(settings: Settings): void;
 
-  enablePersistence(settings?: PersistenceSettings): Promise<void>;
-
   collection(collectionPath: string): CollectionReference<DocumentData>;
 
   doc(documentPath: string): DocumentReference<DocumentData>;
@@ -66,8 +63,6 @@ export class FirebaseFirestore {
   batch(): WriteBatch;
 
   app: any;
-
-  clearPersistence(): Promise<void>;
 
   enableNetwork(): Promise<void>;
 
@@ -86,6 +81,10 @@ export class FirebaseFirestore {
 
   INTERNAL: { delete: () => Promise<void> };
 }
+
+export function enablePersistence(firestore: FirebaseFirestore, settings?: PersistenceSettings) : Promise<void>;
+
+export function clearPersistence(firestore: FirebaseFirestore) : Promise<void>;
 
 export class GeoPoint {
   constructor(latitude: number, longitude: number);
