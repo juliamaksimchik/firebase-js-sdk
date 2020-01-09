@@ -17,6 +17,10 @@
 
 import * as firestore from '@firebase/firestore-types';
 import firebase from './firebase_export';
+import {
+  clearPersistence,
+  enablePersistence
+} from '../../../src/api/persistence';
 /**
  * NOTE: These helpers are used by api/ tests and therefore may not have any
  * dependencies on src/ files.
@@ -219,7 +223,7 @@ export async function withTestDbsSettings(
 
     let ready: Promise<firestore.FirebaseFirestore>;
     if (persistence) {
-      ready = firestore.enablePersistence().then(() => firestore);
+      ready = enablePersistence(firestore).then(() => firestore);
     } else {
       ready = Promise.resolve(firestore);
     }
@@ -235,7 +239,7 @@ export async function withTestDbsSettings(
     await wipeDb(dbs[0]);
     for (const db of dbs) {
       await db.terminate();
-      await db.clearPersistence();
+      await clearPersistence(db);
     }
   }
 }

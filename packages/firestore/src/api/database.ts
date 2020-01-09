@@ -23,8 +23,8 @@ import { DatabaseId, DatabaseInfo } from '../core/database_info';
 import { ListenOptions } from '../core/event_manager';
 import {
   FirestoreClient,
-  InternalPersistenceSettings,
-  MemoryPersistenceSettings
+  PersistenceFactory,
+  startMemoryPersistence
 } from '../core/firestore_client';
 import {
   Bound,
@@ -104,6 +104,7 @@ import {
 } from './user_data_converter';
 import { FirebaseAuthInternalName } from '@firebase/auth-interop-types';
 import { Provider } from '@firebase/component';
+import { Persistence } from '../local/persistence';
 
 // settings() defaults:
 const DEFAULT_HOST = 'firestore.googleapis.com';
@@ -288,7 +289,8 @@ export class Firestore implements firestore.FirebaseFirestore, FirebaseService {
   private readonly _persistenceKey: string;
   private _credentials: CredentialsProvider;
   private readonly _firebaseApp: FirebaseApp | null = null;
-  private _settings: FirestoreSettings;
+  _settings: FirestoreSettings;
+  _configured = false;
 
   // The firestore client instance. This will be available as soon as
   // configureClient is called, but any calls against it will block until
@@ -431,7 +433,7 @@ export class Firestore implements firestore.FirebaseFirestore, FirebaseService {
     if (!this._firestoreClient) {
       // Kick off starting the client but don't actually wait for it.
       // eslint-disable-next-line @typescript-eslint/no-floating-promises
-      this.configureClient(new MemoryPersistenceSettings());
+      this._configureClient(startMemoryPersistence);
     }
     return this._firestoreClient as FirestoreClient;
   }
@@ -446,23 +448,18 @@ export class Firestore implements firestore.FirebaseFirestore, FirebaseService {
     );
   }
 
-  private configureClient(
-    persistenceSettings: InternalPersistenceSettings
-  ): Promise<void> {
+  _configureClient(persistenceFactory: PersistenceFactory): Promise<void> {
     assert(!!this._settings.host, 'FirestoreSettings.host is not set');
-
     assert(!this._firestoreClient, 'configureClient() called multiple times');
 
     const databaseInfo = this.makeDatabaseInfo();
-
     this._firestoreClient = new FirestoreClient(
       PlatformSupport.getPlatform(),
       databaseInfo,
       this._credentials,
       this._queue
     );
-
-    return this._firestoreClient.start(persistenceSettings);
+    return this._firestoreClient.start(persistenceFactory);
   }
 
   private createDataConverter(databaseId: DatabaseId): UserDataConverter {
