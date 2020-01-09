@@ -82,9 +82,7 @@ async function startIndexedDbPersistence(
     useProto3Json: true
   });
 
-  if (
-    !WebStorageSharedClientState.isAvailable(platform)
-  ) {
+  if (!WebStorageSharedClientState.isAvailable(platform)) {
     throw new FirestoreError(
       Code.UNIMPLEMENTED,
       'IndexedDB persistence is only available on platforms that support LocalStorage.'
@@ -228,28 +226,28 @@ export function enablePersistence(
   firestore._configureClient(persistenceWithFallback);
   return persistenceResult.promise;
 }
-//
-// export function clearPersistence(firestore: Firestore): Promise<void> {
-//   const persistenceKey = IndexedDbPersistence.buildStoragePrefix(
-//     this.makeDatabaseInfo()
-//   );
-// const deferred = new Deferred<void>();
-// this._queue.enqueueAndForgetEvenAfterShutdown(async () => {
-//   try {
-//     if (
-//       this._firestoreClient !== undefined &&
-//       !this._firestoreClient.clientTerminated
-//     ) {
-//       throw new FirestoreError(
-//         Code.FAILED_PRECONDITION,
-//         'Persistence cannot be cleared after this Firestore instance is initialized.'
-//       );
-//     }
-//     await IndexedDbPersistence.clearPersistence(persistenceKey);
-//     deferred.resolve();
-//   } catch (e) {
-//     deferred.reject(e);
-//   }
-// });
-// return deferred.promise;
-// }
+
+export function clearPersistence(firestore: Firestore): Promise<void> {
+  const persistenceKey = IndexedDbPersistence.buildStoragePrefix(
+    firestore.makeDatabaseInfo()
+  );
+  const deferred = new Deferred<void>();
+  firestore._queue.enqueueAndForgetEvenAfterShutdown(async () => {
+    try {
+      if (
+        firestore._firestoreClient !== undefined &&
+        !firestore._firestoreClient.clientTerminated
+      ) {
+        throw new FirestoreError(
+          Code.FAILED_PRECONDITION,
+          'Persistence cannot be cleared after this Firestore instance is initialized.'
+        );
+      }
+      await IndexedDbPersistence.clearPersistence(persistenceKey);
+      deferred.resolve();
+    } catch (e) {
+      deferred.reject(e);
+    }
+  });
+  return deferred.promise;
+}
