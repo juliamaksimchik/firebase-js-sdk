@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,41 +15,43 @@
  * limitations under the License.
  */
 
-import { SnapshotVersion } from '../../../src/core/snapshot_version';
-import { QueryEngine } from '../../../src/local/query_engine';
-import { LocalDocumentsView } from '../../../src/local/local_documents_view';
-import { PersistenceTransaction } from '../../../src/local/persistence';
 import { Query } from '../../../src/core/query';
+import { SnapshotVersion } from '../../../src/core/snapshot_version';
+import { DocumentOverlayCache } from '../../../src/local/document_overlay_cache';
+import { IndexManager } from '../../../src/local/index_manager';
+import { LocalDocumentsView } from '../../../src/local/local_documents_view';
 import { PersistencePromise } from '../../../src/local/persistence_promise';
+import { PersistenceTransaction } from '../../../src/local/persistence_transaction';
+import { QueryEngine } from '../../../src/local/query_engine';
 import { RemoteDocumentCache } from '../../../src/local/remote_document_cache';
-import { MutationQueue } from '../../../src/local/mutation_queue';
 import { DocumentKeySet, DocumentMap } from '../../../src/model/collections';
+import { MutationType } from '../../../src/model/mutation';
 
 /**
  * A test-only query engine that forwards all API calls and exposes the number
  * of documents and mutations read.
  */
-export class CountingQueryEngine implements QueryEngine {
+export class CountingQueryEngine extends QueryEngine {
   /**
-   * The number of mutations returned by the MutationQueue's
-   * `getAllMutationBatchesAffectingQuery()` API (since the last call to
+   * The number of overlays returned by the DocumentOverlayCache's
+   * `getOverlaysByCollection(Group)` API (since the last call to
    * `resetCounts()`)
    */
-  mutationsReadByQuery = 0;
+  overlaysReadByCollection = 0;
 
   /**
-   * The number of mutations returned by the MutationQueue's
-   * `getAllMutationBatchesAffectingDocumentKey()` and
-   * `getAllMutationBatchesAffectingDocumentKeys()` APIs (since the last call
-   * to `resetCounts()`)
+   * The number of overlays returned by the DocumentOverlayCache's
+   * `getOverlay(s)` APIs (since the last call to `resetCounts()`)
    */
-  mutationsReadByKey = 0;
+  overlaysReadByKey = 0;
+
+  overlayTypes: { [k: string]: MutationType } = {};
 
   /**
    * The number of documents returned by the RemoteDocumentCache's
-   * `getDocumentsMatchingQuery()` API (since the last call to `resetCounts()`)
+   * `getAll()` API (since the last call to `resetCounts()`).
    */
-  documentsReadByQuery = 0;
+  documentsReadByCollection = 0;
 
   /**
    * The number of documents returned by the RemoteDocumentCache's `getEntry()`
@@ -57,12 +59,11 @@ export class CountingQueryEngine implements QueryEngine {
    */
   documentsReadByKey = 0;
 
-  constructor(private readonly queryEngine: QueryEngine) {}
-
   resetCounts(): void {
-    this.mutationsReadByQuery = 0;
-    this.mutationsReadByKey = 0;
-    this.documentsReadByQuery = 0;
+    this.overlaysReadByCollection = 0;
+    this.overlaysReadByKey = 0;
+    this.overlayTypes = {};
+    this.documentsReadByCollection = 0;
     this.documentsReadByKey = 0;
   }
 
@@ -72,7 +73,7 @@ export class CountingQueryEngine implements QueryEngine {
     lastLimboFreeSnapshotVersion: SnapshotVersion,
     remoteKeys: DocumentKeySet
   ): PersistencePromise<DocumentMap> {
-    return this.queryEngine.getDocumentsMatchingQuery(
+    return super.getDocumentsMatchingQuery(
       transaction,
       query,
       lastLimboFreeSnapshotVersion,
@@ -80,95 +81,154 @@ export class CountingQueryEngine implements QueryEngine {
     );
   }
 
-  setLocalDocumentsView(localDocuments: LocalDocumentsView): void {
+  initialize(
+    localDocuments: LocalDocumentsView,
+    indexManager: IndexManager
+  ): void {
     const view = new LocalDocumentsView(
       this.wrapRemoteDocumentCache(localDocuments.remoteDocumentCache),
-      this.wrapMutationQueue(localDocuments.mutationQueue),
+      localDocuments.mutationQueue,
+      this.wrapOverlayCache(localDocuments.documentOverlayCache),
       localDocuments.indexManager
     );
-
-    return this.queryEngine.setLocalDocumentsView(view);
+    return super.initialize(view, indexManager);
   }
 
   private wrapRemoteDocumentCache(
     subject: RemoteDocumentCache
   ): RemoteDocumentCache {
     return {
-      getDocumentsMatchingQuery: (transaction, query, sinceReadTime) => {
+      setIndexManager: (indexManager: IndexManager) => {
+        subject.setIndexManager(indexManager);
+      },
+      getDocumentsMatchingQuery: (
+        transaction,
+        query,
+        sinceReadTime,
+        overlays,
+        context
+      ) => {
         return subject
-          .getDocumentsMatchingQuery(transaction, query, sinceReadTime)
+          .getDocumentsMatchingQuery(
+            transaction,
+            query,
+            sinceReadTime,
+            overlays,
+            context
+          )
           .next(result => {
-            this.documentsReadByQuery += result.size;
+            this.documentsReadByCollection += result.size;
+            return result;
+          });
+      },
+      getAllFromCollectionGroup: (
+        transaction,
+        collectionGroup,
+        sinceReadTime,
+        limit
+      ) => {
+        return subject
+          .getAllFromCollectionGroup(
+            transaction,
+            collectionGroup,
+            sinceReadTime,
+            limit
+          )
+          .next(result => {
+            this.documentsReadByCollection += result.size;
             return result;
           });
       },
       getEntries: (transaction, documentKeys) => {
         return subject.getEntries(transaction, documentKeys).next(result => {
-          this.documentsReadByKey += result.size;
+          result.forEach((key, doc) => {
+            if (doc.isValidDocument()) {
+              this.documentsReadByKey++;
+            }
+          });
           return result;
         });
       },
       getEntry: (transaction, documentKey) => {
         return subject.getEntry(transaction, documentKey).next(result => {
-          this.documentsReadByKey += result ? 1 : 0;
+          this.documentsReadByKey += result?.isValidDocument() ? 1 : 0;
           return result;
         });
       },
-      getNewDocumentChanges: subject.getNewDocumentChanges,
-      getLastReadTime: subject.getLastReadTime,
       getSize: subject.getSize,
       newChangeBuffer: subject.newChangeBuffer
     };
   }
 
-  private wrapMutationQueue(subject: MutationQueue): MutationQueue {
+  private wrapOverlayCache(
+    subject: DocumentOverlayCache
+  ): DocumentOverlayCache {
     return {
-      acknowledgeBatch: subject.acknowledgeBatch,
-      addMutationBatch: subject.addMutationBatch,
-      checkEmpty: subject.checkEmpty,
-      getAllMutationBatches: transaction => {
-        return subject.getAllMutationBatches(transaction).next(result => {
-          this.mutationsReadByKey += result.length;
+      getOverlay: (transaction, key) => {
+        return subject.getOverlay(transaction, key).next(result => {
+          this.overlaysReadByKey += 1;
+          if (!!result) {
+            this.overlayTypes[key.toString()] = result.mutation.type;
+          }
           return result;
         });
       },
-      getAllMutationBatchesAffectingDocumentKey: (transaction, documentKey) => {
+
+      getOverlays: (transaction, keys) => {
+        return subject.getOverlays(transaction, keys).next(result => {
+          this.overlaysReadByKey += keys.length;
+          result.forEach((key, overlay) => {
+            this.overlayTypes[key.toString()] = overlay.mutation.type;
+          });
+          return result;
+        });
+      },
+
+      getOverlaysForCollection: (transaction, collection, sinceBatchId) => {
         return subject
-          .getAllMutationBatchesAffectingDocumentKey(transaction, documentKey)
+          .getOverlaysForCollection(transaction, collection, sinceBatchId)
           .next(result => {
-            this.mutationsReadByKey += result.length;
+            this.overlaysReadByCollection += result.size();
+            result.forEach((key, overlay) => {
+              this.overlayTypes[key.toString()] = overlay.mutation.type;
+            });
             return result;
           });
       },
-      getAllMutationBatchesAffectingDocumentKeys: (
-        transaction,
-        documentKeys
+
+      getOverlaysForCollectionGroup: (
+        transaction: PersistenceTransaction,
+        collectionGroup: string,
+        sinceBatchId: number,
+        count: number
       ) => {
         return subject
-          .getAllMutationBatchesAffectingDocumentKeys(transaction, documentKeys)
+          .getOverlaysForCollectionGroup(
+            transaction,
+            collectionGroup,
+            sinceBatchId,
+            count
+          )
           .next(result => {
-            this.mutationsReadByKey += result.length;
+            this.overlaysReadByCollection += result.size();
+            result.forEach((key, overlay) => {
+              this.overlayTypes[key.toString()] = overlay.mutation.type;
+            });
             return result;
           });
       },
-      getAllMutationBatchesAffectingQuery: (transaction, query) => {
-        return subject
-          .getAllMutationBatchesAffectingQuery(transaction, query)
-          .next(result => {
-            this.mutationsReadByQuery += result.length;
-            return result;
-          });
+
+      saveOverlays: (transaction, largestBatchId, overlays) => {
+        return subject.saveOverlays(transaction, largestBatchId, overlays);
       },
-      getHighestUnacknowledgedBatchId: subject.getHighestUnacknowledgedBatchId,
-      getLastStreamToken: subject.getLastStreamToken,
-      getNextMutationBatchAfterBatchId:
-        subject.getNextMutationBatchAfterBatchId,
-      lookupMutationBatch: subject.lookupMutationBatch,
-      lookupMutationKeys: subject.lookupMutationKeys,
-      performConsistencyCheck: subject.performConsistencyCheck,
-      removeCachedMutationKeys: subject.removeCachedMutationKeys,
-      removeMutationBatch: subject.removeMutationBatch,
-      setLastStreamToken: subject.setLastStreamToken
+
+      removeOverlaysForBatchId: (transaction, documentKeys, batchId) => {
+        return subject.removeOverlaysForBatchId(
+          transaction,
+          documentKeys,
+          batchId
+        );
+      }
     };
   }
 }

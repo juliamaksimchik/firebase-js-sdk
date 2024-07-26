@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,39 +15,68 @@
  * limitations under the License.
  */
 
-import { FirebaseApp } from '@firebase/app-types';
-import { FirebaseInstallations } from '@firebase/installations-types';
+import { FirebaseApp, initializeApp, _registerComponent } from '@firebase/app';
+import { Component, ComponentType } from '@firebase/component';
+import { _FirebaseInstallationsInternal } from '@firebase/installations';
+import { AnalyticsService } from '../src/factory';
 
-export function getFakeApp(measurementId?: string): FirebaseApp {
+const fakeConfig = {
+  projectId: 'projectId',
+  authDomain: 'authDomain',
+  messagingSenderId: 'messagingSenderId',
+  databaseURL: 'databaseUrl',
+  storageBucket: 'storageBucket'
+};
+
+export function getFakeApp(fakeAppParams?: {
+  appId?: string;
+  apiKey?: string;
+  measurementId?: string;
+}): FirebaseApp {
   return {
     name: 'appName',
-    options: {
-      apiKey: 'apiKey',
-      projectId: 'projectId',
-      authDomain: 'authDomain',
-      messagingSenderId: 'messagingSenderId',
-      databaseURL: 'databaseUrl',
-      storageBucket: 'storageBucket',
-      appId: '1:777777777777:web:d93b5ca1475efe57',
-      measurementId
-    },
-    automaticDataCollectionEnabled: true,
-    delete: async () => {},
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    installations: null as any,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    analytics: null as any
+    options: { ...fakeConfig, ...fakeAppParams },
+    automaticDataCollectionEnabled: true
   };
 }
 
 export function getFakeInstallations(
   fid: string = 'fid-1234',
+  // eslint-disable-next-line @typescript-eslint/ban-types
   onFidResolve?: Function
-): FirebaseInstallations {
+): _FirebaseInstallationsInternal {
   return {
-    getId: async () => { onFidResolve && onFidResolve(); return fid; },
-    getToken: async () => 'authToken',
-    onIdChange: () => () => undefined,
-    delete: async () => undefined
+    getId: async () => {
+      onFidResolve && onFidResolve();
+      return fid;
+    },
+    getToken: async () => 'authToken'
   };
+}
+
+export function getFullApp(fakeAppParams?: {
+  appId?: string;
+  apiKey?: string;
+  measurementId?: string;
+}): FirebaseApp {
+  _registerComponent(
+    new Component(
+      'installations-internal',
+      () => {
+        return {} as _FirebaseInstallationsInternal;
+      },
+      ComponentType.PUBLIC
+    )
+  );
+  _registerComponent(
+    new Component(
+      'analytics',
+      () => {
+        return {} as AnalyticsService;
+      },
+      ComponentType.PUBLIC
+    )
+  );
+  const app = initializeApp({ ...fakeConfig, ...fakeAppParams });
+  return app;
 }

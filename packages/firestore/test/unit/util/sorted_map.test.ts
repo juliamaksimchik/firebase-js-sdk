@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,14 @@
  */
 
 import { expect } from 'chai';
+
 import { primitiveComparator } from '../../../src/util/misc';
-import * as obj from '../../../src/util/obj';
-import { LLRBNode, SortedMap } from '../../../src/util/sorted_map';
+import { forEach } from '../../../src/util/obj';
+import {
+  LLRBNode,
+  SortedMap,
+  SortedMapIterator
+} from '../../../src/util/sorted_map';
 
 function shuffle(arr: number[]): void {
   for (let i = arr.length - 1; i > 0; i--) {
@@ -31,6 +36,41 @@ function shuffle(arr: number[]): void {
 // Many of these were adapted from the mugs source code.
 // http://mads379.github.com/mugs/
 describe('SortedMap Tests', () => {
+  /** Returns a map with (i, i) entries for i in [0, 9] inclusive */
+  function getMapOfNumbersZeroToNine(): SortedMap<number, number> {
+    const items: number[] = [];
+    for (let i = 0; i < 10; i++) {
+      items.push(i);
+    }
+    shuffle(items);
+
+    let map = new SortedMap<number, number>(primitiveComparator);
+    for (let i = 0; i < 10; i++) {
+      map = map.insert(items[i], items[i]);
+    }
+    return map;
+  }
+
+  /**
+   * Validates that the given iterator covers the given range by counting from
+   * the given `from` argument to the given `to` argument (inclusive).
+   */
+  function validateIteratorCoversRange(
+    iterator: SortedMapIterator<number, number>,
+    from: number,
+    to: number
+  ): void {
+    const countUp = from <= to;
+    let expected = from;
+    while (iterator.hasNext()) {
+      const n = iterator.getNext();
+      expect(n.key).to.equal(expected);
+      expect(n.value).to.equal(expected);
+      expected = countUp ? expected + 1 : expected - 1;
+    }
+    expect(expected).to.equal(countUp ? to + 1 : to - 1);
+  }
+
   it('Create node', () => {
     const map = new SortedMap(primitiveComparator).insert('key', 'value');
     expect(map.root.left.isEmpty()).to.equal(true);
@@ -193,18 +233,12 @@ describe('SortedMap Tests', () => {
     expect(map.size).to.equal(6);
     expect(map.root.checkMaxDepth()).to.equal(true);
 
-    const m2 = map
-      .insert(20, 20)
-      .insert(18, 18)
-      .insert(2, 2);
+    const m2 = map.insert(20, 20).insert(18, 18).insert(2, 2);
 
     expect(m2.size).to.equal(9);
     expect(m2.root.checkMaxDepth()).to.equal(true);
 
-    const m3 = m2
-      .insert(71, 71)
-      .insert(42, 42)
-      .insert(88, 88);
+    const m3 = m2.insert(71, 71).insert(42, 42).insert(88, 88);
 
     expect(m3.size).to.equal(12);
     expect(m3.root.checkMaxDepth()).to.equal(true);
@@ -363,7 +397,7 @@ describe('SortedMap Tests', () => {
       max: number
     ): void => {
       const keys: number[] = [];
-      obj.forEach(tree, k => keys.push(Number(k)));
+      forEach(tree, k => keys.push(Number(k)));
 
       keys.sort();
       expect(keys.length).to.equal(max);
@@ -410,27 +444,46 @@ describe('SortedMap Tests', () => {
     expect(() => iterator.getNext()).to.throw();
   });
 
-  it('SortedMapIterator test with 10 items.', () => {
-    const items: number[] = [];
-    for (let i = 0; i < 10; i++) {
-      items.push(i);
-    }
-    shuffle(items);
+  it('forward iterator without start key', () => {
+    const iterator = getMapOfNumbersZeroToNine().getIterator();
+    validateIteratorCoversRange(iterator, 0, 9);
+  });
 
-    let map = new SortedMap(primitiveComparator);
-    for (let i = 0; i < 10; i++) {
-      map = map.insert(items[i], items[i]);
-    }
+  it('forward iterator with start key.', () => {
+    const iterator = getMapOfNumbersZeroToNine().getIteratorFrom(5);
+    validateIteratorCoversRange(iterator, 5, 9);
+  });
 
-    const iterator = map.getIterator();
-    let expected = 0;
-    while (iterator.hasNext()) {
-      const n = iterator.getNext();
-      expect(n.key).to.equal(expected);
-      expect(n.value).to.equal(expected);
-      expected++;
-    }
-    expect(expected).to.equal(10);
+  it('forward iterator with start key larger than max key', () => {
+    const iterator = getMapOfNumbersZeroToNine().getIteratorFrom(50);
+    expect(iterator.hasNext()).to.equal(false);
+    expect(() => iterator.getNext()).to.throw();
+  });
+
+  it('forward iterator with start key smaller than min key', () => {
+    const iterator = getMapOfNumbersZeroToNine().getIteratorFrom(-50);
+    validateIteratorCoversRange(iterator, 0, 9);
+  });
+
+  it('reverse iterator without start key', () => {
+    const iterator = getMapOfNumbersZeroToNine().getReverseIterator();
+    validateIteratorCoversRange(iterator, 9, 0);
+  });
+
+  it('reverse iterator with start key.', () => {
+    const iterator = getMapOfNumbersZeroToNine().getReverseIteratorFrom(7);
+    validateIteratorCoversRange(iterator, 7, 0);
+  });
+
+  it('reverse iterator with start key smaller than min key', () => {
+    const iterator = getMapOfNumbersZeroToNine().getReverseIteratorFrom(-50);
+    expect(iterator.hasNext()).to.equal(false);
+    expect(() => iterator.getNext()).to.throw();
+  });
+
+  it('reverse iterator with start key larger than max key', () => {
+    const iterator = getMapOfNumbersZeroToNine().getReverseIteratorFrom(50);
+    validateIteratorCoversRange(iterator, 9, 0);
   });
 
   it('SortedMap.indexOf returns index.', () => {

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,14 @@
  * limitations under the License.
  */
 
+import stringify from 'json-stable-stringify';
 import { ExclusiveTestFunction, PendingTestFunction } from 'mocha';
 
+import { queryEquals, QueryImpl } from '../../../src/core/query';
+import { targetEquals, TargetImpl } from '../../../src/core/target';
 import { IndexedDbPersistence } from '../../../src/local/indexeddb_persistence';
-import { assert } from '../../../src/util/assert';
+import { debugAssert } from '../../../src/util/assert';
+import { primitiveComparator } from '../../../src/util/misc';
 import { addEqualityMatcher } from '../../util/equality_matcher';
 
 import { SpecBuilder } from './spec_builder';
@@ -125,10 +129,10 @@ function getTestTimeout(tags: string[]): number | undefined {
 
 /**
  * Like it(), but for spec tests.
- * @param name A name to give the test.
- * @param tags Tags to apply to the test (e.g. 'exclusive' to only run
+ * @param name - A name to give the test.
+ * @param tags - Tags to apply to the test (e.g. 'exclusive' to only run
  *             individual tests)
- * @param builder A function that returns a spec.
+ * @param builder - A function that returns a spec.
  * If writeToJSONFile has been called, the spec will be stored in
  * `specsInThisTest`. Otherwise, it will be run, just as it() would run it.
  */
@@ -157,11 +161,11 @@ export function specTest(
   } else {
     builder = commentOrBuilder;
   }
-  assert(!!builder, 'Missing spec builder');
+  debugAssert(!!builder, 'Missing spec builder');
   // Union in the tags for the describeSpec().
   tags = tags.concat(describeTags);
   for (const tag of tags) {
-    assert(
+    debugAssert(
       KNOWN_TAGS.indexOf(tag) >= 0,
       'Unknown tag "' + tag + '" on test: ' + name
     );
@@ -192,7 +196,7 @@ export function specTest(
       }
     }
   } else {
-    assert(
+    debugAssert(
       tags.indexOf(EXCLUSIVE_TAG) === -1,
       `The 'exclusive' tag is only supported for development and should not be exported to ` +
         `other platforms.`
@@ -219,10 +223,10 @@ export function specTest(
 
 /**
  * Like describe, but for spec tests.
- * @param name A name to give the test.
- * @param tags Tags to apply to all tests in the spec (e.g. 'exclusive' to
+ * @param name - A name to give the test.
+ * @param tags - Tags to apply to all tests in the spec (e.g. 'exclusive' to
  *             only run individual tests)
- * @param builder A function that calls specTest for each test case.
+ * @param builder - A function that calls specTest for each test case.
  * If writeToJSONFile has been called, the specs will be stored in
  * that file. Otherwise, they will be run, just as describe would run.
  */
@@ -236,13 +240,74 @@ export function describeSpec(
 
   if (!writeJSONFile) {
     describe(name, () => {
-      addEqualityMatcher();
+      addEqualityMatcher(
+        { equalsFn: targetEquals, forType: TargetImpl },
+        { equalsFn: queryEquals, forType: QueryImpl }
+      );
       return builder();
     });
   } else {
     specsInThisTest = {};
     builder();
-    const output = JSON.stringify(specsInThisTest, null, 2);
+    // Note: We use json-stable-stringify instead of JSON.stringify() to ensure
+    // that the generated JSON does not produce diffs merely due to the order
+    // of the keys in an object changing.
+    const output = stringify(specsInThisTest, {
+      space: 2,
+      cmp: stringifyComparator
+    });
     writeJSONFile(output);
+  }
+}
+
+/**
+ * The key ordering overrides used when sorting keys in the generated JSON.
+ * If both keys being compared are present in this array then they should be
+ * ordered in the generated JSON in the same relative order of this array.
+ */
+const stringifyCustomOrdering = [
+  'comment',
+  'describeName',
+  'itName',
+  'tags',
+  'config',
+  'steps'
+];
+
+/**
+ * Assigns a "group number" to the given key in the generated JSON.
+ *
+ * Keys with lower group numbers should be ordered before keys with greater
+ * group numbers. Keys with equal group numbers should be ordered
+ * alphabetically.
+ */
+function stringifyGroup(s: string): number {
+  const index = stringifyCustomOrdering.indexOf(s);
+  if (index >= 0) {
+    return index;
+  } else if (!s.startsWith('expected')) {
+    return stringifyCustomOrdering.length;
+  } else {
+    return stringifyCustomOrdering.length + 1;
+  }
+}
+
+/**
+ * A comparator function for stringify() that sorts keys in the JSON output.
+ *
+ * In order to produce JSON that has somewhat-intuitively-ordered keys, this
+ * comparator intentionally deviates from pure alphabetic ordering, placing
+ * some logically-first keys before others.
+ */
+function stringifyComparator(
+  a: stringify.Element,
+  b: stringify.Element
+): number {
+  const aGroup = stringifyGroup(a.key);
+  const bGroup = stringifyGroup(b.key);
+  if (aGroup === bGroup) {
+    return primitiveComparator(a.key, b.key);
+  } else {
+    return primitiveComparator(aGroup, bGroup);
   }
 }

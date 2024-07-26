@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,11 @@
  */
 
 import { expect, use } from 'chai';
+import chaiAsPromised from 'chai-as-promised';
+
 import { PersistencePromise } from '../../../src/local/persistence_promise';
 
-import * as chaiAsPromised from 'chai-as-promised';
+/* eslint-disable no-restricted-globals */
 
 use(chaiAsPromised);
 

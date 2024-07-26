@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,17 +15,20 @@
  * limitations under the License.
  */
 
-import { expect } from 'chai';
 import '../testing/setup';
-import { openDb } from 'idb';
+
 import {
-  migrateOldDatabase,
   V2TokenDetails,
   V3TokenDetails,
-  V4TokenDetails
+  V4TokenDetails,
+  migrateOldDatabase
 } from './migrate-old-database';
+
 import { FakePushSubscription } from '../testing/fakes/service-worker';
+import { base64ToArray } from './array-base64-translator';
+import { expect } from 'chai';
 import { getFakeTokenDetails } from '../testing/fakes/token-details';
+import { openDB } from 'idb';
 
 describe('migrateOldDb', () => {
   it("does nothing if old DB didn't exist", async () => {
@@ -49,7 +52,7 @@ describe('migrateOldDb', () => {
       const v2TokenDetails: V2TokenDetails = {
         fcmToken: 'token-value',
         swScope: '/scope-value',
-        vapidKey: base64ToArrayBuffer('dmFwaWQta2V5LXZhbHVl'),
+        vapidKey: base64ToArray('dmFwaWQta2V5LXZhbHVl'),
         fcmSenderId: '1234567890',
         fcmPushSet: '7654321',
         auth: 'YXV0aC12YWx1ZQ',
@@ -87,7 +90,7 @@ describe('migrateOldDb', () => {
       const v2TokenDetails: V2TokenDetails = {
         fcmToken: 'token-value',
         swScope: '/scope-value',
-        vapidKey: base64ToArrayBuffer('dmFwaWQta2V5LXZhbHVl'),
+        vapidKey: base64ToArray('dmFwaWQta2V5LXZhbHVl'),
         fcmSenderId: '1234567890',
         fcmPushSet: '7654321',
         subscription: new FakePushSubscription()
@@ -105,11 +108,11 @@ describe('migrateOldDb', () => {
         createTime: 1234567890,
         fcmToken: 'token-value',
         swScope: '/scope-value',
-        vapidKey: base64ToArrayBuffer('dmFwaWQta2V5LXZhbHVl'),
+        vapidKey: base64ToArray('dmFwaWQta2V5LXZhbHVl'),
         fcmSenderId: '1234567890',
         fcmPushSet: '7654321',
-        auth: base64ToArrayBuffer('YXV0aC12YWx1ZQ'),
-        p256dh: base64ToArrayBuffer('cDI1Ni12YWx1ZQ'),
+        auth: base64ToArray('YXV0aC12YWx1ZQ'),
+        p256dh: base64ToArray('cDI1Ni12YWx1ZQ'),
         endpoint: 'https://example.org'
       };
 
@@ -143,10 +146,10 @@ describe('migrateOldDb', () => {
         createTime: 1234567890,
         fcmToken: 'token-value',
         swScope: '/scope-value',
-        vapidKey: base64ToArrayBuffer('dmFwaWQta2V5LXZhbHVl'),
+        vapidKey: base64ToArray('dmFwaWQta2V5LXZhbHVl'),
         fcmSenderId: '1234567890',
-        auth: base64ToArrayBuffer('YXV0aC12YWx1ZQ'),
-        p256dh: base64ToArrayBuffer('cDI1Ni12YWx1ZQ'),
+        auth: base64ToArray('YXV0aC12YWx1ZQ'),
+        p256dh: base64ToArray('cDI1Ni12YWx1ZQ'),
         endpoint: 'https://example.org'
       };
 
@@ -176,41 +179,25 @@ describe('migrateOldDb', () => {
 });
 
 async function put(version: number, value: object): Promise<void> {
-  const db = await openDb('fcm_token_details_db', version, upgradeDb => {
-    if (upgradeDb.oldVersion === 0) {
-      const objectStore = upgradeDb.createObjectStore(
-        'fcm_token_object_Store',
-        {
+  const db = await openDB('fcm_token_details_db', version, {
+    upgrade: (db, oldVersion) => {
+      if (oldVersion === 0) {
+        const objectStore = db.createObjectStore('fcm_token_object_Store', {
           keyPath: 'swScope'
-        }
-      );
-      objectStore.createIndex('fcmSenderId', 'fcmSenderId', {
-        unique: false
-      });
-      objectStore.createIndex('fcmToken', 'fcmToken', { unique: true });
+        });
+        objectStore.createIndex('fcmSenderId', 'fcmSenderId', {
+          unique: false
+        });
+        objectStore.createIndex('fcmToken', 'fcmToken', { unique: true });
+      }
     }
   });
 
   try {
     const tx = db.transaction('fcm_token_object_Store', 'readwrite');
     await tx.objectStore('fcm_token_object_Store').put(value);
-    await tx.complete;
+    await tx.done;
   } finally {
     db.close();
   }
-}
-
-function base64ToArrayBuffer(base64String: string): Uint8Array {
-  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
-  const base64 = (base64String + padding)
-    .replace(/\-/g, '+')
-    .replace(/_/g, '/');
-
-  const rawData = atob(base64);
-  const outputArray = new Uint8Array(rawData.length);
-
-  for (let i = 0; i < rawData.length; ++i) {
-    outputArray[i] = rawData.charCodeAt(i);
-  }
-  return outputArray;
 }

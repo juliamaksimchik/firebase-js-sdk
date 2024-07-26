@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -122,11 +122,11 @@ class ObserverProxy<T> implements Observer<T> {
   /**
    * Subscribe function that can be used to add an Observer to the fan-out list.
    *
-   * - We require that no event is sent to a subscriber sychronously to their
+   * - We require that no event is sent to a subscriber synchronously to their
    *   call to subscribe().
    */
   subscribe(
-    nextOrObserver?: PartialObserver<T> | Function,
+    nextOrObserver?: NextFn<T> | PartialObserver<T>,
     error?: ErrorFn,
     complete?: CompleteFn
   ): Unsubscribe {
@@ -261,6 +261,7 @@ class ObserverProxy<T> implements Observer<T> {
 }
 
 /** Turn synchronous function into one called asynchronously. */
+// eslint-disable-next-line @typescript-eslint/ban-types
 export function async(fn: Function, onError?: ErrorFn): Function {
   return (...args: unknown[]) => {
     Promise.resolve(true)

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 import { BatchId, TargetId } from '../core/types';
 import { documentKeySet, DocumentKeySet } from '../model/collections';
 import { DocumentKey } from '../model/document_key';
+import { ResourcePath } from '../model/path';
 import { primitiveComparator } from '../util/misc';
 import { SortedSet } from '../util/sorted_set';
 
@@ -77,7 +78,7 @@ export class ReferenceSet {
    * removed.
    */
   removeReferencesForId(id: TargetId | BatchId): DocumentKey[] {
-    const emptyKey = DocumentKey.EMPTY;
+    const emptyKey = new DocumentKey(new ResourcePath([]));
     const startRef = new DocReference(emptyKey, id);
     const endRef = new DocReference(emptyKey, id + 1);
     const keys: DocumentKey[] = [];
@@ -98,7 +99,7 @@ export class ReferenceSet {
   }
 
   referencesForId(id: TargetId | BatchId): DocumentKeySet {
-    const emptyKey = DocumentKey.EMPTY;
+    const emptyKey = new DocumentKey(new ResourcePath([]));
     const startRef = new DocReference(emptyKey, id);
     const endRef = new DocReference(emptyKey, id + 1);
     let keys = documentKeySet();

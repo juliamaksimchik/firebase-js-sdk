@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2020 Google Inc.
+ * Copyright 2020 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,9 +15,9 @@
  * limitations under the License.
  */
 
-// eslint-disable-next-line import/no-extraneous-dependencies
-import * as ts from 'typescript';
 import * as fs from 'fs';
+
+import * as ts from 'typescript';
 
 function extractIdentifiersFromNodeAndChildren(
   node: ts.Node,
@@ -32,6 +32,17 @@ function extractIdentifiersFromNodeAndChildren(
   );
 }
 
+/** Generates the "d.ts" content for `fileName`. */
+function extractTypeDeclaration(fileName: string): string {
+  let result: string;
+  const compilerOptions = { declaration: true, emitDeclarationOnly: true };
+  const host = ts.createCompilerHost(compilerOptions);
+  host.writeFile = (_: string, contents: string) => (result = contents);
+  const program = ts.createProgram([fileName], compilerOptions, host);
+  program.emit();
+  return result!;
+}
+
 /**
  * Traverses TypeScript type definition files and returns the list of referenced
  * identifiers.
@@ -40,12 +51,21 @@ export function extractPublicIdentifiers(filePaths: string[]): Set<string> {
   const publicIdentifiers = new Set<string>();
 
   for (const filePath of filePaths) {
-    const contents = fs.readFileSync(filePath, { encoding: 'UTF-8' });
-    const sourceFile = ts.createSourceFile(
+    const contents = fs.readFileSync(filePath, { encoding: 'utf-8' });
+    let sourceFile = ts.createSourceFile(
       filePath,
       contents,
       ts.ScriptTarget.ES2015
     );
+
+    if (!sourceFile.isDeclarationFile) {
+      const dtsSource = extractTypeDeclaration(filePath);
+      sourceFile = ts.createSourceFile(
+        filePath.replace('.ts', '.d.ts'),
+        dtsSource,
+        ts.ScriptTarget.ES2015
+      );
+    }
 
     const identifiers = new Set<string>();
     ts.forEachChild(sourceFile, (childNode: ts.Node) =>

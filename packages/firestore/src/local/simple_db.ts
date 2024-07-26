@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,13 +15,17 @@
  * limitations under the License.
  */
 
-import { getUA } from '@firebase/util';
-import { assert } from '../util/assert';
+import { getUA, isIndexedDBAvailable } from '@firebase/util';
+
+import { debugAssert } from '../util/assert';
 import { Code, FirestoreError } from '../util/error';
-import { debug, error } from '../util/log';
+import { logDebug, logError } from '../util/log';
 import { Deferred } from '../util/promise';
-import { SCHEMA_VERSION } from './indexeddb_schema';
+
 import { PersistencePromise } from './persistence_promise';
+
+// References to `window` are guarded by SimpleDb.isAvailable()
+/* eslint-disable no-restricted-globals */
 
 const LOG_TAG = 'SimpleDb';
 
@@ -44,6 +48,108 @@ export interface SimpleDbSchemaConverter {
 }
 
 /**
+ * Wraps an IDBTransaction and exposes a store() method to get a handle to a
+ * specific object store.
+ */
+export class SimpleDbTransaction {
+  private aborted = false;
+
+  /**
+   * A `Promise` that resolves with the result of the IndexedDb transaction.
+   */
+  private readonly completionDeferred = new Deferred<void>();
+
+  static open(
+    db: IDBDatabase,
+    action: string,
+    mode: IDBTransactionMode,
+    objectStoreNames: string[]
+  ): SimpleDbTransaction {
+    try {
+      return new SimpleDbTransaction(
+        action,
+        db.transaction(objectStoreNames, mode)
+      );
+    } catch (e) {
+      throw new IndexedDbTransactionError(action, e as Error);
+    }
+  }
+
+  constructor(
+    private readonly action: string,
+    private readonly transaction: IDBTransaction
+  ) {
+    this.transaction.oncomplete = () => {
+      this.completionDeferred.resolve();
+    };
+    this.transaction.onabort = () => {
+      if (transaction.error) {
+        this.completionDeferred.reject(
+          new IndexedDbTransactionError(action, transaction.error)
+        );
+      } else {
+        this.completionDeferred.resolve();
+      }
+    };
+    this.transaction.onerror = (event: Event) => {
+      const error = checkForAndReportiOSError(
+        (event.target as IDBRequest).error!
+      );
+      this.completionDeferred.reject(
+        new IndexedDbTransactionError(action, error)
+      );
+    };
+  }
+
+  get completionPromise(): Promise<void> {
+    return this.completionDeferred.promise;
+  }
+
+  abort(error?: Error): void {
+    if (error) {
+      this.completionDeferred.reject(error);
+    }
+
+    if (!this.aborted) {
+      logDebug(
+        LOG_TAG,
+        'Aborting transaction:',
+        error ? error.message : 'Client-initiated abort'
+      );
+      this.aborted = true;
+      this.transaction.abort();
+    }
+  }
+
+  maybeCommit(): void {
+    // If the browser supports V3 IndexedDB, we invoke commit() explicitly to
+    // speed up index DB processing if the event loop remains blocks.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const maybeV3IndexedDb = this.transaction as any;
+    if (!this.aborted && typeof maybeV3IndexedDb.commit === 'function') {
+      maybeV3IndexedDb.commit();
+    }
+  }
+
+  /**
+   * Returns a SimpleDbStore<KeyType, ValueType> for the specified store. All
+   * operations performed on the SimpleDbStore happen within the context of this
+   * transaction and it cannot be used anymore once the transaction is
+   * completed.
+   *
+   * Note that we can't actually enforce that the KeyType and ValueType are
+   * correct, but they allow type safety through the rest of the consuming code.
+   */
+  store<KeyType extends IDBValidKey, ValueType extends unknown>(
+    storeName: string
+  ): SimpleDbStore<KeyType, ValueType> {
+    const store = this.transaction.objectStore(storeName);
+    debugAssert(!!store, 'Object store not part of transaction: ' + storeName);
+    return new SimpleDbStore<KeyType, ValueType>(store);
+  }
+}
+
+/**
  * Provides a wrapper around IndexedDb with a simplified interface that uses
  * Promise-like return values to chain operations. Real promises cannot be used
  * since .then() continuations are executed asynchronously (e.g. via
@@ -51,110 +157,23 @@ export interface SimpleDbSchemaConverter {
  * See PersistencePromise for more details.
  */
 export class SimpleDb {
-  /**
-   * Opens the specified database, creating or upgrading it if necessary.
-   *
-   * Note that `version` must not be a downgrade. IndexedDB does not support downgrading the schema
-   * version. We currently do not support any way to do versioning outside of IndexedDB's versioning
-   * mechanism, as only version-upgrade transactions are allowed to do things like create
-   * objectstores.
-   */
-  static openOrCreate(
-    name: string,
-    version: number,
-    schemaConverter: SimpleDbSchemaConverter
-  ): Promise<SimpleDb> {
-    assert(
-      SimpleDb.isAvailable(),
-      'IndexedDB not supported in current environment.'
-    );
-    debug(LOG_TAG, 'Opening database:', name);
-    return new PersistencePromise<SimpleDb>((resolve, reject) => {
-      // TODO(mikelehen): Investigate browser compatibility.
-      // https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API/Using_IndexedDB
-      // suggests IE9 and older WebKit browsers handle upgrade
-      // differently. They expect setVersion, as described here:
-      // https://developer.mozilla.org/en-US/docs/Web/API/IDBVersionChangeRequest/setVersion
-      const request = window.indexedDB.open(name, version);
-
-      request.onsuccess = (event: Event) => {
-        const db = (event.target as IDBOpenDBRequest).result;
-        resolve(new SimpleDb(db));
-      };
-
-      request.onblocked = () => {
-        reject(
-          new FirestoreError(
-            Code.FAILED_PRECONDITION,
-            'Cannot upgrade IndexedDB schema while another tab is open. ' +
-              'Close all tabs that access Firestore and reload this page to proceed.'
-          )
-        );
-      };
-
-      request.onerror = (event: Event) => {
-        const error: DOMException = (event.target as IDBOpenDBRequest).error!;
-        if (error.name === 'VersionError') {
-          reject(
-            new FirestoreError(
-              Code.FAILED_PRECONDITION,
-              'A newer version of the Firestore SDK was previously used and so the persisted ' +
-                'data is not compatible with the version of the SDK you are now using. The SDK ' +
-                'will operate with persistence disabled. If you need persistence, please ' +
-                're-upgrade to a newer version of the SDK or else clear the persisted IndexedDB ' +
-                'data for your app to start fresh.'
-            )
-          );
-        } else {
-          reject(error);
-        }
-      };
-
-      request.onupgradeneeded = (event: IDBVersionChangeEvent) => {
-        debug(
-          LOG_TAG,
-          'Database "' + name + '" requires upgrade from version:',
-          event.oldVersion
-        );
-        const db = (event.target as IDBOpenDBRequest).result;
-        schemaConverter
-          .createOrUpgrade(
-            db,
-            request.transaction!,
-            event.oldVersion,
-            SCHEMA_VERSION
-          )
-          .next(() => {
-            debug(
-              LOG_TAG,
-              'Database upgrade to version ' + SCHEMA_VERSION + ' complete'
-            );
-          });
-      };
-    }).toPromise();
-  }
+  private db?: IDBDatabase;
+  private versionchangelistener?: (event: IDBVersionChangeEvent) => void;
 
   /** Deletes the specified database. */
   static delete(name: string): Promise<void> {
-    debug(LOG_TAG, 'Removing database:', name);
+    logDebug(LOG_TAG, 'Removing database:', name);
     return wrapRequest<void>(window.indexedDB.deleteDatabase(name)).toPromise();
   }
 
   /** Returns true if IndexedDB is available in the current environment. */
   static isAvailable(): boolean {
-    if (typeof window === 'undefined' || window.indexedDB == null) {
+    if (!isIndexedDBAvailable()) {
       return false;
     }
 
     if (SimpleDb.isMockPersistence()) {
       return true;
-    }
-
-    // In some Node environments, `window` is defined, but `window.navigator` is
-    // not. We don't support IndexedDB persistence in Node if the
-    // isMockPersistence() check above returns false.
-    if (window.navigator === undefined) {
-      return false;
     }
 
     // We extensively use indexed array values and compound keys,
@@ -181,8 +200,8 @@ export class SimpleDb {
     const iOSVersion = SimpleDb.getIOSVersion(ua);
     const isUnsupportedIOS = 0 < iOSVersion && iOSVersion < 10;
 
-    // Android browser: Disable for userse running version < 4.5.
-    const androidVersion = SimpleDb.getAndroidVersion(ua);
+    // Android browser: Disable for users running version < 4.5.
+    const androidVersion = getAndroidVersion(ua);
     const isUnsupportedAndroid = 0 < androidVersion && androidVersion < 4.5;
 
     if (
@@ -222,35 +241,37 @@ export class SimpleDb {
   static getIOSVersion(ua: string): number {
     const iOSVersionRegex = ua.match(/i(?:phone|pad|pod) os ([\d_]+)/i);
     const version = iOSVersionRegex
-      ? iOSVersionRegex[1]
-          .split('_')
-          .slice(0, 2)
-          .join('.')
+      ? iOSVersionRegex[1].split('_').slice(0, 2).join('.')
       : '-1';
     return Number(version);
   }
 
-  // visible for testing
-  /** Parse User Agent to determine Android version. Returns -1 if not found. */
-  static getAndroidVersion(ua: string): number {
-    const androidVersionRegex = ua.match(/Android ([\d.]+)/i);
-    const version = androidVersionRegex
-      ? androidVersionRegex[1]
-          .split('.')
-          .slice(0, 2)
-          .join('.')
-      : '-1';
-    return Number(version);
-  }
+  /*
+   * Creates a new SimpleDb wrapper for IndexedDb database `name`.
+   *
+   * Note that `version` must not be a downgrade. IndexedDB does not support
+   * downgrading the schema version. We currently do not support any way to do
+   * versioning outside of IndexedDB's versioning mechanism, as only
+   * version-upgrade transactions are allowed to do things like create
+   * objectstores.
+   */
+  constructor(
+    private readonly name: string,
+    private readonly version: number,
+    private readonly schemaConverter: SimpleDbSchemaConverter
+  ) {
+    debugAssert(
+      SimpleDb.isAvailable(),
+      'IndexedDB not supported in current environment.'
+    );
 
-  constructor(private db: IDBDatabase) {
     const iOSVersion = SimpleDb.getIOSVersion(getUA());
     // NOTE: According to https://bugs.webkit.org/show_bug.cgi?id=197050, the
     // bug we're checking for should exist in iOS >= 12.2 and < 13, but for
     // whatever reason it's much harder to hit after 12.2 so we only proactively
     // log on 12.2.
     if (iOSVersion === 12.2) {
-      error(
+      logError(
         'Firestore persistence suffers from a bug in iOS 12.2 ' +
           'Safari that may cause your app to stop working. See ' +
           'https://stackoverflow.com/q/56496296/110915 for details ' +
@@ -259,15 +280,106 @@ export class SimpleDb {
     }
   }
 
+  /**
+   * Opens the specified database, creating or upgrading it if necessary.
+   */
+  async ensureDb(action: string): Promise<IDBDatabase> {
+    if (!this.db) {
+      logDebug(LOG_TAG, 'Opening database:', this.name);
+      this.db = await new Promise<IDBDatabase>((resolve, reject) => {
+        // TODO(mikelehen): Investigate browser compatibility.
+        // https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API/Using_IndexedDB
+        // suggests IE9 and older WebKit browsers handle upgrade
+        // differently. They expect setVersion, as described here:
+        // https://developer.mozilla.org/en-US/docs/Web/API/IDBVersionChangeRequest/setVersion
+        const request = indexedDB.open(this.name, this.version);
+
+        request.onsuccess = (event: Event) => {
+          const db = (event.target as IDBOpenDBRequest).result;
+          resolve(db);
+        };
+
+        request.onblocked = () => {
+          reject(
+            new IndexedDbTransactionError(
+              action,
+              'Cannot upgrade IndexedDB schema while another tab is open. ' +
+                'Close all tabs that access Firestore and reload this page to proceed.'
+            )
+          );
+        };
+
+        request.onerror = (event: Event) => {
+          const error: DOMException = (event.target as IDBOpenDBRequest).error!;
+          if (error.name === 'VersionError') {
+            reject(
+              new FirestoreError(
+                Code.FAILED_PRECONDITION,
+                'A newer version of the Firestore SDK was previously used and so the persisted ' +
+                  'data is not compatible with the version of the SDK you are now using. The SDK ' +
+                  'will operate with persistence disabled. If you need persistence, please ' +
+                  're-upgrade to a newer version of the SDK or else clear the persisted IndexedDB ' +
+                  'data for your app to start fresh.'
+              )
+            );
+          } else if (error.name === 'InvalidStateError') {
+            reject(
+              new FirestoreError(
+                Code.FAILED_PRECONDITION,
+                'Unable to open an IndexedDB connection. This could be due to running in a ' +
+                  'private browsing session on a browser whose private browsing sessions do not ' +
+                  'support IndexedDB: ' +
+                  error
+              )
+            );
+          } else {
+            reject(new IndexedDbTransactionError(action, error));
+          }
+        };
+
+        request.onupgradeneeded = (event: IDBVersionChangeEvent) => {
+          logDebug(
+            LOG_TAG,
+            'Database "' + this.name + '" requires upgrade from version:',
+            event.oldVersion
+          );
+          const db = (event.target as IDBOpenDBRequest).result;
+          this.schemaConverter
+            .createOrUpgrade(
+              db,
+              request.transaction!,
+              event.oldVersion,
+              this.version
+            )
+            .next(() => {
+              logDebug(
+                LOG_TAG,
+                'Database upgrade to version ' + this.version + ' complete'
+              );
+            });
+        };
+      });
+    }
+
+    if (this.versionchangelistener) {
+      this.db.onversionchange = event => this.versionchangelistener!(event);
+    }
+    return this.db;
+  }
+
   setVersionChangeListener(
     versionChangeListener: (event: IDBVersionChangeEvent) => void
   ): void {
-    this.db.onversionchange = (event: IDBVersionChangeEvent) => {
-      return versionChangeListener(event);
-    };
+    this.versionchangelistener = versionChangeListener;
+    if (this.db) {
+      this.db.onversionchange = (event: IDBVersionChangeEvent) => {
+        return versionChangeListener(event);
+      };
+    }
   }
 
   async runTransaction<T>(
+    action: string,
     mode: SimpleDbTransactionMode,
     objectStores: string[],
     transactionFn: (transaction: SimpleDbTransaction) => PersistencePromise<T>
@@ -278,13 +390,20 @@ export class SimpleDb {
     while (true) {
       ++attemptNumber;
 
-      const transaction = SimpleDbTransaction.open(
-        this.db,
-        readonly ? 'readonly' : 'readwrite',
-        objectStores
-      );
       try {
+        this.db = await this.ensureDb(action);
+
+        const transaction = SimpleDbTransaction.open(
+          this.db,
+          action,
+          readonly ? 'readonly' : 'readwrite',
+          objectStores
+        );
         const transactionFnResult = transactionFn(transaction)
+          .next(result => {
+            transaction.maybeCommit();
+            return result;
+          })
           .catch(error => {
             // Abort the transaction if there was an error.
             transaction.abort(error);
@@ -305,7 +424,8 @@ export class SimpleDb {
         // caller.
         await transaction.completionPromise;
         return transactionFnResult;
-      } catch (error) {
+      } catch (e) {
+        const error = e as Error;
         // TODO(schmidt-sebastian): We could probably be smarter about this and
         // not retry exceptions that are likely unrecoverable (such as quota
         // exceeded errors).
@@ -315,12 +435,15 @@ export class SimpleDb {
         const retryable =
           error.name !== 'FirebaseError' &&
           attemptNumber < TRANSACTION_RETRY_COUNT;
-        debug(
+        logDebug(
           LOG_TAG,
-          'Transaction failed with error: %s. Retrying: %s.',
+          'Transaction failed with error:',
           error.message,
+          'Retrying:',
           retryable
         );
+
+        this.close();
 
         if (!retryable) {
           return Promise.reject(error);
@@ -330,8 +453,20 @@ export class SimpleDb {
   }
 
   close(): void {
-    this.db.close();
+    if (this.db) {
+      this.db.close();
+    }
+    this.db = undefined;
   }
+}
+
+/** Parse User Agent to determine Android version. Returns -1 if not found. */
+export function getAndroidVersion(ua: string): number {
+  const androidVersionRegex = ua.match(/Android ([\d.]+)/i);
+  const version = androidVersionRegex
+    ? androidVersionRegex[1].split('.').slice(0, 2).join('.')
+    : '-1';
+  return Number(version);
 }
 
 /**
@@ -396,7 +531,7 @@ export interface IterateOptions {
   /** Index to iterate over (else primary keys will be iterated) */
   index?: string;
 
-  /** IndxedDB Range to iterate over (else entire store will be iterated) */
+  /** IndexedDB Range to iterate over (else entire store will be iterated) */
   range?: IDBKeyRange;
 
   /** If true, values aren't read while iterating. */
@@ -406,81 +541,23 @@ export interface IterateOptions {
   reverse?: boolean;
 }
 
-/**
- * Wraps an IDBTransaction and exposes a store() method to get a handle to a
- * specific object store.
- */
-export class SimpleDbTransaction {
-  private aborted = false;
+/** An error that wraps exceptions that thrown during IndexedDB execution. */
+export class IndexedDbTransactionError extends FirestoreError {
+  name = 'IndexedDbTransactionError';
 
-  /**
-   * A promise that resolves with the result of the IndexedDb transaction.
-   */
-  private readonly completionDeferred = new Deferred<void>();
-
-  static open(
-    db: IDBDatabase,
-    mode: IDBTransactionMode,
-    objectStoreNames: string[]
-  ): SimpleDbTransaction {
-    return new SimpleDbTransaction(db.transaction(objectStoreNames, mode));
+  constructor(actionName: string, cause: Error | string) {
+    super(
+      Code.UNAVAILABLE,
+      `IndexedDB transaction '${actionName}' failed: ${cause}`
+    );
   }
+}
 
-  constructor(private readonly transaction: IDBTransaction) {
-    this.transaction.oncomplete = () => {
-      this.completionDeferred.resolve();
-    };
-    this.transaction.onabort = () => {
-      if (transaction.error) {
-        this.completionDeferred.reject(transaction.error);
-      } else {
-        this.completionDeferred.resolve();
-      }
-    };
-    this.transaction.onerror = (event: Event) => {
-      const error = checkForAndReportiOSError(
-        (event.target as IDBRequest).error!
-      );
-      this.completionDeferred.reject(error);
-    };
-  }
-
-  get completionPromise(): Promise<void> {
-    return this.completionDeferred.promise;
-  }
-
-  abort(error?: Error): void {
-    if (error) {
-      this.completionDeferred.reject(error);
-    }
-
-    if (!this.aborted) {
-      debug(
-        LOG_TAG,
-        'Aborting transaction:',
-        error ? error.message : 'Client-initiated abort'
-      );
-      this.aborted = true;
-      this.transaction.abort();
-    }
-  }
-
-  /**
-   * Returns a SimpleDbStore<KeyType, ValueType> for the specified store. All
-   * operations performed on the SimpleDbStore happen within the context of this
-   * transaction and it cannot be used anymore once the transaction is
-   * completed.
-   *
-   * Note that we can't actually enforce that the KeyType and ValueType are
-   * correct, but they allow type safety through the rest of the consuming code.
-   */
-  store<KeyType extends IDBValidKey, ValueType extends unknown>(
-    storeName: string
-  ): SimpleDbStore<KeyType, ValueType> {
-    const store = this.transaction.objectStore(storeName);
-    assert(!!store, 'Object store not part of transaction: ' + storeName);
-    return new SimpleDbStore<KeyType, ValueType>(store);
-  }
+/** Verifies whether `e` is an IndexedDbTransactionError. */
+export function isIndexedDbTransactionError(e: Error): boolean {
+  // Use name equality, as instanceof checks on errors don't work with errors
+  // that wrap other errors.
+  return e.name === 'IndexedDbTransactionError';
 }
 
 /**
@@ -502,9 +579,9 @@ export class SimpleDbStore<
   /**
    * Writes a value into the Object Store.
    *
-   * @param key Optional explicit key to use when writing the object, else the
+   * @param key - Optional explicit key to use when writing the object, else the
    * key will be auto-assigned (e.g. via the defined keyPath for the store).
-   * @param value The object to write.
+   * @param value - The object to write.
    */
   put(value: ValueType): PersistencePromise<void>;
   put(key: KeyType, value: ValueType): PersistencePromise<void>;
@@ -514,10 +591,10 @@ export class SimpleDbStore<
   ): PersistencePromise<void> {
     let request;
     if (value !== undefined) {
-      debug(LOG_TAG, 'PUT', this.store.name, keyOrValue, value);
+      logDebug(LOG_TAG, 'PUT', this.store.name, keyOrValue, value);
       request = this.store.put(value, keyOrValue as KeyType);
     } else {
-      debug(LOG_TAG, 'PUT', this.store.name, '<auto-key>', keyOrValue);
+      logDebug(LOG_TAG, 'PUT', this.store.name, '<auto-key>', keyOrValue);
       request = this.store.put(keyOrValue as ValueType);
     }
     return wrapRequest<void>(request);
@@ -527,11 +604,11 @@ export class SimpleDbStore<
    * Adds a new value into an Object Store and returns the new key. Similar to
    * IndexedDb's `add()`, this method will fail on primary key collisions.
    *
-   * @param value The object to write.
-   * @return The key of the value to add.
+   * @param value - The object to write.
+   * @returns The key of the value to add.
    */
   add(value: ValueType): PersistencePromise<KeyType> {
-    debug(LOG_TAG, 'ADD', this.store.name, value, value);
+    logDebug(LOG_TAG, 'ADD', this.store.name, value, value);
     const request = this.store.add(value as ValueType);
     return wrapRequest<KeyType>(request);
   }
@@ -541,7 +618,7 @@ export class SimpleDbStore<
    * if no object exists with the specified key.
    *
    * @key The key of the object to get.
-   * @return The object with the specified key or null if no object exists.
+   * @returns The object with the specified key or null if no object exists.
    */
   get(key: KeyType): PersistencePromise<ValueType | null> {
     const request = this.store.get(key);
@@ -552,13 +629,13 @@ export class SimpleDbStore<
       if (result === undefined) {
         result = null;
       }
-      debug(LOG_TAG, 'GET', this.store.name, key, result);
+      logDebug(LOG_TAG, 'GET', this.store.name, key, result);
       return result;
     });
   }
 
   delete(key: KeyType | IDBKeyRange): PersistencePromise<void> {
-    debug(LOG_TAG, 'DELETE', this.store.name, key);
+    logDebug(LOG_TAG, 'DELETE', this.store.name, key);
     const request = this.store.delete(key);
     return wrapRequest<void>(request);
   }
@@ -570,24 +647,72 @@ export class SimpleDbStore<
    * Returns the number of rows in the store.
    */
   count(): PersistencePromise<number> {
-    debug(LOG_TAG, 'COUNT', this.store.name);
+    logDebug(LOG_TAG, 'COUNT', this.store.name);
     const request = this.store.count();
     return wrapRequest<number>(request);
   }
 
+  /** Loads all elements from the object store. */
   loadAll(): PersistencePromise<ValueType[]>;
+  /** Loads all elements for the index range from the object store. */
   loadAll(range: IDBKeyRange): PersistencePromise<ValueType[]>;
+  /** Loads all elements ordered by the given index. */
+  loadAll(index: string): PersistencePromise<ValueType[]>;
+  /**
+   * Loads all elements from the object store that fall into the provided in the
+   * index range for the given index.
+   */
   loadAll(index: string, range: IDBKeyRange): PersistencePromise<ValueType[]>;
   loadAll(
     indexOrRange?: string | IDBKeyRange,
     range?: IDBKeyRange
   ): PersistencePromise<ValueType[]> {
-    const cursor = this.cursor(this.options(indexOrRange, range));
-    const results: ValueType[] = [];
-    return this.iterateCursor(cursor, (key, value) => {
-      results.push(value);
-    }).next(() => {
-      return results;
+    const iterateOptions = this.options(indexOrRange, range);
+    // Use `getAll()` if the browser supports IndexedDB v3, as it is roughly
+    // 20% faster.
+    const store = iterateOptions.index
+      ? this.store.index(iterateOptions.index)
+      : this.store;
+    if (typeof store.getAll === 'function') {
+      const request = store.getAll(iterateOptions.range);
+      return new PersistencePromise((resolve, reject) => {
+        request.onerror = (event: Event) => {
+          reject((event.target as IDBRequest).error!);
+        };
+        request.onsuccess = (event: Event) => {
+          resolve((event.target as IDBRequest).result);
+        };
+      });
+    } else {
+      const cursor = this.cursor(iterateOptions);
+      const results: ValueType[] = [];
+      return this.iterateCursor(cursor, (key, value) => {
+        results.push(value);
+      }).next(() => {
+        return results;
+      });
+    }
+  }
+
+  /**
+   * Loads the first `count` elements from the provided index range. Loads all
+   * elements if no limit is provided.
+   */
+  loadFirst(
+    range: IDBKeyRange,
+    count: number | null
+  ): PersistencePromise<ValueType[]> {
+    const request = this.store.getAll(
+      range,
+      count === null ? undefined : count
+    );
+    return new PersistencePromise((resolve, reject) => {
+      request.onerror = (event: Event) => {
+        reject((event.target as IDBRequest).error!);
+      };
+      request.onsuccess = (event: Event) => {
+        resolve((event.target as IDBRequest).result);
+      };
     });
   }
 
@@ -598,7 +723,7 @@ export class SimpleDbStore<
     indexOrRange?: string | IDBKeyRange,
     range?: IDBKeyRange
   ): PersistencePromise<void> {
-    debug(LOG_TAG, 'DELETE ALL', this.store.name);
+    logDebug(LOG_TAG, 'DELETE ALL', this.store.name);
     const options = this.options(indexOrRange, range);
     options.keysOnly = false;
     const cursor = this.cursor(options);
@@ -616,8 +741,9 @@ export class SimpleDbStore<
   /**
    * Iterates over keys and values in an object store.
    *
-   * @param options Options specifying how to iterate the objects in the store.
-   * @param callback will be called for each iterated object. Iteration can be
+   * @param options - Options specifying how to iterate the objects in the
+   * store.
+   * @param callback - will be called for each iterated object. Iteration can be
    * canceled at any point by calling the doneFn passed to the callback.
    * The callback can return a PersistencePromise if it performs async
    * operations but note that iteration will continue without waiting for them
@@ -724,9 +850,7 @@ export class SimpleDbStore<
           cursor.continue(controller.skipToKey);
         }
       };
-    }).next(() => {
-      return PersistencePromise.waitFor(results);
-    });
+    }).next(() => PersistencePromise.waitFor(results));
   }
 
   private options(
@@ -738,7 +862,7 @@ export class SimpleDbStore<
       if (typeof indexOrRange === 'string') {
         indexName = indexOrRange;
       } else {
-        assert(
+        debugAssert(
           range === undefined,
           '3rd argument must not be defined if 2nd is a range.'
         );

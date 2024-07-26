@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-const stringToByteArray = function(str: string): number[] {
+const stringToByteArray = function (str: string): number[] {
   // TODO(user): Use native implementations if/when available
   const out: number[] = [];
   let p = 0;
@@ -52,7 +52,7 @@ const stringToByteArray = function(str: string): number[] {
  * @param bytes Array of numbers representing characters.
  * @return Stringification of the array.
  */
-const byteArrayToString = function(bytes: number[]): string {
+const byteArrayToString = function (bytes: number[]): string {
   // TODO(user): Use native implementations if/when available
   const out: string[] = [];
   let pos = 0,
@@ -284,7 +284,7 @@ export const base64: Base64 = {
       ++i;
 
       if (byte1 == null || byte2 == null || byte3 == null || byte4 == null) {
-        throw Error();
+        throw new DecodeBase64StringError();
       }
 
       const outByte1 = (byte1 << 2) | (byte2 >> 4);
@@ -334,11 +334,27 @@ export const base64: Base64 = {
 };
 
 /**
+ * An error encountered while decoding base64 string.
+ */
+export class DecodeBase64StringError extends Error {
+  readonly name = 'DecodeBase64StringError';
+}
+
+/**
  * URL-safe base64 encoding
  */
-export const base64Encode = function(str: string): string {
+export const base64Encode = function (str: string): string {
   const utf8Bytes = stringToByteArray(str);
   return base64.encodeByteArray(utf8Bytes, true);
+};
+
+/**
+ * URL-safe base64 encoding (without "." padding in the end).
+ * e.g. Used in JSON Web Token (JWT) parts.
+ */
+export const base64urlEncodeWithoutPadding = function (str: string): string {
+  // Use base64url encoding and remove padding in the end (dot characters).
+  return base64Encode(str).replace(/\./g, '');
 };
 
 /**
@@ -350,7 +366,7 @@ export const base64Encode = function(str: string): string {
  * @param str To be decoded
  * @return Decoded result, if possible
  */
-export const base64Decode = function(str: string): string | null {
+export const base64Decode = function (str: string): string | null {
   try {
     return base64.decodeString(str, true);
   } catch (e) {

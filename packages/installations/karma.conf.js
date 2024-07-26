@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,15 +17,19 @@
 
 const karmaBase = require('../../config/karma.base');
 
-const files = ['src/**/*.test.ts'];
+const files = [`src/**/*.test.ts`];
 
-module.exports = function(config) {
-  config.set({
+module.exports = function (config) {
+  const karmaConfig = {
     ...karmaBase,
+    // files to load into karma
     files,
-    preprocessors: { '**/*.ts': ['webpack', 'sourcemap'] },
+    // frameworks to use
+    // available frameworks: https://npmjs.org/browse/keyword/karma-adapter
     frameworks: ['mocha']
-  });
+  };
+
+  config.set(karmaConfig);
 };
 
 module.exports.files = files;

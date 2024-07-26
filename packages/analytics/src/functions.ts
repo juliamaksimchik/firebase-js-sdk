@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,12 +17,20 @@
 
 import {
   AnalyticsCallOptions,
-  Gtag,
   CustomParams,
   ControlParams,
-  EventParams
-} from '@firebase/analytics-types';
+  EventParams,
+  ConsentSettings
+} from './public-types';
+import { Gtag } from './types';
 import { GtagCommand } from './constants';
+import { AnalyticsError, ERROR_FACTORY } from './errors';
+
+/**
+ * Event parameters to set on 'gtag' during initialization.
+ */
+export let defaultEventParametersForInit: CustomParams | undefined;
+
 /**
  * Logs an analytics event through the Firebase SDK.
  *
@@ -30,39 +38,47 @@ import { GtagCommand } from './constants';
  * @param eventName Google Analytics event name, choose from standard list or use a custom string.
  * @param eventParams Analytics event parameters.
  */
-export function logEvent(
+export async function logEvent(
   gtagFunction: Gtag,
-  analyticsId: string,
+  initializationPromise: Promise<string>,
   eventName: string,
   eventParams?: EventParams,
   options?: AnalyticsCallOptions
-): void {
-  let params: EventParams | ControlParams = eventParams || {};
-  if (!options || !options.global) {
-    params = { ...eventParams, 'send_to': analyticsId };
+): Promise<void> {
+  if (options && options.global) {
+    gtagFunction(GtagCommand.EVENT, eventName, eventParams);
+    return;
+  } else {
+    const measurementId = await initializationPromise;
+    const params: EventParams | ControlParams = {
+      ...eventParams,
+      'send_to': measurementId
+    };
+    gtagFunction(GtagCommand.EVENT, eventName, params);
   }
-  // Workaround for http://b/141370449 - third argument cannot be undefined.
-  gtagFunction(GtagCommand.EVENT, eventName, params || {});
 }
-
-// TODO: Brad is going to add `screen_name` to GA Gold config parameter schema
 
 /**
  * Set screen_name parameter for this Google Analytics ID.
  *
+ * @deprecated Use {@link logEvent} with `eventName` as 'screen_view' and add relevant `eventParams`.
+ * See {@link https://firebase.google.com/docs/analytics/screenviews | Track Screenviews}.
+ *
  * @param gtagFunction Wrapped gtag function that waits for fid to be set before sending an event
  * @param screenName Screen name string to set.
  */
-export function setCurrentScreen(
+export async function setCurrentScreen(
   gtagFunction: Gtag,
-  analyticsId: string,
+  initializationPromise: Promise<string>,
   screenName: string | null,
   options?: AnalyticsCallOptions
-): void {
+): Promise<void> {
   if (options && options.global) {
     gtagFunction(GtagCommand.SET, { 'screen_name': screenName });
+    return Promise.resolve();
   } else {
-    gtagFunction(GtagCommand.CONFIG, analyticsId, {
+    const measurementId = await initializationPromise;
+    gtagFunction(GtagCommand.CONFIG, measurementId, {
       update: true,
       'screen_name': screenName
     });
@@ -75,16 +91,18 @@ export function setCurrentScreen(
  * @param gtagFunction Wrapped gtag function that waits for fid to be set before sending an event
  * @param id User ID string to set
  */
-export function setUserId(
+export async function setUserId(
   gtagFunction: Gtag,
-  analyticsId: string,
+  initializationPromise: Promise<string>,
   id: string | null,
   options?: AnalyticsCallOptions
-): void {
+): Promise<void> {
   if (options && options.global) {
     gtagFunction(GtagCommand.SET, { 'user_id': id });
+    return Promise.resolve();
   } else {
-    gtagFunction(GtagCommand.CONFIG, analyticsId, {
+    const measurementId = await initializationPromise;
+    gtagFunction(GtagCommand.CONFIG, measurementId, {
       update: true,
       'user_id': id
     });
@@ -97,12 +115,12 @@ export function setUserId(
  * @param gtagFunction Wrapped gtag function that waits for fid to be set before sending an event
  * @param properties Map of user properties to set
  */
-export function setUserProperties(
+export async function setUserProperties(
   gtagFunction: Gtag,
-  analyticsId: string,
+  initializationPromise: Promise<string>,
   properties: CustomParams,
   options?: AnalyticsCallOptions
-): void {
+): Promise<void> {
   if (options && options.global) {
     const flatProperties: { [key: string]: unknown } = {};
     for (const key of Object.keys(properties)) {
@@ -110,8 +128,10 @@ export function setUserProperties(
       flatProperties[`user_properties.${key}`] = properties[key];
     }
     gtagFunction(GtagCommand.SET, flatProperties);
+    return Promise.resolve();
   } else {
-    gtagFunction(GtagCommand.CONFIG, analyticsId, {
+    const measurementId = await initializationPromise;
+    gtagFunction(GtagCommand.CONFIG, measurementId, {
       update: true,
       'user_properties': properties
     });
@@ -119,13 +139,69 @@ export function setUserProperties(
 }
 
 /**
+ * Retrieves a unique Google Analytics identifier for the web client.
+ * See {@link https://developers.google.com/analytics/devguides/collection/ga4/reference/config#client_id | client_id}.
+ *
+ * @param gtagFunction Wrapped gtag function that waits for fid to be set before sending an event
+ */
+export async function internalGetGoogleAnalyticsClientId(
+  gtagFunction: Gtag,
+  initializationPromise: Promise<string>
+): Promise<string> {
+  const measurementId = await initializationPromise;
+  return new Promise((resolve, reject) => {
+    gtagFunction(
+      GtagCommand.GET,
+      measurementId,
+      'client_id',
+      (clientId: string) => {
+        if (!clientId) {
+          reject(ERROR_FACTORY.create(AnalyticsError.NO_CLIENT_ID));
+        }
+        resolve(clientId);
+      }
+    );
+  });
+}
+
+/**
  * Set whether collection is enabled for this ID.
  *
  * @param enabled If true, collection is enabled for this ID.
  */
-export function setAnalyticsCollectionEnabled(
-  analyticsId: string,
+export async function setAnalyticsCollectionEnabled(
+  initializationPromise: Promise<string>,
   enabled: boolean
+): Promise<void> {
+  const measurementId = await initializationPromise;
+  window[`ga-disable-${measurementId}`] = !enabled;
+}
+
+/**
+ * Consent parameters to default to during 'gtag' initialization.
+ */
+export let defaultConsentSettingsForInit: ConsentSettings | undefined;
+
+/**
+ * Sets the variable {@link defaultConsentSettingsForInit} for use in the initialization of
+ * analytics.
+ *
+ * @param consentSettings Maps the applicable end user consent state for gtag.js.
+ */
+export function _setConsentDefaultForInit(
+  consentSettings?: ConsentSettings
 ): void {
-  window[`ga-disable-${analyticsId}`] = !enabled;
+  defaultConsentSettingsForInit = consentSettings;
+}
+
+/**
+ * Sets the variable `defaultEventParametersForInit` for use in the initialization of
+ * analytics.
+ *
+ * @param customParams Any custom params the user may pass to gtag.js.
+ */
+export function _setDefaultEventParametersForInit(
+  customParams?: CustomParams
+): void {
+  defaultEventParametersForInit = customParams;
 }

@@ -1,6 +1,10 @@
+import { Repo } from '../core/Repo';
+import { Path } from '../core/util/Path';
+import { QueryContext } from '../core/view/EventRegistration';
+
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2021 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,382 +19,117 @@
  * limitations under the License.
  */
 
-import { OnDisconnect } from './onDisconnect';
-import { TransactionResult } from './TransactionResult';
-import { warn } from '../core/util/util';
-import { nextPushId } from '../core/util/NextPushId';
-import { Query } from './Query';
-import { Repo } from '../core/Repo';
-import { Path } from '../core/util/Path';
-import { QueryParams } from '../core/view/QueryParams';
-import {
-  validateRootPathString,
-  validatePathString,
-  validateFirebaseMergeDataArg,
-  validateBoolean,
-  validatePriority,
-  validateFirebaseDataArg,
-  validateWritablePath
-} from '../core/util/validation';
-import { validateArgCount, validateCallback, Deferred } from '@firebase/util';
-
-import { SyncPoint } from '../core/SyncPoint';
-import { Database } from './Database';
-import { DataSnapshot } from './DataSnapshot';
-import * as types from '@firebase/database-types';
-
-export interface ReferenceConstructor {
-  new (repo: Repo, path: Path): Reference;
-}
-
-export class Reference extends Query {
-  then: Promise<Reference>['then'];
-  catch: Promise<Reference>['catch'];
+/**
+ * A `Query` sorts and filters the data at a Database location so only a subset
+ * of the child data is included. This can be used to order a collection of
+ * data by some attribute (for example, height of dinosaurs) as well as to
+ * restrict a large list of items (for example, chat messages) down to a number
+ * suitable for synchronizing to the client. Queries are created by chaining
+ * together one or more of the filter methods defined here.
+ *
+ * Just as with a `DatabaseReference`, you can receive data from a `Query` by using the
+ * `on*()` methods. You will only receive events and `DataSnapshot`s for the
+ * subset of the data that matches your query.
+ *
+ * See {@link https://firebase.google.com/docs/database/web/lists-of-data#sorting_and_filtering_data}
+ * for more information.
+ */
+export interface Query extends QueryContext {
+  /** The `DatabaseReference` for the `Query`'s location. */
+  readonly ref: DatabaseReference;
 
   /**
-   * Call options:
-   *   new Reference(Repo, Path) or
-   *   new Reference(url: string, string|RepoManager)
+   * Returns whether or not the current and provided queries represent the same
+   * location, have the same query parameters, and are from the same instance of
+   * `FirebaseApp`.
    *
-   * Externally - this is the firebase.database.Reference type.
+   * Two `DatabaseReference` objects are equivalent if they represent the same location
+   * and are from the same instance of `FirebaseApp`.
    *
-   * @param {!Repo} repo
-   * @param {(!Path)} path
-   * @extends {Query}
+   * Two `Query` objects are equivalent if they represent the same location,
+   * have the same query parameters, and are from the same instance of
+   * `FirebaseApp`. Equivalent queries share the same sort order, limits, and
+   * starting and ending points.
+   *
+   * @param other - The query to compare against.
+   * @returns Whether or not the current and provided queries are equivalent.
    */
-  constructor(repo: Repo, path: Path) {
-    if (!(repo instanceof Repo)) {
-      throw new Error(
-        'new Reference() no longer supported - use app.database().'
-      );
-    }
-
-    // call Query's constructor, passing in the repo and path.
-    super(repo, path, QueryParams.DEFAULT, false);
-  }
-
-  /** @return {?string} */
-  getKey(): string | null {
-    validateArgCount('Reference.key', 0, 0, arguments.length);
-
-    if (this.path.isEmpty()) {
-      return null;
-    } else {
-      return this.path.getBack();
-    }
-  }
+  isEqual(other: Query | null): boolean;
 
   /**
-   * @param {!(string|Path)} pathString
-   * @return {!Reference}
+   * Returns a JSON-serializable representation of this object.
+   *
+   * @returns A JSON-serializable representation of this object.
    */
-  child(pathString: string | Path): Reference {
-    validateArgCount('Reference.child', 1, 1, arguments.length);
-    if (typeof pathString === 'number') {
-      pathString = String(pathString);
-    } else if (!(pathString instanceof Path)) {
-      if (this.path.getFront() === null) {
-        validateRootPathString('Reference.child', 1, pathString, false);
-      } else {
-        validatePathString('Reference.child', 1, pathString, false);
-      }
-    }
-
-    return new Reference(this.repo, this.path.child(pathString));
-  }
-
-  /** @return {?Reference} */
-  getParent(): Reference | null {
-    validateArgCount('Reference.parent', 0, 0, arguments.length);
-
-    const parentPath = this.path.parent();
-    return parentPath === null ? null : new Reference(this.repo, parentPath);
-  }
-
-  /** @return {!Reference} */
-  getRoot(): Reference {
-    validateArgCount('Reference.root', 0, 0, arguments.length);
-
-    let ref: Reference = this;
-    while (ref.getParent() !== null) {
-      ref = ref.getParent();
-    }
-    return ref;
-  }
-
-  /** @return {!Database} */
-  databaseProp(): Database {
-    return this.repo.database;
-  }
+  toJSON(): string;
 
   /**
-   * @param {*} newVal
-   * @param {function(?Error)=} onComplete
-   * @return {!Promise}
+   * Gets the absolute URL for this location.
+   *
+   * The `toString()` method returns a URL that is ready to be put into a
+   * browser, curl command, or a `refFromURL()` call. Since all of those expect
+   * the URL to be url-encoded, `toString()` returns an encoded URL.
+   *
+   * Append '.json' to the returned URL when typed into a browser to download
+   * JSON-formatted data. If the location is secured (that is, not publicly
+   * readable), you will get a permission-denied error.
+   *
+   * @returns The absolute URL for this location.
    */
-  set(
-    newVal: unknown,
-    onComplete?: (a: Error | null) => void
-  ): Promise<unknown> {
-    validateArgCount('Reference.set', 1, 2, arguments.length);
-    validateWritablePath('Reference.set', this.path);
-    validateFirebaseDataArg('Reference.set', 1, newVal, this.path, false);
-    validateCallback('Reference.set', 2, onComplete, true);
-
-    const deferred = new Deferred();
-    this.repo.setWithPriority(
-      this.path,
-      newVal,
-      /*priority=*/ null,
-      deferred.wrapCallback(onComplete)
-    );
-    return deferred.promise;
-  }
-
-  /**
-   * @param {!Object} objectToMerge
-   * @param {function(?Error)=} onComplete
-   * @return {!Promise}
-   */
-  update(
-    objectToMerge: object,
-    onComplete?: (a: Error | null) => void
-  ): Promise<unknown> {
-    validateArgCount('Reference.update', 1, 2, arguments.length);
-    validateWritablePath('Reference.update', this.path);
-
-    if (Array.isArray(objectToMerge)) {
-      const newObjectToMerge: { [k: string]: unknown } = {};
-      for (let i = 0; i < objectToMerge.length; ++i) {
-        newObjectToMerge['' + i] = objectToMerge[i];
-      }
-      objectToMerge = newObjectToMerge;
-      warn(
-        'Passing an Array to Firebase.update() is deprecated. ' +
-          'Use set() if you want to overwrite the existing data, or ' +
-          'an Object with integer keys if you really do want to ' +
-          'only update some of the children.'
-      );
-    }
-    validateFirebaseMergeDataArg(
-      'Reference.update',
-      1,
-      objectToMerge,
-      this.path,
-      false
-    );
-    validateCallback('Reference.update', 2, onComplete, true);
-    const deferred = new Deferred();
-    this.repo.update(
-      this.path,
-      objectToMerge as { [k: string]: unknown },
-      deferred.wrapCallback(onComplete)
-    );
-    return deferred.promise;
-  }
-
-  /**
-   * @param {*} newVal
-   * @param {string|number|null} newPriority
-   * @param {function(?Error)=} onComplete
-   * @return {!Promise}
-   */
-  setWithPriority(
-    newVal: unknown,
-    newPriority: string | number | null,
-    onComplete?: (a: Error | null) => void
-  ): Promise<unknown> {
-    validateArgCount('Reference.setWithPriority', 2, 3, arguments.length);
-    validateWritablePath('Reference.setWithPriority', this.path);
-    validateFirebaseDataArg(
-      'Reference.setWithPriority',
-      1,
-      newVal,
-      this.path,
-      false
-    );
-    validatePriority('Reference.setWithPriority', 2, newPriority, false);
-    validateCallback('Reference.setWithPriority', 3, onComplete, true);
-
-    if (this.getKey() === '.length' || this.getKey() === '.keys') {
-      throw 'Reference.setWithPriority failed: ' +
-        this.getKey() +
-        ' is a read-only object.';
-    }
-
-    const deferred = new Deferred();
-    this.repo.setWithPriority(
-      this.path,
-      newVal,
-      newPriority,
-      deferred.wrapCallback(onComplete)
-    );
-    return deferred.promise;
-  }
-
-  /**
-   * @param {function(?Error)=} onComplete
-   * @return {!Promise}
-   */
-  remove(onComplete?: (a: Error | null) => void): Promise<unknown> {
-    validateArgCount('Reference.remove', 0, 1, arguments.length);
-    validateWritablePath('Reference.remove', this.path);
-    validateCallback('Reference.remove', 1, onComplete, true);
-
-    return this.set(null, onComplete);
-  }
-
-  /**
-   * @param {function(*):*} transactionUpdate
-   * @param {(function(?Error, boolean, ?DataSnapshot))=} onComplete
-   * @param {boolean=} applyLocally
-   * @return {!Promise}
-   */
-  transaction(
-    transactionUpdate: (a: unknown) => unknown,
-    onComplete?: (a: Error | null, b: boolean, c: DataSnapshot | null) => void,
-    applyLocally?: boolean
-  ): Promise<TransactionResult> {
-    validateArgCount('Reference.transaction', 1, 3, arguments.length);
-    validateWritablePath('Reference.transaction', this.path);
-    validateCallback('Reference.transaction', 1, transactionUpdate, false);
-    validateCallback('Reference.transaction', 2, onComplete, true);
-    // NOTE: applyLocally is an internal-only option for now.  We need to decide if we want to keep it and how
-    // to expose it.
-    validateBoolean('Reference.transaction', 3, applyLocally, true);
-
-    if (this.getKey() === '.length' || this.getKey() === '.keys') {
-      throw 'Reference.transaction failed: ' +
-        this.getKey() +
-        ' is a read-only object.';
-    }
-
-    if (applyLocally === undefined) {
-      applyLocally = true;
-    }
-
-    const deferred = new Deferred<TransactionResult>();
-    if (typeof onComplete === 'function') {
-      deferred.promise.catch(() => {});
-    }
-
-    const promiseComplete = function(
-      error: Error,
-      committed: boolean,
-      snapshot: DataSnapshot
-    ) {
-      if (error) {
-        deferred.reject(error);
-      } else {
-        deferred.resolve(new TransactionResult(committed, snapshot));
-      }
-      if (typeof onComplete === 'function') {
-        onComplete(error, committed, snapshot);
-      }
-    };
-    this.repo.startTransaction(
-      this.path,
-      transactionUpdate,
-      promiseComplete,
-      applyLocally
-    );
-
-    return deferred.promise;
-  }
-
-  /**
-   * @param {string|number|null} priority
-   * @param {function(?Error)=} onComplete
-   * @return {!Promise}
-   */
-  setPriority(
-    priority: string | number | null,
-    onComplete?: (a: Error | null) => void
-  ): Promise<unknown> {
-    validateArgCount('Reference.setPriority', 1, 2, arguments.length);
-    validateWritablePath('Reference.setPriority', this.path);
-    validatePriority('Reference.setPriority', 1, priority, false);
-    validateCallback('Reference.setPriority', 2, onComplete, true);
-
-    const deferred = new Deferred();
-    this.repo.setWithPriority(
-      this.path.child('.priority'),
-      priority,
-      null,
-      deferred.wrapCallback(onComplete)
-    );
-    return deferred.promise;
-  }
-
-  /**
-   * @param {*=} value
-   * @param {function(?Error)=} onComplete
-   * @return {!Reference}
-   */
-  push(value?: unknown, onComplete?: (a: Error | null) => void): Reference {
-    validateArgCount('Reference.push', 0, 2, arguments.length);
-    validateWritablePath('Reference.push', this.path);
-    validateFirebaseDataArg('Reference.push', 1, value, this.path, true);
-    validateCallback('Reference.push', 2, onComplete, true);
-
-    const now = this.repo.serverTime();
-    const name = nextPushId(now);
-
-    // push() returns a ThennableReference whose promise is fulfilled with a regular Reference.
-    // We use child() to create handles to two different references. The first is turned into a
-    // ThennableReference below by adding then() and catch() methods and is used as the
-    // return value of push(). The second remains a regular Reference and is used as the fulfilled
-    // value of the first ThennableReference.
-    const thennablePushRef = this.child(name);
-    const pushRef = this.child(name);
-
-    let promise;
-    if (value != null) {
-      promise = thennablePushRef.set(value, onComplete).then(() => pushRef);
-    } else {
-      promise = Promise.resolve(pushRef);
-    }
-
-    thennablePushRef.then = promise.then.bind(promise);
-    thennablePushRef.catch = promise.then.bind(promise, undefined);
-
-    if (typeof onComplete === 'function') {
-      promise.catch(() => {});
-    }
-
-    return thennablePushRef;
-  }
-
-  /**
-   * @return {!OnDisconnect}
-   */
-  onDisconnect(): OnDisconnect {
-    validateWritablePath('Reference.onDisconnect', this.path);
-    return new OnDisconnect(this.repo, this.path);
-  }
-
-  get database(): Database {
-    return this.databaseProp();
-  }
-
-  get key(): string | null {
-    return this.getKey();
-  }
-
-  get parent(): Reference | null {
-    return this.getParent();
-  }
-
-  get root(): Reference {
-    return this.getRoot();
-  }
+  toString(): string;
 }
 
 /**
- * Define reference constructor in various modules
+ * A `DatabaseReference` represents a specific location in your Database and can be used
+ * for reading or writing data to that Database location.
  *
- * We are doing this here to avoid several circular
- * dependency issues
+ * You can reference the root or child location in your Database by calling
+ * `ref()` or `ref("child/path")`.
+ *
+ * Writing is done with the `set()` method and reading can be done with the
+ * `on*()` method. See {@link
+ * https://firebase.google.com/docs/database/web/read-and-write}
  */
-Query.__referenceConstructor = Reference;
-SyncPoint.__referenceConstructor = Reference;
+export interface DatabaseReference extends Query {
+  /**
+   * The last part of the `DatabaseReference`'s path.
+   *
+   * For example, `"ada"` is the key for
+   * `https://<DATABASE_NAME>.firebaseio.com/users/ada`.
+   *
+   * The key of a root `DatabaseReference` is `null`.
+   */
+  readonly key: string | null;
+
+  /**
+   * The parent location of a `DatabaseReference`.
+   *
+   * The parent of a root `DatabaseReference` is `null`.
+   */
+  readonly parent: DatabaseReference | null;
+
+  /** The root `DatabaseReference` of the Database. */
+  readonly root: DatabaseReference;
+}
+
+/**
+ * A `Promise` that can also act as a `DatabaseReference` when returned by
+ * {@link push}. The reference is available immediately and the `Promise` resolves
+ * as the write to the backend completes.
+ */
+export interface ThenableReference
+  extends DatabaseReference,
+    Pick<Promise<DatabaseReference>, 'then' | 'catch'> {}
+
+/** A callback that can invoked to remove a listener. */
+export type Unsubscribe = () => void;
+
+/** An options objects that can be used to customize a listener. */
+export interface ListenOptions {
+  /** Whether to remove the listener after its first invocation. */
+  readonly onlyOnce?: boolean;
+}
+
+export interface ReferenceConstructor {
+  new (repo: Repo, path: Path): DatabaseReference;
+}

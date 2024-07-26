@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,11 @@
  * limitations under the License.
  */
 
-import { FirebaseApp, FirebaseOptions } from '@firebase/app-types';
-import { FirebaseError } from '@firebase/util';
-import { AppConfig } from '../interfaces/app-config';
 import { ERROR_FACTORY, ErrorCode } from '../util/errors';
+import { FirebaseApp, FirebaseOptions } from '@firebase/app';
+
+import { AppConfig } from '../interfaces/app-config';
+import { FirebaseError } from '@firebase/util';
 
 export function extractAppConfig(app: FirebaseApp): AppConfig {
   if (!app || !app.options) {

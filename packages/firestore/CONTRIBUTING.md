@@ -34,7 +34,7 @@ on port 8080, which is default when running it via CLI.
     ```
   * Run the emulator
     ```
-    firebase serve --only firestore
+    firebase emulators:start --only firestore
     ```
 
 ### Running Firestore Tests
@@ -61,7 +61,7 @@ yarn test:browser --integration
 
 # Run browser integration tests against a Firestore server running on
 # localhost:8080.
-yarn test:browser --integration --local
+yarn test:browser:emulator --integration
 
 # Run all node tests once (unit and integration) against the emulator.
 yarn test:node

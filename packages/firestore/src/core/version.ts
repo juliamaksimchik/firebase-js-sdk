@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,9 @@
  * limitations under the License.
  */
 
-import firebase from '@firebase/app';
-
 /** The semver (www.semver.org) version of the SDK. */
-export const SDK_VERSION = firebase.SDK_VERSION;
+import { version } from '../../../firebase/package.json';
+export let SDK_VERSION = version;
+export function setSDKVersion(version: string): void {
+  SDK_VERSION = version;
+}

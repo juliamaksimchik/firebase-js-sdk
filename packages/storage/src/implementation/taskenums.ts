@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,47 +20,71 @@
  */
 
 /**
- * Enum for task events.
- * @enum {string}
+ * An event that is triggered on a task.
+ * @internal
  */
 export type TaskEvent = string;
+
+/**
+ * An event that is triggered on a task.
+ * @internal
+ */
 export const TaskEvent = {
-  /** Triggered whenever the task changes or progress is updated. */
+  /**
+   * For this event,
+   * <ul>
+   *   <li>The `next` function is triggered on progress updates and when the
+   *       task is paused/resumed with an `UploadTaskSnapshot` as the first
+   *       argument.</li>
+   *   <li>The `error` function is triggered if the upload is canceled or fails
+   *       for another reason.</li>
+   *   <li>The `complete` function is triggered if the upload completes
+   *       successfully.</li>
+   * </ul>
+   */
   STATE_CHANGED: 'state_changed'
 };
 
 /**
  * Internal enum for task state.
- * @enum {string}
  */
-export type InternalTaskState = string;
-export const InternalTaskState = {
-  RUNNING: 'running',
-  PAUSING: 'pausing',
-  PAUSED: 'paused',
-  SUCCESS: 'success',
-  CANCELING: 'canceling',
-  CANCELED: 'canceled',
-  ERROR: 'error'
-};
+export const enum InternalTaskState {
+  RUNNING = 'running',
+  PAUSING = 'pausing',
+  PAUSED = 'paused',
+  SUCCESS = 'success',
+  CANCELING = 'canceling',
+  CANCELED = 'canceled',
+  ERROR = 'error'
+}
 
 /**
- * External (API-surfaced) enum for task state.
- * @enum {string}
+ * Represents the current state of a running upload.
+ * @internal
  */
-export type TaskState = string;
+export type TaskState = (typeof TaskState)[keyof typeof TaskState];
+
+// type keys = keyof TaskState
+/**
+ * Represents the current state of a running upload.
+ * @internal
+ */
 export const TaskState = {
   /** The task is currently transferring data. */
   RUNNING: 'running',
+
   /** The task was paused by the user. */
   PAUSED: 'paused',
+
   /** The task completed successfully. */
   SUCCESS: 'success',
+
   /** The task was canceled. */
   CANCELED: 'canceled',
+
   /** The task failed with an error. */
   ERROR: 'error'
-};
+} as const;
 
 export function taskStateFromInternalTaskState(
   state: InternalTaskState

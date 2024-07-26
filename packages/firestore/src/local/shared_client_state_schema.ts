@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,12 @@
  * limitations under the License.
  */
 
-import { BatchId, MutationBatchState, TargetId } from '../core/types';
-import { QueryTargetState } from './shared_client_state_syncer';
-import { assert } from '../util/assert';
-import { ClientId } from './shared_client_state';
 import { User } from '../auth/user';
+import { BatchId, MutationBatchState, TargetId } from '../core/types';
+import { debugAssert } from '../util/assert';
+
+import { ClientId } from './shared_client_state';
+import { QueryTargetState } from './shared_client_state_syncer';
 
 // The format of the LocalStorage key that stores the client state is:
 //     firestore_clients_<persistence_prefix>_<instance_key>
@@ -30,7 +31,7 @@ export function createWebStorageClientStateKey(
   persistenceKey: string,
   clientId: ClientId
 ): string {
-  assert(
+  debugAssert(
     clientId.indexOf('_') === -1,
     `Client key cannot contain '_', but was '${clientId}'`
   );
@@ -113,6 +114,16 @@ export const ONLINE_STATE_KEY_PREFIX = 'firestore_online_state';
 /** Assembles the key for the online state of the primary tab. */
 export function createWebStorageOnlineStateKey(persistenceKey: string): string {
   return `${ONLINE_STATE_KEY_PREFIX}_${persistenceKey}`;
+}
+
+// The WebStorage prefix that plays as a event to indicate the remote documents
+// might have changed due to some secondary tabs loading a bundle.
+// format of the key is:
+//     firestore_bundle_loaded_v2_<persistenceKey>
+// The version ending with "v2" stores the list of modified collection groups.
+export const BUNDLE_LOADED_KEY_PREFIX = 'firestore_bundle_loaded_v2';
+export function createBundleLoadedKey(persistenceKey: string): string {
+  return `${BUNDLE_LOADED_KEY_PREFIX}_${persistenceKey}`;
 }
 
 /**

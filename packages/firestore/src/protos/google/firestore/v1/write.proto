@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC.
+// Copyright 2021 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,16 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//
 
 syntax = "proto3";
 
 package google.firestore.v1;
 
-import "google/api/annotations.proto";
+import "google/firestore/v1/bloom_filter.proto";
 import "google/firestore/v1/common.proto";
 import "google/firestore/v1/document.proto";
 import "google/protobuf/timestamp.proto";
+import "google/api/annotations.proto";
 
 option csharp_namespace = "Google.Cloud.Firestore.V1";
 option go_package = "google.golang.org/genproto/googleapis/firestore/v1;firestore";
@@ -29,7 +29,7 @@ option java_outer_classname = "WriteProto";
 option java_package = "com.google.firestore.v1";
 option objc_class_prefix = "GCFS";
 option php_namespace = "Google\\Cloud\\Firestore\\V1";
-
+option ruby_package = "Google::Cloud::Firestore::V1";
 
 // A write on a document.
 message Write {
@@ -47,10 +47,7 @@ message Write {
     // This only requires read access to the document.
     string verify = 5;
 
-    // Applies a tranformation to a document.
-    // At most one `transform` per document is allowed in a given request.
-    // An `update` cannot follow a `transform` on the same document in a given
-    // request.
+    // Applies a transformation to a document.
     DocumentTransform transform = 6;
   }
 
@@ -65,6 +62,13 @@ message Write {
   // deleted from the document on the server.
   // The field paths in this mask must not contain a reserved field name.
   DocumentMask update_mask = 3;
+
+  // The transforms to perform after update.
+  //
+  // This field can be set only when the operation is `update`. If present, this
+  // write is equivalent to performing `update` and `transform` to the same
+  // document atomically and in order.
+  repeated DocumentTransform.FieldTransform update_transforms = 7;
 
   // An optional precondition on the document.
   //
@@ -82,7 +86,8 @@ message DocumentTransform {
       SERVER_VALUE_UNSPECIFIED = 0;
 
       // The time at which the server processed the request, with millisecond
-      // precision.
+      // precision. If used on multiple fields (same or different documents) in
+      // a transaction, all the fields will get the same server timestamp.
       REQUEST_TIME = 1;
     }
 
@@ -230,7 +235,7 @@ message DocumentDelete {
 //
 // Sent if the document is no longer relevant to a target and is out of view.
 // Can be sent instead of a DocumentDelete or a DocumentChange if the server
-// can not send the new value of the document.
+// cannot send the new value of the document.
 //
 // Multiple [DocumentRemove][google.firestore.v1.DocumentRemove] messages may be returned for the same logical
 // write or delete, if multiple targets are affected.
@@ -257,4 +262,18 @@ message ExistenceFilter {
   // If different from the count of documents in the client that match, the
   // client must manually determine which documents no longer match the target.
   int32 count = 2;
+
+  // A bloom filter that contains the UTF-8 byte encodings of the resource names
+  // of the documents that match [target_id][google.firestore.v1.ExistenceFilter.target_id], in the
+  // form `projects/{project_id}/databases/{database_id}/documents/{document_path}`
+  // that have NOT changed since the query results indicated by the resume token
+  // or timestamp given in `Target.resume_type`.
+  //
+  // This bloom filter may be omitted at the server's discretion, such as if it
+  // is deemed that the client will not make use of it or if it is too
+  // computationally expensive to calculate or transmit. Clients must gracefully
+  // handle this field being absent by falling back to the logic used before
+  // this field existed; that is, re-add the target without a resume token to
+  // figure out which documents in the client's cache are out of sync.
+  BloomFilter unchanged_names = 3;
 }

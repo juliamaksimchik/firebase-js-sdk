@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,11 +18,18 @@
 /**
  * @fileoverview Functions to create and manipulate URLs for the server API.
  */
-import { DEFAULT_HOST } from './constants';
 import { UrlParams } from './requestinfo';
 
-export function makeUrl(urlPart: string): string {
-  return `https://${DEFAULT_HOST}/v0${urlPart}`;
+export function makeUrl(
+  urlPart: string,
+  host: string,
+  protocol: string
+): string {
+  let origin = host;
+  if (protocol == null) {
+    origin = `https://${host}`;
+  }
+  return `${protocol}://${origin}/v0${urlPart}`;
 }
 
 export function makeQueryString(params: UrlParams): string {
@@ -30,7 +37,6 @@ export function makeQueryString(params: UrlParams): string {
   let queryPart = '?';
   for (const key in params) {
     if (params.hasOwnProperty(key)) {
-      // @ts-ignore TODO: remove once typescript is upgraded to 3.5.x
       const nextPart = encode(key) + '=' + encode(params[key]);
       queryPart = queryPart + nextPart + '&';
     }

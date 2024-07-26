@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,54 +16,21 @@
  */
 
 import { User } from '../auth/user';
-
-import { ListenSequenceNumber } from '../core/types';
+import { TargetId } from '../core/types';
 import { DocumentKey } from '../model/document_key';
+
+import { BundleCache } from './bundle_cache';
+import { DocumentOverlayCache } from './document_overlay_cache';
 import { IndexManager } from './index_manager';
-import { LocalStore } from './local_store';
 import { MutationQueue } from './mutation_queue';
 import { PersistencePromise } from './persistence_promise';
-import { TargetCache } from './target_cache';
-import { ReferenceSet } from './reference_set';
+import {
+  PersistenceTransaction,
+  PersistenceTransactionMode
+} from './persistence_transaction';
 import { RemoteDocumentCache } from './remote_document_cache';
-import { ClientId, SharedClientState } from './shared_client_state';
+import { TargetCache } from './target_cache';
 import { TargetData } from './target_data';
-import { DatabaseInfo } from '../core/database_info';
-import { PersistenceSettings } from '../core/firestore_client';
-import { Platform } from '../platform/platform';
-import { AsyncQueue } from '../util/async_queue';
-
-export const PRIMARY_LEASE_LOST_ERROR_MSG =
-  'The current tab is not in the required state to perform this operation. ' +
-  'It might be necessary to refresh the browser tab.';
-
-/**
- * A base class representing a persistence transaction, encapsulating both the
- * transaction's sequence numbers as well as a list of onCommitted listeners.
- *
- * When you call Persistence.runTransaction(), it will create a transaction and
- * pass it to your callback. You then pass it to any method that operates
- * on persistence.
- */
-export abstract class PersistenceTransaction {
-  private readonly onCommittedListeners: Array<() => void> = [];
-
-  abstract readonly currentSequenceNumber: ListenSequenceNumber;
-
-  addOnCommittedListener(listener: () => void): void {
-    this.onCommittedListeners.push(listener);
-  }
-
-  raiseOnCommittedEvent(): void {
-    this.onCommittedListeners.forEach(listener => listener());
-  }
-}
-
-/** The different modes supported by `IndexedDbPersistence.runTransaction()`. */
-export type PersistenceTransactionMode =
-  | 'readonly'
-  | 'readwrite'
-  | 'readwrite-primary';
 
 /**
  * Callback type for primary state notifications. This callback can be
@@ -91,21 +58,17 @@ export type PrimaryStateListener = (isPrimary: boolean) => Promise<void>;
  * generate sequence numbers (getCurrentSequenceNumber()).
  */
 export interface ReferenceDelegate {
-  /**
-   * Registers a ReferenceSet of documents that should be considered 'referenced' and not eligible
-   * for removal during garbage collection.
-   */
-  setInMemoryPins(pins: ReferenceSet): void;
-
   /** Notify the delegate that the given document was added to a target. */
   addReference(
     txn: PersistenceTransaction,
+    targetId: TargetId,
     doc: DocumentKey
   ): PersistencePromise<void>;
 
   /** Notify the delegate that the given document was removed from a target. */
   removeReference(
     txn: PersistenceTransaction,
+    targetId: TargetId,
     doc: DocumentKey
   ): PersistencePromise<void>;
 
@@ -118,8 +81,11 @@ export interface ReferenceDelegate {
     targetData: TargetData
   ): PersistencePromise<void>;
 
-  /** Notify the delegate that a document is no longer being mutated by the user. */
-  removeMutationReference(
+  /**
+   * Notify the delegate that a document may no longer be part of any views or
+   * have any mutations associated.
+   */
+  markPotentiallyOrphaned(
     txn: PersistenceTransaction,
     doc: DocumentKey
   ): PersistencePromise<void>;
@@ -175,21 +141,13 @@ export interface Persistence {
 
   readonly referenceDelegate: ReferenceDelegate;
 
+  /** Starts persistence. */
+  start(): Promise<void>;
+
   /**
    * Releases any resources held during eager shutdown.
    */
   shutdown(): Promise<void>;
-
-  /**
-   * Registers a listener that gets called when the primary state of the
-   * instance changes. Upon registering, this listener is invoked immediately
-   * with the current primary state.
-   *
-   * PORTING NOTE: This is only used for Web multi-tab.
-   */
-  setPrimaryStateListener(
-    primaryStateListener: PrimaryStateListener
-  ): Promise<void>;
 
   /**
    * Registers a listener that gets called when the database receives a
@@ -210,15 +168,6 @@ export interface Persistence {
   setNetworkEnabled(networkEnabled: boolean): void;
 
   /**
-   * Returns the IDs of the clients that are currently active. If multi-tab
-   * is not supported, returns an array that only contains the local client's
-   * ID.
-   *
-   * PORTING NOTE: This is only used for Web multi-tab.
-   */
-  getActiveClients(): Promise<ClientId[]>;
-
-  /**
    * Returns a MutationQueue representing the persisted mutations for the
    * given user.
    *
@@ -226,9 +175,9 @@ export interface Persistence {
    * this is called for a given user. In particular, the memory-backed
    * implementation does this to emulate the persisted implementation to the
    * extent possible (e.g. in the case of uid switching from
-   * sally=>jack=>sally, sally's mutation queue will be preserved).
+   * sally=&gt;jack=&gt;sally, sally's mutation queue will be preserved).
    */
-  getMutationQueue(user: User): MutationQueue;
+  getMutationQueue(user: User, indexManager: IndexManager): MutationQueue;
 
   /**
    * Returns a TargetCache representing the persisted cache of targets.
@@ -250,13 +199,28 @@ export interface Persistence {
   getRemoteDocumentCache(): RemoteDocumentCache;
 
   /**
+   * Returns a BundleCache representing the persisted cache of loaded bundles.
+   *
+   * Note: The implementation is free to return the same instance every time
+   * this is called. In particular, the memory-backed implementation does this
+   * to emulate the persisted implementation to the extent possible.
+   */
+  getBundleCache(): BundleCache;
+
+  /**
    * Returns an IndexManager instance that manages our persisted query indexes.
    *
    * Note: The implementation is free to return the same instance every time
    * this is called. In particular, the memory-backed implementation does this
    * to emulate the persisted implementation to the extent possible.
    */
-  getIndexManager(): IndexManager;
+  getIndexManager(user: User): IndexManager;
+
+  /**
+   * Returns a DocumentOverlayCache representing the documents that are mutated
+   * locally.
+   */
+  getDocumentOverlayCache(user: User): DocumentOverlayCache;
 
   /**
    * Performs an operation inside a persistence transaction. Any reads or writes
@@ -268,16 +232,16 @@ export interface Persistence {
    * the transaction will be committed and the Promise returned by this method
    * will resolve.
    *
-   * @param action A description of the action performed by this transaction,
+   * @param action - A description of the action performed by this transaction,
    * used for logging.
-   * @param mode The underlying mode of the IndexedDb transaction. Can be
-   * 'readonly`, 'readwrite' or 'readwrite-primary'. Transactions marked
+   * @param mode - The underlying mode of the IndexedDb transaction. Can be
+   * 'readonly', 'readwrite' or 'readwrite-primary'. Transactions marked
    * 'readwrite-primary' can only be executed by the primary client. In this
    * mode, the transactionOperation will not be run if the primary lease cannot
    * be acquired and the returned promise will be rejected with a
    * FAILED_PRECONDITION error.
-   * @param transactionOperation The operation to run inside a transaction.
-   * @return A promise that is resolved once the transaction completes.
+   * @param transactionOperation - The operation to run inside a transaction.
+   * @returns A `Promise` that is resolved once the transaction completes.
    */
   runTransaction<T>(
     action: string,
@@ -289,34 +253,10 @@ export interface Persistence {
 }
 
 /**
- * Interface implemented by the LRU scheduler to start(), stop() and restart
- * garbage collection.
+ * Interface to schedule periodic tasks within SDK.
  */
-export interface GarbageCollectionScheduler {
+export interface Scheduler {
   readonly started: boolean;
-  start(localStore: LocalStore): void;
+  start(): void;
   stop(): void;
-}
-
-/**
- * Provides all persistence components for Firestore. Consumers have to invoke
- * configure() once before accessing any of the individual components.
- */
-export interface PersistenceProvider {
-  initialize(
-    asyncQueue: AsyncQueue,
-    databaseInfo: DatabaseInfo,
-    platform: Platform,
-    clientId: ClientId,
-    initialUser: User,
-    settings: PersistenceSettings
-  ): Promise<void>;
-
-  getPersistence(): Persistence;
-
-  getGarbageCollectionScheduler(): GarbageCollectionScheduler;
-
-  getSharedClientState(): SharedClientState;
-
-  clearPersistence(databaseId: DatabaseInfo): Promise<void>;
 }

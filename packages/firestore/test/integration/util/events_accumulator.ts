@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,17 +15,17 @@
  * limitations under the License.
  */
 
-import * as firestore from '@firebase/firestore-types';
-import { Deferred } from '@firebase/util';
 import { expect } from 'chai';
+
+import { Deferred } from '../../util/promise';
+
+import { DocumentSnapshot, QuerySnapshot } from './firebase_export';
 
 /**
  * A helper object that can accumulate an arbitrary amount of events and resolve
  * a promise when expected number has been emitted.
  */
-export class EventsAccumulator<
-  T extends firestore.DocumentSnapshot | firestore.QuerySnapshot
-> {
+export class EventsAccumulator<T extends DocumentSnapshot | QuerySnapshot> {
   private events: T[] = [];
   private waitingFor: number = 0;
   private deferred: Deferred<T[]> | null = null;

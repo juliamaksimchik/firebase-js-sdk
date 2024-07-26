@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,11 @@
  * limitations under the License.
  */
 
+import { base64Encode, isNodeSdk, stringify } from '@firebase/util';
+
+import { RepoInfo, repoInfoConnectionURL } from '../core/RepoInfo';
+import { StatsCollection } from '../core/stats/StatsCollection';
+import { statsManagerGetCollection } from '../core/stats/StatsManager';
 import {
   executeWhenDOMReady,
   isChromeExtensionContentScript,
@@ -24,10 +29,11 @@ import {
   LUIDGenerator,
   splitStringBySize
 } from '../core/util/util';
-import { StatsManager } from '../core/stats/StatsManager';
-import { PacketReceiver } from './polling/PacketReceiver';
+
 import {
-  FORGE_DOMAIN,
+  APP_CHECK_TOKEN_PARAM,
+  APPLICATION_ID_PARAM,
+  FORGE_DOMAIN_RE,
   FORGE_REF,
   LAST_SESSION_PARAM,
   LONG_POLLING,
@@ -36,11 +42,8 @@ import {
   TRANSPORT_SESSION_PARAM,
   VERSION_PARAM
 } from './Constants';
-import { base64Encode, stringify, isNodeSdk } from '@firebase/util';
-
+import { PacketReceiver } from './polling/PacketReceiver';
 import { Transport } from './Transport';
-import { RepoInfo } from '../core/RepoInfo';
-import { StatsCollection } from '../core/stats/StatsCollection';
 
 // URL query parameters associated with longpolling
 export const FIREBASE_LONGPOLL_START_PARAM = 'start';
@@ -68,23 +71,16 @@ const MAX_PAYLOAD_SIZE = MAX_URL_DATA_SIZE - SEG_HEADER_SIZE;
  * Keepalive period
  * send a fresh request at minimum every 25 seconds. Opera has a maximum request
  * length of 30 seconds that we can't exceed.
- * @const
- * @type {number}
  */
 const KEEPALIVE_REQUEST_INTERVAL = 25000;
 
 /**
  * How long to wait before aborting a long-polling connection attempt.
- * @const
- * @type {number}
  */
 const LP_CONNECT_TIMEOUT = 30000;
 
 /**
  * This class manages a single long-polling connection.
- *
- * @constructor
- * @implements {Transport}
  */
 export class BrowserPollConnection implements Transport {
   bytesSent = 0;
@@ -104,29 +100,39 @@ export class BrowserPollConnection implements Transport {
   private onDisconnect_: ((a?: boolean) => void) | null;
 
   /**
-   * @param {string} connId An identifier for this connection, used for logging
-   * @param {RepoInfo} repoInfo The info for the endpoint to send data to.
-   * @param {string=} transportSessionId Optional transportSessionid if we are reconnecting for an existing
-   *                                         transport session
-   * @param {string=}  lastSessionId Optional lastSessionId if the PersistentConnection has already created a
-   *                                     connection previously
+   * @param connId An identifier for this connection, used for logging
+   * @param repoInfo The info for the endpoint to send data to.
+   * @param applicationId The Firebase App ID for this project.
+   * @param appCheckToken The AppCheck token for this client.
+   * @param authToken The AuthToken to use for this connection.
+   * @param transportSessionId Optional transportSessionid if we are
+   * reconnecting for an existing transport session
+   * @param lastSessionId Optional lastSessionId if the PersistentConnection has
+   * already created a connection previously
    */
   constructor(
     public connId: string,
     public repoInfo: RepoInfo,
+    private applicationId?: string,
+    private appCheckToken?: string,
+    private authToken?: string,
     public transportSessionId?: string,
     public lastSessionId?: string
   ) {
     this.log_ = logWrapper(connId);
-    this.stats_ = StatsManager.getCollection(repoInfo);
-    this.urlFn = (params: { [k: string]: string }) =>
-      repoInfo.connectionURL(LONG_POLLING, params);
+    this.stats_ = statsManagerGetCollection(repoInfo);
+    this.urlFn = (params: { [k: string]: string }) => {
+      // Always add the token if we have one.
+      if (this.appCheckToken) {
+        params[APP_CHECK_TOKEN_PARAM] = this.appCheckToken;
+      }
+      return repoInfoConnectionURL(repoInfo, LONG_POLLING, params);
+    };
   }
 
   /**
-   *
-   * @param {function(Object)} onMessage Callback when messages arrive
-   * @param {function()} onDisconnect Callback with connection lost.
+   * @param onMessage - Callback when messages arrive
+   * @param onDisconnect - Callback with connection lost.
    */
   open(onMessage: (msg: {}) => void, onDisconnect: (a?: boolean) => void) {
     this.curSegmentNum = 0;
@@ -203,9 +209,8 @@ export class BrowserPollConnection implements Transport {
         Math.random() * 100000000
       );
       if (this.scriptTagHolder.uniqueCallbackIdentifier) {
-        urlParams[
-          FIREBASE_LONGPOLL_CALLBACK_ID_PARAM
-        ] = this.scriptTagHolder.uniqueCallbackIdentifier;
+        urlParams[FIREBASE_LONGPOLL_CALLBACK_ID_PARAM] =
+          this.scriptTagHolder.uniqueCallbackIdentifier;
       }
       urlParams[VERSION_PARAM] = PROTOCOL_VERSION;
       if (this.transportSessionId) {
@@ -214,10 +219,16 @@ export class BrowserPollConnection implements Transport {
       if (this.lastSessionId) {
         urlParams[LAST_SESSION_PARAM] = this.lastSessionId;
       }
+      if (this.applicationId) {
+        urlParams[APPLICATION_ID_PARAM] = this.applicationId;
+      }
+      if (this.appCheckToken) {
+        urlParams[APP_CHECK_TOKEN_PARAM] = this.appCheckToken;
+      }
       if (
         typeof location !== 'undefined' &&
-        location.href &&
-        location.href.indexOf(FORGE_DOMAIN) !== -1
+        location.hostname &&
+        FORGE_DOMAIN_RE.test(location.hostname)
       ) {
         urlParams[REFERER_PARAM] = FORGE_REF;
       }
@@ -237,7 +248,7 @@ export class BrowserPollConnection implements Transport {
     this.addDisconnectPingFrame(this.id, this.password);
   }
 
-  private static forceAllow_: boolean;
+  static forceAllow_: boolean;
 
   /**
    * Forces long polling to be considered as a potential transport
@@ -246,7 +257,7 @@ export class BrowserPollConnection implements Transport {
     BrowserPollConnection.forceAllow_ = true;
   }
 
-  private static forceDisallow_: boolean;
+  static forceDisallow_: boolean;
 
   /**
    * Forces longpolling to not be considered as a potential transport
@@ -281,7 +292,6 @@ export class BrowserPollConnection implements Transport {
 
   /**
    * Stops polling and cleans up the iframe
-   * @private
    */
   private shutdown_() {
     this.isClosed_ = true;
@@ -305,7 +315,6 @@ export class BrowserPollConnection implements Transport {
 
   /**
    * Triggered when this transport is closed
-   * @private
    */
   private onClosed_() {
     if (!this.isClosed_) {
@@ -333,7 +342,7 @@ export class BrowserPollConnection implements Transport {
   /**
    * Send the JSON object down to the server. It will need to be stringified, base64 encoded, and then
    * broken into chunks (since URLs have a small maximum length).
-   * @param {!Object} data The JSON data to transmit.
+   * @param data - The JSON data to transmit.
    */
   send(data: {}) {
     const dataStr = stringify(data);
@@ -363,8 +372,6 @@ export class BrowserPollConnection implements Transport {
    * This is how we notify the server that we're leaving.
    * We aren't able to send requests with DHTML on a window close event, but we can
    * trigger XHR requests in some browsers (everything but Opera basically).
-   * @param {!string} id
-   * @param {!string} pw
    */
   addDisconnectPingFrame(id: string, pw: string) {
     if (isNodeSdk()) {
@@ -383,8 +390,6 @@ export class BrowserPollConnection implements Transport {
 
   /**
    * Used to track the bytes received by this client
-   * @param {*} args
-   * @private
    */
   private incrementIncomingBytes_(args: unknown) {
     // TODO: This is an annoying perf hit just to track the number of incoming bytes.  Maybe it should be opt-in.
@@ -394,14 +399,13 @@ export class BrowserPollConnection implements Transport {
   }
 }
 
-// eslint-disable-next-line @typescript-eslint/interface-name-prefix
+// eslint-disable-next-line @typescript-eslint/naming-convention
 export interface IFrameElement extends HTMLIFrameElement {
   doc: Document;
 }
 
 /*********************************************************************************************
  * A wrapper around an iframe that is used as a long-polling script holder.
- * @constructor
  *********************************************************************************************/
 export class FirebaseIFrameScriptHolder {
   //We maintain a count of all of the outstanding requests, because if we have too many active at once it can cause
@@ -431,7 +435,7 @@ export class FirebaseIFrameScriptHolder {
   onMessageCB: (...args: unknown[]) => void;
 
   /**
-   * @param commandCB - The callback to be called when control commands are recevied from the server.
+   * @param commandCB - The callback to be called when control commands are received from the server.
    * @param onMessageCB - The callback to be triggered when responses arrive from the server.
    * @param onDisconnect - The callback to be triggered when this tag holder is closed
    * @param urlFn - A function that provides the URL of the endpoint to send data to.
@@ -451,9 +455,8 @@ export class FirebaseIFrameScriptHolder {
       window[
         FIREBASE_LONGPOLL_COMMAND_CB_NAME + this.uniqueCallbackIdentifier
       ] = commandCB;
-      window[
-        FIREBASE_LONGPOLL_DATA_CB_NAME + this.uniqueCallbackIdentifier
-      ] = onMessageCB;
+      window[FIREBASE_LONGPOLL_DATA_CB_NAME + this.uniqueCallbackIdentifier] =
+        onMessageCB;
 
       //Create an iframe for us to add script tags to.
       this.myIFrame = FirebaseIFrameScriptHolder.createIFrame_();
@@ -490,8 +493,6 @@ export class FirebaseIFrameScriptHolder {
   /**
    * Each browser has its own funny way to handle iframes. Here we mush them all together into one object that I can
    * actually use.
-   * @private
-   * @return {Element}
    */
   private static createIFrame_(): IFrameElement {
     const iframe = document.createElement('iframe') as IFrameElement;
@@ -546,8 +547,8 @@ export class FirebaseIFrameScriptHolder {
     if (this.myIFrame) {
       //We have to actually remove all of the html inside this iframe before removing it from the
       //window, or IE will continue loading and executing the script tags we've already added, which
-      //can lead to some errors being thrown. Setting innerHTML seems to be the easiest way to do this.
-      this.myIFrame.doc.body.innerHTML = '';
+      //can lead to some errors being thrown. Setting textContent seems to be the safest way to do this.
+      this.myIFrame.doc.body.textContent = '';
       setTimeout(() => {
         if (this.myIFrame !== null) {
           document.body.removeChild(this.myIFrame);
@@ -566,8 +567,8 @@ export class FirebaseIFrameScriptHolder {
 
   /**
    * Actually start the long-polling session by adding the first script tag(s) to the iframe.
-   * @param {!string} id - The ID of this connection
-   * @param {!string} pw - The password for this connection
+   * @param id - The ID of this connection
+   * @param pw - The password for this connection
    */
   startLongPoll(id: string, pw: string) {
     this.myID = id;
@@ -667,9 +668,8 @@ export class FirebaseIFrameScriptHolder {
 
   /**
    * Add a script tag for a regular long-poll request.
-   * @param {!string} url - The URL of the script tag.
-   * @param {!number} serial - The serial number of the request.
-   * @private
+   * @param url - The URL of the script tag.
+   * @param serial - The serial number of the request.
    */
   private addLongPollTag_(url: string, serial: number) {
     //remember that we sent this request.
@@ -700,8 +700,8 @@ export class FirebaseIFrameScriptHolder {
 
   /**
    * Add an arbitrary script tag to the iframe.
-   * @param {!string} url - The URL for the script tag source.
-   * @param {!function()} loadCB - A callback to be triggered once the script has loaded.
+   * @param url - The URL for the script tag source.
+   * @param loadCB - A callback to be triggered once the script has loaded.
    */
   addTag(url: string, loadCB: () => void) {
     if (isNodeSdk()) {
@@ -719,18 +719,19 @@ export class FirebaseIFrameScriptHolder {
           newScript.async = true;
           newScript.src = url;
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          newScript.onload = (newScript as any).onreadystatechange = function() {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const rstate = (newScript as any).readyState;
-            if (!rstate || rstate === 'loaded' || rstate === 'complete') {
+          newScript.onload = (newScript as any).onreadystatechange =
+            function () {
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              newScript.onload = (newScript as any).onreadystatechange = null;
-              if (newScript.parentNode) {
-                newScript.parentNode.removeChild(newScript);
+              const rstate = (newScript as any).readyState;
+              if (!rstate || rstate === 'loaded' || rstate === 'complete') {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                newScript.onload = (newScript as any).onreadystatechange = null;
+                if (newScript.parentNode) {
+                  newScript.parentNode.removeChild(newScript);
+                }
+                loadCB();
               }
-              loadCB();
-            }
-          };
+            };
           newScript.onerror = () => {
             log('Long-poll script failed to load: ' + url);
             this.sendNewPolls = false;

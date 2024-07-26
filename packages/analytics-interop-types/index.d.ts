@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,8 +21,8 @@ export interface FirebaseAnalyticsInternal {
    * automatically associates this logged event with this Firebase web
    * app instance on this device.
    * List of official event parameters can be found in
-   * {@link https://developers.google.com/gtagjs/reference/event
-   * the gtag.js reference documentation}.
+   * {@link https://developers.google.com/gtagjs/reference/ga4-events
+   * the GA4 reference documentation}.
    */
   logEvent(
     eventName: string,

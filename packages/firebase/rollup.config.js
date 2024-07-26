@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2018 Google Inc.
+ * Copyright 2020 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,102 +15,67 @@
  * limitations under the License.
  */
 
-import { resolve } from 'path';
-import resolveModule from 'rollup-plugin-node-resolve';
-import commonjs from 'rollup-plugin-commonjs';
-import sourcemaps from 'rollup-plugin-sourcemaps';
-import typescriptPlugin from 'rollup-plugin-typescript2';
-import typescript from 'typescript';
-import { uglify } from 'rollup-plugin-uglify';
-import { terser } from 'rollup-plugin-terser';
-import json from 'rollup-plugin-json';
-import pkg from './package.json';
-
 import appPkg from './app/package.json';
-
-function createUmdOutputConfig(output) {
-  return {
-    file: output,
-    format: 'umd',
-    sourcemap: true,
-    extend: true,
-    name: GLOBAL_NAME,
-    globals: {
-      '@firebase/app': GLOBAL_NAME
-    },
-
-    /**
-     * use iife to avoid below error in the old Safari browser
-     * SyntaxError: Functions cannot be declared in a nested block in strict mode
-     * https://github.com/firebase/firebase-js-sdk/issues/1228
-     *
-     */
-    intro: `
-          try {
-            (function() {`,
-    outro: `
-          }).apply(this, arguments);
-        } catch(err) {
-            console.error(err);
-            throw new Error(
-              'Cannot instantiate ${output} - ' +
-              'be sure to load firebase-app.js first.'
-            );
-          }`
-  };
-}
-
-const plugins = [
-  sourcemaps(),
-  resolveModule(),
-  typescriptPlugin({
-    typescript,
-    // Workaround for typescript plugins that use async functions.
-    // In this case, `rollup-plugin-sourcemaps`.
-    // See https://github.com/ezolenko/rollup-plugin-typescript2/blob/master/README.md
-    objectHashIgnoreUnknownHack: true,
-    // For safety, given hack above (see link).
-    clean: true
-  }),
-  json(),
-  commonjs()
-];
+import commonjs from '@rollup/plugin-commonjs';
+import json from '@rollup/plugin-json';
+import pkg from './package.json';
+import { resolve } from 'path';
+import resolveModule from '@rollup/plugin-node-resolve';
+import rollupTypescriptPlugin from 'rollup-plugin-typescript2';
+import sourcemaps from 'rollup-plugin-sourcemaps';
+import { terser } from 'rollup-plugin-terser';
+import typescript from 'typescript';
+import { emitModulePackageFile } from '../../scripts/build/rollup_emit_module_package_file';
 
 const external = Object.keys(pkg.dependencies || {});
+const plugins = [sourcemaps(), resolveModule(), json(), commonjs()];
 
-/**
- * Global UMD Build
- */
-const GLOBAL_NAME = 'firebase';
+const typescriptPlugin = rollupTypescriptPlugin({
+  typescript
+});
+
+const typescriptPluginCDN = rollupTypescriptPlugin({
+  typescript,
+  tsconfigOverride: {
+    compilerOptions: {
+      declaration: false
+    }
+  }
+});
 
 /**
  * Individual Component Builds
  */
 const appBuilds = [
   /**
-   * App Browser Builds
+   * App ESM Build
+   * Uses "type:module" in package.json to signal this is ESM.
+   * Allows the extension to remain '.js' as some tools do not recognize
+   * '.mjs'.
+   */
+  {
+    input: 'app/index.ts',
+    output: [
+      { file: resolve('app', appPkg.browser), format: 'es', sourcemap: true }
+    ],
+    plugins: [...plugins, typescriptPlugin, emitModulePackageFile()],
+    external: id => external.some(dep => id === dep || id.startsWith(`${dep}/`))
+  },
+  /**
+   * App CJS/MJS builds
    */
   {
     input: 'app/index.ts',
     output: [
       { file: resolve('app', appPkg.main), format: 'cjs', sourcemap: true },
-      { file: resolve('app', appPkg.module), format: 'es', sourcemap: true }
+      {
+        file: resolve('app', appPkg.main.replace('.cjs.js', '.mjs')),
+        format: 'es',
+        sourcemap: true
+      }
     ],
-    plugins,
-    external
-  },
-  /**
-   * App UMD Builds
-   */
-  {
-    input: 'app/index.ts',
-    output: {
-      file: 'firebase-app.js',
-      sourcemap: true,
-      format: 'umd',
-      name: GLOBAL_NAME
-    },
-    plugins: [...plugins, uglify()]
+    plugins: [...plugins, typescriptPlugin],
+    external: id => external.some(dep => id === dep || id.startsWith(`${dep}/`))
   }
 ];
 
@@ -120,6 +85,28 @@ const componentBuilds = pkg.components
   .map(component => {
     const pkg = require(`./${component}/package.json`);
     return [
+      /**
+       * Component ESM Build
+       * Uses "type:module" in package.json to signal this is ESM.
+       * Allows the extension to remain '.js' as some tools do not recognize
+       * '.mjs'.
+       */
+      {
+        input: `${component}/index.ts`,
+        output: [
+          {
+            file: resolve(component, pkg.browser),
+            format: 'es',
+            sourcemap: true
+          }
+        ],
+        plugins: [...plugins, typescriptPlugin, emitModulePackageFile()],
+        external: id =>
+          external.some(dep => id === dep || id.startsWith(`${dep}/`))
+      },
+      /**
+       * Component CJS/MJS builds
+       */
       {
         input: `${component}/index.ts`,
         output: [
@@ -129,166 +116,61 @@ const componentBuilds = pkg.components
             sourcemap: true
           },
           {
-            file: resolve(component, pkg.module),
+            file: resolve(component, pkg.main.replace('.cjs.js', '.mjs')),
             format: 'es',
             sourcemap: true
           }
         ],
-        plugins,
-        external
-      },
-      {
-        input: `${component}/index.ts`,
-        output: createUmdOutputConfig(`firebase-${component}.js`),
-        plugins: [...plugins, uglify()],
-        external: ['@firebase/app']
+        plugins: [...plugins, typescriptPlugin],
+        external: id =>
+          external.some(dep => id === dep || id.startsWith(`${dep}/`))
       }
     ];
   })
   .reduce((a, b) => a.concat(b), []);
 
-const firestoreMemoryBuilds = [
-  {
-    input: `firestore/memory/index.ts`,
-    output: [
-      {
-        file: resolve('firestore/memory', pkg.main),
-        format: 'cjs',
-        sourcemap: true
-      },
-      {
-        file: resolve('firestore/memory', pkg.module),
-        format: 'es',
-        sourcemap: true
-      }
-    ],
-    plugins,
-    external
-  },
-  {
-    input: `firestore/memory/index.ts`,
-    output: createUmdOutputConfig(`firebase-firestore.memory.js`),
-    plugins: [...plugins, uglify()],
-    external: ['@firebase/app']
-  }
-];
-
 /**
- * Complete Package Builds
+ * CDN script builds
  */
-const completeBuilds = [
-  /**
-   * App Browser Builds
-   */
+const cdnBuilds = [
   {
-    input: 'src/index.ts',
-    output: [
-      { file: pkg.browser, format: 'cjs', sourcemap: true },
-      { file: pkg.module, format: 'es', sourcemap: true }
-    ],
-    plugins,
-    external
-  },
-  {
-    input: 'src/index.cdn.ts',
+    input: 'app/index.cdn.ts',
     output: {
-      file: 'firebase.js',
-      format: 'umd',
+      file: 'firebase-app.js',
       sourcemap: true,
-      name: GLOBAL_NAME
+      format: 'es'
     },
-    plugins: [...plugins, uglify()]
+    plugins: [...plugins, typescriptPluginCDN]
   },
-  /**
-   * App Node.js Builds
-   */
-  {
-    input: 'src/index.node.ts',
-    output: { file: pkg.main, format: 'cjs', sourcemap: true },
-    plugins,
-    external
-  },
-  /**
-   * App React Native Builds
-   */
-  {
-    input: 'src/index.rn.ts',
-    output: { file: pkg['react-native'], format: 'cjs', sourcemap: true },
-    plugins,
-    external
-  },
-  /**
-   * Performance script Build
-   */
-  {
-    input: 'src/index.perf.ts',
-    output: {
-      file: 'firebase-performance-standalone.js',
-      format: 'umd',
-      sourcemap: true,
-      name: GLOBAL_NAME
-    },
-    plugins: [
-      sourcemaps(),
-      resolveModule({
-        mainFields: ['lite', 'module', 'main']
-      }),
-      typescriptPlugin({
-        typescript,
-        // Workaround for typescript plugins that use async functions.
-        // In this case, `rollup-plugin-sourcemaps`.
-        // See https://github.com/ezolenko/rollup-plugin-typescript2/blob/master/README.md
-        objectHashIgnoreUnknownHack: true,
-        // For safety, given hack above (see link).
-        clean: true
-      }),
-      json(),
-      commonjs(),
-      uglify()
-    ]
-  },
-  /**
-   * Performance script Build in ES2017
-   */
-  {
-    input: 'src/index.perf.ts',
-    output: {
-      file: 'firebase-performance-standalone.es2017.js',
-      format: 'umd',
-      sourcemap: true,
-      name: GLOBAL_NAME
-    },
-    plugins: [
-      sourcemaps(),
-      resolveModule({
-        mainFields: ['lite-esm2017', 'esm2017', 'module', 'main']
-      }),
-      typescriptPlugin({
-        typescript,
-        // Workaround for typescript plugins that use async functions.
-        // In this case, `rollup-plugin-sourcemaps`.
-        // See https://github.com/ezolenko/rollup-plugin-typescript2/blob/master/README.md
-        objectHashIgnoreUnknownHack: true,
-        // For safety, given hack above (see link).
-        clean: true,
-        tsconfigOverride: {
-          compilerOptions: {
-            target: 'es2017'
-          }
-        }
-      }),
-      json({
-        preferConst: true
-      }),
-      commonjs(),
-      terser()
-    ]
-  }
+  ...pkg.components
+    .filter(component => component !== 'app')
+    .map(component => {
+      // It is needed for handling sub modules, for example firestore/lite which should produce firebase-firestore-lite.js
+      // Otherwise, we will create a directory with '/' in the name.
+      const componentName = component.replace('/', '-');
+
+      return {
+        input: `${component}/index.ts`,
+        output: {
+          file: `firebase-${componentName}.js`,
+          sourcemap: true,
+          format: 'es'
+        },
+        plugins: [
+          ...plugins,
+          typescriptPluginCDN,
+          terser({
+            format: { comments: false },
+            keep_fnames: true,
+            keep_classnames: true,
+            mangle: {
+              reserved: ['_getProvider', '__PRIVATE_lastReasonableEscapeIndex']
+            }
+          })
+        ],
+        external: ['@firebase/app']
+      };
+    })
 ];
 
-export default [
-  ...appBuilds,
-  ...componentBuilds,
-  ...firestoreMemoryBuilds,
-  ...completeBuilds
-];
+export default [...appBuilds, ...componentBuilds, ...cdnBuilds];

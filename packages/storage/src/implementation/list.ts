@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,12 +18,10 @@
 /**
  * @fileoverview Documentation for the listOptions and listResult format
  */
-import { AuthWrapper } from './authwrapper';
 import { Location } from './location';
-import * as json from './json';
-import * as type from './type';
+import { jsonObjectOrNull } from './json';
 import { ListResult } from '../list';
-import * as errors from './error';
+import { FirebaseStorageImpl } from '../service';
 
 /**
  * Represents the simplified object metadata returned by List API.
@@ -44,14 +42,12 @@ interface ListResultResponse {
   nextPageToken?: string;
 }
 
-const MAX_RESULTS_KEY = 'maxResults';
-const MAX_MAX_RESULTS = 1000;
-const PAGE_TOKEN_KEY = 'pageToken';
 const PREFIXES_KEY = 'prefixes';
 const ITEMS_KEY = 'items';
 
 function fromBackendResponse(
-  authWrapper: AuthWrapper,
+  service: FirebaseStorageImpl,
+  bucket: string,
   resource: ListResultResponse
 ): ListResult {
   const listResult: ListResult = {
@@ -59,14 +55,10 @@ function fromBackendResponse(
     items: [],
     nextPageToken: resource['nextPageToken']
   };
-  const bucket = authWrapper.bucket();
-  if (bucket === null) {
-    throw errors.noDefaultBucket();
-  }
   if (resource[PREFIXES_KEY]) {
     for (const path of resource[PREFIXES_KEY]) {
       const pathWithoutTrailingSlash = path.replace(/\/$/, '');
-      const reference = authWrapper.makeStorageReference(
+      const reference = service._makeStorageReference(
         new Location(bucket, pathWithoutTrailingSlash)
       );
       listResult.prefixes.push(reference);
@@ -75,7 +67,7 @@ function fromBackendResponse(
 
   if (resource[ITEMS_KEY]) {
     for (const item of resource[ITEMS_KEY]) {
-      const reference = authWrapper.makeStorageReference(
+      const reference = service._makeStorageReference(
         new Location(bucket, item['name'])
       );
       listResult.items.push(reference);
@@ -85,38 +77,14 @@ function fromBackendResponse(
 }
 
 export function fromResponseString(
-  authWrapper: AuthWrapper,
+  service: FirebaseStorageImpl,
+  bucket: string,
   resourceString: string
 ): ListResult | null {
-  const obj = json.jsonObjectOrNull(resourceString);
+  const obj = jsonObjectOrNull(resourceString);
   if (obj === null) {
     return null;
   }
-  const resource = (obj as unknown) as ListResultResponse;
-  return fromBackendResponse(authWrapper, resource);
-}
-
-export function listOptionsValidator(p: unknown): void {
-  if (!type.isObject(p) || !p) {
-    throw 'Expected ListOptions object.';
-  }
-  for (const key in p) {
-    if (key === MAX_RESULTS_KEY) {
-      if (
-        !type.isInteger(p[MAX_RESULTS_KEY]) ||
-        (p[MAX_RESULTS_KEY] as number) <= 0
-      ) {
-        throw 'Expected maxResults to be a positive number.';
-      }
-      if ((p[MAX_RESULTS_KEY] as number) > 1000) {
-        throw `Expected maxResults to be less than or equal to ${MAX_MAX_RESULTS}.`;
-      }
-    } else if (key === PAGE_TOKEN_KEY) {
-      if (p[PAGE_TOKEN_KEY] && !type.isString(p[PAGE_TOKEN_KEY])) {
-        throw 'Expected pageToken to be string.';
-      }
-    } else {
-      throw 'Unknown option: ' + key;
-    }
-  }
+  const resource = obj as unknown as ListResultResponse;
+  return fromBackendResponse(service, bucket, resource);
 }

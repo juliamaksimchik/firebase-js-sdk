@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,14 +15,14 @@
  * limitations under the License.
  */
 
-import { StatsCollection } from './StatsCollection';
 import { each } from '../util/util';
+
+import { StatsCollection } from './StatsCollection';
 
 /**
  * Returns the delta from the previous call to get stats.
  *
- * @param collection_ The collection to "listen" to.
- * @constructor
+ * @param collection_ - The collection to "listen" to.
  */
 export class StatsListener {
   private last_: { [k: string]: number } | null = null;

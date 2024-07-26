@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,15 +15,15 @@
  * limitations under the License.
  */
 
-import { DocumentKeySet, NullableMaybeDocumentMap } from '../model/collections';
-import { MaybeDocument } from '../model/document';
+import { SnapshotVersion } from '../core/snapshot_version';
+import { DocumentKeySet, MutableDocumentMap } from '../model/collections';
+import { MutableDocument } from '../model/document';
 import { DocumentKey } from '../model/document_key';
-import { assert } from '../util/assert';
+import { debugAssert } from '../util/assert';
 import { ObjectMap } from '../util/obj_map';
 
-import { PersistenceTransaction } from './persistence';
 import { PersistencePromise } from './persistence_promise';
-import { SnapshotVersion } from '../core/snapshot_version';
+import { PersistenceTransaction } from './persistence_transaction';
 
 /**
  * An in-memory buffer of entries to be written to a RemoteDocumentCache.
@@ -40,50 +40,27 @@ import { SnapshotVersion } from '../core/snapshot_version';
  * porting this class as part of that implementation work.
  */
 export abstract class RemoteDocumentChangeBuffer {
-  // A mapping of document key to the new cache entry that should be written (or null if any
-  // existing cache entry should be removed).
-  protected changes: ObjectMap<
-    DocumentKey,
-    MaybeDocument | null
-  > = new ObjectMap(key => key.toString());
-
-  // The read time to use for all added documents in this change buffer.
-  private _readTime: SnapshotVersion | undefined;
+  // A mapping of document key to the new cache entry that should be written.
+  protected changes: ObjectMap<DocumentKey, MutableDocument> = new ObjectMap(
+    key => key.toString(),
+    (l, r) => l.isEqual(r)
+  );
 
   private changesApplied = false;
 
   protected abstract getFromCache(
     transaction: PersistenceTransaction,
     documentKey: DocumentKey
-  ): PersistencePromise<MaybeDocument | null>;
+  ): PersistencePromise<MutableDocument>;
 
   protected abstract getAllFromCache(
     transaction: PersistenceTransaction,
     documentKeys: DocumentKeySet
-  ): PersistencePromise<NullableMaybeDocumentMap>;
+  ): PersistencePromise<MutableDocumentMap>;
 
   protected abstract applyChanges(
     transaction: PersistenceTransaction
   ): PersistencePromise<void>;
-
-  protected set readTime(value: SnapshotVersion) {
-    // Right now (for simplicity) we just track a single readTime for all the
-    // added entries since we expect them to all be the same, but we could
-    // rework to store per-entry readTimes if necessary.
-    assert(
-      this._readTime === undefined || this._readTime.isEqual(value),
-      'All changes in a RemoteDocumentChangeBuffer must have the same read time'
-    );
-    this._readTime = value;
-  }
-
-  protected get readTime(): SnapshotVersion {
-    assert(
-      this._readTime !== undefined,
-      'Read time is not set. All removeEntry() calls must include a readTime if `trackRemovals` is used.'
-    );
-    return this._readTime;
-  }
 
   /**
    * Buffers a `RemoteDocumentCache.addEntry()` call.
@@ -91,10 +68,9 @@ export abstract class RemoteDocumentChangeBuffer {
    * You can only modify documents that have already been retrieved via
    * `getEntry()/getEntries()` (enforced via IndexedDbs `apply()`).
    */
-  addEntry(maybeDocument: MaybeDocument, readTime: SnapshotVersion): void {
+  addEntry(document: MutableDocument): void {
     this.assertNotApplied();
-    this.readTime = readTime;
-    this.changes.set(maybeDocument.key, maybeDocument);
+    this.changes.set(document.key, document);
   }
 
   /**
@@ -103,12 +79,12 @@ export abstract class RemoteDocumentChangeBuffer {
    * You can only remove documents that have already been retrieved via
    * `getEntry()/getEntries()` (enforced via IndexedDbs `apply()`).
    */
-  removeEntry(key: DocumentKey, readTime?: SnapshotVersion): void {
+  removeEntry(key: DocumentKey, readTime: SnapshotVersion): void {
     this.assertNotApplied();
-    if (readTime) {
-      this.readTime = readTime;
-    }
-    this.changes.set(key, null);
+    this.changes.set(
+      key,
+      MutableDocument.newInvalidDocument(key).setReadTime(readTime)
+    );
   }
 
   /**
@@ -116,20 +92,20 @@ export abstract class RemoteDocumentChangeBuffer {
    * and if no buffered change applies, this will forward to
    * `RemoteDocumentCache.getEntry()`.
    *
-   * @param transaction The transaction in which to perform any persistence
+   * @param transaction - The transaction in which to perform any persistence
    *     operations.
-   * @param documentKey The key of the entry to look up.
-   * @return The cached Document or NoDocument entry, or null if we have nothing
+   * @param documentKey - The key of the entry to look up.
+   * @returns The cached document or an invalid document if we have nothing
    * cached.
    */
   getEntry(
     transaction: PersistenceTransaction,
     documentKey: DocumentKey
-  ): PersistencePromise<MaybeDocument | null> {
+  ): PersistencePromise<MutableDocument> {
     this.assertNotApplied();
     const bufferedEntry = this.changes.get(documentKey);
     if (bufferedEntry !== undefined) {
-      return PersistencePromise.resolve<MaybeDocument | null>(bufferedEntry);
+      return PersistencePromise.resolve(bufferedEntry);
     } else {
       return this.getFromCache(transaction, documentKey);
     }
@@ -139,17 +115,16 @@ export abstract class RemoteDocumentChangeBuffer {
    * Looks up several entries in the cache, forwarding to
    * `RemoteDocumentCache.getEntry()`.
    *
-   * @param transaction The transaction in which to perform any persistence
+   * @param transaction - The transaction in which to perform any persistence
    *     operations.
-   * @param documentKeys The keys of the entries to look up.
-   * @return A map of cached `Document`s or `NoDocument`s, indexed by key. If an
-   *     entry cannot be found, the corresponding key will be mapped to a null
-   *     value.
+   * @param documentKeys - The keys of the entries to look up.
+   * @returns A map of cached documents, indexed by key. If an entry cannot be
+   *     found, the corresponding key will be mapped to an invalid document.
    */
   getEntries(
     transaction: PersistenceTransaction,
     documentKeys: DocumentKeySet
-  ): PersistencePromise<NullableMaybeDocumentMap> {
+  ): PersistencePromise<MutableDocumentMap> {
     return this.getAllFromCache(transaction, documentKeys);
   }
 
@@ -165,6 +140,6 @@ export abstract class RemoteDocumentChangeBuffer {
 
   /** Helper to assert this.changes is not null  */
   protected assertNotApplied(): void {
-    assert(!this.changesApplied, 'Changes have already been applied.');
+    debugAssert(!this.changesApplied, 'Changes have already been applied.');
   }
 }

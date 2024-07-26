@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ export interface RemoteConfig {
   settings: Settings;
 
   /**
-   * Object containing default values for conigs.
+   * Object containing default values for configs.
    */
   defaultConfig: { [key: string]: string | number | boolean };
 
@@ -117,7 +117,7 @@ export interface Value {
   /**
    * Gets the value as a boolean.
    *
-   * The following values (case insensitive) are interpreted as true:
+   * The following values (case-insensitive) are interpreted as true:
    * "1", "true", "t", "yes", "y", "on". Other values are interpreted as false.
    */
   asBoolean(): boolean;
@@ -175,6 +175,6 @@ export type LogLevel = 'debug' | 'error' | 'silent';
 
 declare module '@firebase/component' {
   interface NameServiceMapping {
-    'remoteConfig': RemoteConfig;
+    'remoteConfig-compat': RemoteConfig;
   }
 }

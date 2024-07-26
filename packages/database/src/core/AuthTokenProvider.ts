@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,31 +21,48 @@ import {
   FirebaseAuthInternalName
 } from '@firebase/auth-interop-types';
 import { Provider } from '@firebase/component';
+
 import { log, warn } from './util/util';
-import { FirebaseApp } from '@firebase/app-types';
+
+export interface AuthTokenProvider {
+  getToken(forceRefresh: boolean): Promise<FirebaseAuthTokenData>;
+  addTokenChangeListener(listener: (token: string | null) => void): void;
+  removeTokenChangeListener(listener: (token: string | null) => void): void;
+  notifyForInvalidToken(): void;
+}
 
 /**
  * Abstraction around FirebaseApp's token fetching capabilities.
  */
-export class AuthTokenProvider {
+export class FirebaseAuthTokenProvider implements AuthTokenProvider {
   private auth_: FirebaseAuthInternal | null = null;
+
   constructor(
-    private app_: FirebaseApp,
+    private appName_: string,
+    private firebaseOptions_: object,
     private authProvider_: Provider<FirebaseAuthInternalName>
   ) {
     this.auth_ = authProvider_.getImmediate({ optional: true });
     if (!this.auth_) {
-      authProvider_.get().then(auth => (this.auth_ = auth));
+      authProvider_.onInit(auth => (this.auth_ = auth));
     }
   }
 
-  /**
-   * @param {boolean} forceRefresh
-   * @return {!Promise<FirebaseAuthTokenData>}
-   */
   getToken(forceRefresh: boolean): Promise<FirebaseAuthTokenData> {
     if (!this.auth_) {
-      return Promise.resolve(null);
+      return new Promise<FirebaseAuthTokenData>((resolve, reject) => {
+        // Support delayed initialization of FirebaseAuth. This allows our
+        // customers to initialize the RTDB SDK before initializing Firebase
+        // Auth and ensures that all requests are authenticated if a token
+        // becomes available before the timeout below expires.
+        setTimeout(() => {
+          if (this.auth_) {
+            this.getToken(forceRefresh).then(resolve, reject);
+          } else {
+            resolve(null);
+          }
+        }, 0);
+      });
     }
 
     return this.auth_.getToken(forceRefresh).catch(error => {
@@ -60,37 +77,36 @@ export class AuthTokenProvider {
     });
   }
 
-  addTokenChangeListener(listener: (token: string | null) => void) {
+  addTokenChangeListener(listener: (token: string | null) => void): void {
     // TODO: We might want to wrap the listener and call it with no args to
     // avoid a leaky abstraction, but that makes removing the listener harder.
     if (this.auth_) {
       this.auth_.addAuthTokenListener(listener);
     } else {
-      setTimeout(() => listener(null), 0);
       this.authProvider_
         .get()
         .then(auth => auth.addAuthTokenListener(listener));
     }
   }
 
-  removeTokenChangeListener(listener: (token: string | null) => void) {
+  removeTokenChangeListener(listener: (token: string | null) => void): void {
     this.authProvider_
       .get()
       .then(auth => auth.removeAuthTokenListener(listener));
   }
 
-  notifyForInvalidToken() {
+  notifyForInvalidToken(): void {
     let errorMessage =
       'Provided authentication credentials for the app named "' +
-      this.app_.name +
+      this.appName_ +
       '" are invalid. This usually indicates your app was not ' +
       'initialized correctly. ';
-    if ('credential' in this.app_.options) {
+    if ('credential' in this.firebaseOptions_) {
       errorMessage +=
         'Make sure the "credential" property provided to initializeApp() ' +
         'is authorized to access the specified "databaseURL" and is from the correct ' +
         'project.';
-    } else if ('serviceAccount' in this.app_.options) {
+    } else if ('serviceAccount' in this.firebaseOptions_) {
       errorMessage +=
         'Make sure the "serviceAccount" property provided to initializeApp() ' +
         'is authorized to access the specified "databaseURL" and is from the correct ' +
@@ -103,4 +119,28 @@ export class AuthTokenProvider {
     }
     warn(errorMessage);
   }
+}
+
+/* AuthTokenProvider that supplies a constant token. Used by Admin SDK or mockUserToken with emulators. */
+export class EmulatorTokenProvider implements AuthTokenProvider {
+  /** A string that is treated as an admin access token by the RTDB emulator. Used by Admin SDK. */
+  static OWNER = 'owner';
+
+  constructor(private accessToken: string) {}
+
+  getToken(forceRefresh: boolean): Promise<FirebaseAuthTokenData> {
+    return Promise.resolve({
+      accessToken: this.accessToken
+    });
+  }
+
+  addTokenChangeListener(listener: (token: string | null) => void): void {
+    // Invoke the listener immediately to match the behavior in Firebase Auth
+    // (see packages/auth/src/auth.js#L1807)
+    listener(this.accessToken);
+  }
+
+  removeTokenChangeListener(listener: (token: string | null) => void): void {}
+
+  notifyForInvalidToken(): void {}
 }

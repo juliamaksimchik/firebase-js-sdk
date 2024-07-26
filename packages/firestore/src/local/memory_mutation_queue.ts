@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,23 +15,23 @@
  * limitations under the License.
  */
 
-import { Timestamp } from '../api/timestamp';
-import { Query } from '../core/query';
+import { isCollectionGroupQuery, Query } from '../core/query';
 import { BatchId } from '../core/types';
-import { DocumentKeySet } from '../model/collections';
+import { Timestamp } from '../lite-api/timestamp';
 import { DocumentKey } from '../model/document_key';
 import { Mutation } from '../model/mutation';
-import { MutationBatch, BATCHID_UNKNOWN } from '../model/mutation_batch';
-import { assert } from '../util/assert';
+import { MutationBatch } from '../model/mutation_batch';
+import { debugAssert, hardAssert } from '../util/assert';
 import { primitiveComparator } from '../util/misc';
-import { ByteString } from '../util/byte_string';
 import { SortedMap } from '../util/sorted_map';
 import { SortedSet } from '../util/sorted_set';
+import { BATCHID_UNKNOWN } from '../util/types';
 
 import { IndexManager } from './index_manager';
 import { MutationQueue } from './mutation_queue';
-import { PersistenceTransaction, ReferenceDelegate } from './persistence';
+import { ReferenceDelegate } from './persistence';
 import { PersistencePromise } from './persistence_promise';
+import { PersistenceTransaction } from './persistence_transaction';
 import { DocReference } from './reference_set';
 
 export class MemoryMutationQueue implements MutationQueue {
@@ -43,12 +43,6 @@ export class MemoryMutationQueue implements MutationQueue {
 
   /** Next value to use when assigning sequential IDs to each mutation batch. */
   private nextBatchId: BatchId = 1;
-
-  /** The last received stream token from the server, used to acknowledge which
-   * responses the client has processed. Stream tokens are opaque checkpoint
-   * markers whose only real value is their inclusion in the next request.
-   */
-  private lastStreamToken: ByteString = ByteString.EMPTY_BYTE_STRING;
 
   /** An ordered mapping between documents and the mutations batch IDs. */
   private batchesByDocumentKey = new SortedSet(DocReference.compareByKey);
@@ -62,60 +56,20 @@ export class MemoryMutationQueue implements MutationQueue {
     return PersistencePromise.resolve(this.mutationQueue.length === 0);
   }
 
-  acknowledgeBatch(
-    transaction: PersistenceTransaction,
-    batch: MutationBatch,
-    streamToken: ByteString
-  ): PersistencePromise<void> {
-    const batchId = batch.batchId;
-    const batchIndex = this.indexOfExistingBatchId(batchId, 'acknowledged');
-    assert(
-      batchIndex === 0,
-      'Can only acknowledge the first batch in the mutation queue'
-    );
-
-    // Verify that the batch in the queue is the one to be acknowledged.
-    const check = this.mutationQueue[batchIndex];
-    assert(
-      batchId === check.batchId,
-      'Queue ordering failure: expected batch ' +
-        batchId +
-        ', got batch ' +
-        check.batchId
-    );
-
-    this.lastStreamToken = streamToken;
-    return PersistencePromise.resolve();
-  }
-
-  getLastStreamToken(
-    transaction: PersistenceTransaction
-  ): PersistencePromise<ByteString> {
-    return PersistencePromise.resolve(this.lastStreamToken);
-  }
-
-  setLastStreamToken(
-    transaction: PersistenceTransaction,
-    streamToken: ByteString
-  ): PersistencePromise<void> {
-    this.lastStreamToken = streamToken;
-    return PersistencePromise.resolve();
-  }
-
   addMutationBatch(
     transaction: PersistenceTransaction,
     localWriteTime: Timestamp,
     baseMutations: Mutation[],
     mutations: Mutation[]
   ): PersistencePromise<MutationBatch> {
-    assert(mutations.length !== 0, 'Mutation batches should not be empty');
+    debugAssert(mutations.length !== 0, 'Mutation batches should not be empty');
 
     const batchId = this.nextBatchId;
     this.nextBatchId++;
 
     if (this.mutationQueue.length > 0) {
       const prior = this.mutationQueue[this.mutationQueue.length - 1];
-      assert(
+      debugAssert(
         prior.batchId < batchId,
         'Mutation batchIDs must be monotonically increasing order'
       );
@@ -149,17 +103,6 @@ export class MemoryMutationQueue implements MutationQueue {
     batchId: BatchId
   ): PersistencePromise<MutationBatch | null> {
     return PersistencePromise.resolve(this.findMutationBatch(batchId));
-  }
-
-  lookupMutationKeys(
-    transaction: PersistenceTransaction,
-    batchId: BatchId
-  ): PersistencePromise<DocumentKeySet | null> {
-    const mutationBatch = this.findMutationBatch(batchId);
-    assert(mutationBatch != null, 'Failed to find local mutation batch.');
-    return PersistencePromise.resolve<DocumentKeySet | null>(
-      mutationBatch.keys()
-    );
   }
 
   getNextMutationBatchAfterBatchId(
@@ -197,12 +140,12 @@ export class MemoryMutationQueue implements MutationQueue {
     const end = new DocReference(documentKey, Number.POSITIVE_INFINITY);
     const result: MutationBatch[] = [];
     this.batchesByDocumentKey.forEachInRange([start, end], ref => {
-      assert(
+      debugAssert(
         documentKey.isEqual(ref.key),
         "Should only iterate over a single key's batches"
       );
       const batch = this.findMutationBatch(ref.targetOrBatchId);
-      assert(
+      debugAssert(
         batch !== null,
         'Batches in the index must exist in the main table'
       );
@@ -222,7 +165,7 @@ export class MemoryMutationQueue implements MutationQueue {
       const start = new DocReference(documentKey, 0);
       const end = new DocReference(documentKey, Number.POSITIVE_INFINITY);
       this.batchesByDocumentKey.forEachInRange([start, end], ref => {
-        assert(
+        debugAssert(
           documentKey.isEqual(ref.key),
           "For each key, should only iterate over a single key's batches"
         );
@@ -238,8 +181,8 @@ export class MemoryMutationQueue implements MutationQueue {
     transaction: PersistenceTransaction,
     query: Query
   ): PersistencePromise<MutationBatch[]> {
-    assert(
-      !query.isCollectionGroupQuery(),
+    debugAssert(
+      !isCollectionGroupQuery(query),
       'CollectionGroup queries should be handled in LocalDocumentsView'
     );
     // Use the query path as a prefix for testing if a document matches the
@@ -299,10 +242,9 @@ export class MemoryMutationQueue implements MutationQueue {
     transaction: PersistenceTransaction,
     batch: MutationBatch
   ): PersistencePromise<void> {
-    // Find the position of the first batch for removal. This need not be the
-    // first entry in the queue.
+    // Find the position of the first batch for removal.
     const batchIndex = this.indexOfExistingBatchId(batch.batchId, 'removed');
-    assert(
+    hardAssert(
       batchIndex === 0,
       'Can only remove the first entry of the mutation queue'
     );
@@ -312,7 +254,7 @@ export class MemoryMutationQueue implements MutationQueue {
     return PersistencePromise.forEach(batch.mutations, (mutation: Mutation) => {
       const ref = new DocReference(mutation.key, batch.batchId);
       references = references.delete(ref);
-      return this.referenceDelegate.removeMutationReference(
+      return this.referenceDelegate.markPotentiallyOrphaned(
         transaction,
         mutation.key
       );
@@ -338,7 +280,7 @@ export class MemoryMutationQueue implements MutationQueue {
     txn: PersistenceTransaction
   ): PersistencePromise<void> {
     if (this.mutationQueue.length === 0) {
-      assert(
+      debugAssert(
         this.batchesByDocumentKey.isEmpty(),
         'Document leak -- detected dangling mutation references when queue is empty.'
       );
@@ -350,13 +292,13 @@ export class MemoryMutationQueue implements MutationQueue {
    * Finds the index of the given batchId in the mutation queue and asserts that
    * the resulting index is within the bounds of the queue.
    *
-   * @param batchId The batchId to search for
-   * @param action A description of what the caller is doing, phrased in passive
+   * @param batchId - The batchId to search for
+   * @param action - A description of what the caller is doing, phrased in passive
    * form (e.g. "acknowledged" in a routine that acknowledges batches).
    */
   private indexOfExistingBatchId(batchId: BatchId, action: string): number {
     const index = this.indexOfBatchId(batchId);
-    assert(
+    debugAssert(
       index >= 0 && index < this.mutationQueue.length,
       'Batches must exist to be ' + action
     );
@@ -367,9 +309,9 @@ export class MemoryMutationQueue implements MutationQueue {
    * Finds the index of the given batchId in the mutation queue. This operation
    * is O(1).
    *
-   * @return The computed index of the batch with the given batchId, based on
+   * @returns The computed index of the batch with the given batchId, based on
    * the state of the queue. Note this index can be negative if the requested
-   * batchId has already been remvoed from the queue or past the end of the
+   * batchId has already been removed from the queue or past the end of the
    * queue if the batchId is larger than the last added batch.
    */
   private indexOfBatchId(batchId: BatchId): number {
@@ -388,7 +330,7 @@ export class MemoryMutationQueue implements MutationQueue {
 
   /**
    * A version of lookupMutationBatch that doesn't return a promise, this makes
-   * other functions that uses this code easier to read and more efficent.
+   * other functions that uses this code easier to read and more efficient.
    */
   private findMutationBatch(batchId: BatchId): MutationBatch | null {
     const index = this.indexOfBatchId(batchId);
@@ -397,7 +339,7 @@ export class MemoryMutationQueue implements MutationQueue {
     }
 
     const batch = this.mutationQueue[index];
-    assert(batch.batchId === batchId, 'If found batch must match');
+    debugAssert(batch.batchId === batchId, 'If found batch must match');
     return batch;
   }
 }

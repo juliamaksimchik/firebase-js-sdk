@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,34 +15,48 @@
  * limitations under the License.
  */
 
-import { FieldFilter, Filter, Query } from '../../../src/core/query';
-import { Target } from '../../../src/core/target';
+import { IndexConfiguration } from '../../../src/api/index_configuration';
+import { ExpUserDataWriter } from '../../../src/api/reference_impl';
+import {
+  ListenOptions,
+  ListenerDataSource as Source
+} from '../../../src/core/event_manager';
+import { FieldFilter, Filter } from '../../../src/core/filter';
+import {
+  LimitType,
+  newQueryForPath,
+  Query,
+  queryEquals,
+  queryToTarget
+} from '../../../src/core/query';
+import { canonifyTarget, Target, targetEquals } from '../../../src/core/target';
 import { TargetIdGenerator } from '../../../src/core/target_id_generator';
 import { TargetId } from '../../../src/core/types';
-import {
-  Document,
-  MaybeDocument,
-  NoDocument
-} from '../../../src/model/document';
+import { TargetPurpose } from '../../../src/local/target_data';
+import { Document } from '../../../src/model/document';
 import { DocumentKey } from '../../../src/model/document_key';
-import { JsonObject } from '../../../src/model/field_value';
+import { FieldIndex } from '../../../src/model/field_index';
+import { JsonObject } from '../../../src/model/object_value';
+import { ResourcePath } from '../../../src/model/path';
+import { BloomFilter as ProtoBloomFilter } from '../../../src/protos/firestore_proto_api';
 import {
   isPermanentWriteError,
   mapCodeFromRpcCode,
   mapRpcCodeFromCode
 } from '../../../src/remote/rpc_error';
-import { assert, fail } from '../../../src/util/assert';
-
+import { debugAssert, fail } from '../../../src/util/assert';
+import { TimerId } from '../../../src/util/async_queue';
 import { Code } from '../../../src/util/error';
-import * as objUtils from '../../../src/util/obj';
+import { forEach } from '../../../src/util/obj';
+import { ObjectMap } from '../../../src/util/obj_map';
 import { isNullOrUndefined } from '../../../src/util/types';
+import { firestore } from '../../util/api_helpers';
 import { TestSnapshotVersion } from '../../util/helpers';
 
-import { TimerId } from '../../../src/util/async_queue';
 import { RpcError } from './spec_rpc_error';
-import { ObjectMap } from '../../../src/util/obj_map';
 import {
   parseQuery,
+  PersistenceAction,
   runSpec,
   SpecConfig,
   SpecDocument,
@@ -55,14 +69,30 @@ import {
   SpecWriteFailure
 } from './spec_test_runner';
 
+const userDataWriter = new ExpUserDataWriter(firestore());
+
 // These types are used in a protected API by SpecBuilder and need to be
 // exported.
 export interface LimboMap {
   [key: string]: TargetId;
 }
 
+export interface ActiveTargetSpec {
+  queries: SpecQuery[];
+  targetPurpose?: TargetPurpose;
+  resumeToken?: string;
+  readTime?: TestSnapshotVersion;
+  expectedCount?: number;
+}
+
 export interface ActiveTargetMap {
-  [targetId: string]: { queries: SpecQuery[]; resumeToken: string };
+  [targetId: string]: ActiveTargetSpec;
+}
+
+export interface ResumeSpec {
+  resumeToken?: string;
+  readTime?: TestSnapshotVersion;
+  expectedCount?: number;
 }
 
 /**
@@ -78,10 +108,14 @@ export interface ActiveTargetMap {
  */
 export class ClientMemoryState {
   activeTargets: ActiveTargetMap = {};
-  queryMapping = new ObjectMap<Target, TargetId>(t => t.canonicalId());
+  queryMapping = new ObjectMap<Target, TargetId>(
+    t => canonifyTarget(t),
+    targetEquals
+  );
   limboMapping: LimboMap = {};
 
   limboIdGenerator: TargetIdGenerator = TargetIdGenerator.forSyncEngine();
+  injectFailures = false;
 
   constructor() {
     this.reset();
@@ -89,7 +123,10 @@ export class ClientMemoryState {
 
   /** Reset all internal memory state (as done during a client restart). */
   reset(): void {
-    this.queryMapping = new ObjectMap<Target, TargetId>(t => t.canonicalId());
+    this.queryMapping = new ObjectMap<Target, TargetId>(
+      t => canonifyTarget(t),
+      targetEquals
+    );
     this.limboMapping = {};
     this.activeTargets = {};
     this.limboIdGenerator = TargetIdGenerator.forSyncEngine();
@@ -109,7 +146,10 @@ export class ClientMemoryState {
  */
 class CachedTargetIdGenerator {
   // TODO(wuandy): rename this to targetMapping.
-  private queryMapping = new ObjectMap<Target, TargetId>(t => t.canonicalId());
+  private queryMapping = new ObjectMap<Target, TargetId>(
+    t => canonifyTarget(t),
+    targetEquals
+  );
   private targetIdGenerator = TargetIdGenerator.forTargetCache();
 
   /**
@@ -151,7 +191,7 @@ class CachedTargetIdGenerator {
  * duplicate tests in every client.
  */
 export class SpecBuilder {
-  protected config: SpecConfig = { useGarbageCollection: true, numClients: 1 };
+  protected config: SpecConfig = { useEagerGCForMemory: true, numClients: 1 };
   // currentStep is built up (in particular, expectations can be added to it)
   // until nextStep() is called to append it to steps.
   protected currentStep: SpecStep | null = null;
@@ -160,7 +200,8 @@ export class SpecBuilder {
 
   private queryIdGenerator = new CachedTargetIdGenerator();
 
-  private readonly currentClientState: ClientMemoryState = new ClientMemoryState();
+  private readonly currentClientState: ClientMemoryState =
+    new ClientMemoryState();
 
   // Accessor function that can be overridden to return a different
   // `ClientMemoryState`.
@@ -184,6 +225,14 @@ export class SpecBuilder {
     return this.clientState.activeTargets;
   }
 
+  private get injectFailures(): boolean {
+    return this.clientState.injectFailures;
+  }
+
+  private set injectFailures(injectFailures: boolean) {
+    this.clientState.injectFailures = injectFailures;
+  }
+
   /**
    * Exports the spec steps as a JSON object that be used in the spec runner.
    */
@@ -205,33 +254,69 @@ export class SpecBuilder {
     return runSpec(name, tags, usePersistence, this.config, this.steps);
   }
 
-  // Configures Garbage Collection behavior (on or off). Default is on.
-  withGCEnabled(gcEnabled: boolean): this {
-    assert(
+  // Ensures manual LRU GC for both memory and indexeddb persistence.
+  // In spec tests, GC is always manually triggered via triggerLruGC().
+  ensureManualLruGC(): this {
+    debugAssert(
       !this.currentStep,
-      'withGCEnabled() must be called before all spec steps.'
+      'ensureManualLruGC() must be called before all spec steps.'
     );
-    this.config.useGarbageCollection = gcEnabled;
+    this.config.useEagerGCForMemory = false;
     return this;
   }
 
-  userListens(query: Query, resumeToken?: string): this {
+  withMaxConcurrentLimboResolutions(value?: number): this {
+    this.config.maxConcurrentLimboResolutions = value;
+    return this;
+  }
+
+  private addUserListenStep(
+    query: Query,
+    resume?: ResumeSpec,
+    options?: ListenOptions
+  ): void {
     this.nextStep();
 
-    const target = query.toTarget();
+    const target = queryToTarget(query);
     let targetId: TargetId = 0;
-    if (this.queryMapping.has(target)) {
-      targetId = this.queryMapping.get(target)!;
-    } else {
-      targetId = this.queryIdGenerator.next(target);
-    }
 
-    this.queryMapping.set(target, targetId);
-    this.addQueryToActiveTargets(targetId, query, resumeToken);
-    this.currentStep = {
-      userListen: [targetId, SpecBuilder.queryToSpec(query)],
-      expectedState: { activeTargets: objUtils.shallowCopy(this.activeTargets) }
-    };
+    if (this.injectFailures) {
+      // Return a `userListens()` step but don't advance the target IDs.
+      this.currentStep = {
+        userListen: { targetId, query: SpecBuilder.queryToSpec(query), options }
+      };
+    } else {
+      if (this.queryMapping.has(target)) {
+        targetId = this.queryMapping.get(target)!;
+      } else {
+        targetId = this.queryIdGenerator.next(target);
+      }
+
+      this.queryMapping.set(target, targetId);
+
+      if (options?.source !== Source.Cache) {
+        // Active targets are created if listener is not sourcing from cache
+        this.addQueryToActiveTargets(targetId, query, resume);
+      }
+
+      this.currentStep = {
+        userListen: {
+          targetId,
+          query: SpecBuilder.queryToSpec(query),
+          options
+        },
+        expectedState: { activeTargets: { ...this.activeTargets } }
+      };
+    }
+  }
+
+  userListens(query: Query, resume?: ResumeSpec): this {
+    this.addUserListenStep(query, resume);
+    return this;
+  }
+
+  userListensToCache(query: Query, resume?: ResumeSpec): this {
+    this.addUserListenStep(query, resume, { source: Source.Cache });
     return this;
   }
 
@@ -239,42 +324,54 @@ export class SpecBuilder {
    * Registers a previously active target with the test expectations after a
    * stream disconnect.
    */
-  restoreListen(query: Query, resumeToken: string): this {
-    const targetId = this.queryMapping.get(query.toTarget());
+  restoreListen(
+    query: Query,
+    resumeToken: string,
+    expectedCount?: number
+  ): this {
+    const targetId = this.queryMapping.get(queryToTarget(query));
 
     if (isNullOrUndefined(targetId)) {
       throw new Error("Can't restore an unknown query: " + query);
     }
 
-    this.addQueryToActiveTargets(targetId!, query, resumeToken);
+    this.addQueryToActiveTargets(targetId!, query, {
+      resumeToken,
+      expectedCount
+    });
 
     const currentStep = this.currentStep!;
     currentStep.expectedState = currentStep.expectedState || {};
-    currentStep.expectedState.activeTargets = objUtils.shallowCopy(
-      this.activeTargets
-    );
+    currentStep.expectedState.activeTargets = { ...this.activeTargets };
     return this;
   }
 
-  userUnlistens(query: Query): this {
+  userUnlistens(query: Query, shouldRemoveWatchTarget: boolean = true): this {
     this.nextStep();
-    const target = query.toTarget();
+    const target = queryToTarget(query);
     if (!this.queryMapping.has(target)) {
       throw new Error('Unlistening to query not listened to: ' + query);
     }
     const targetId = this.queryMapping.get(target)!;
-    this.removeQueryFromActiveTargets(query, targetId);
+    if (shouldRemoveWatchTarget) {
+      this.removeQueryFromActiveTargets(query, targetId);
+    }
 
-    if (this.config.useGarbageCollection && !this.activeTargets[targetId]) {
+    if (this.config.useEagerGCForMemory && !this.activeTargets[targetId]) {
       this.queryMapping.delete(target);
       this.queryIdGenerator.purge(target);
     }
 
     this.currentStep = {
       userUnlisten: [targetId, SpecBuilder.queryToSpec(query)],
-      expectedState: { activeTargets: objUtils.shallowCopy(this.activeTargets) }
+      expectedState: { activeTargets: { ...this.activeTargets } }
     };
     return this;
+  }
+
+  userUnlistensToCache(query: Query): this {
+    // Listener sourced from cache do not need to close watch stream.
+    return this.userUnlistens(query, /** shouldRemoveWatchTarget= */ false);
   }
 
   userSets(key: string, value: JsonObject<unknown>): this {
@@ -317,6 +414,28 @@ export class SpecBuilder {
     return this;
   }
 
+  loadBundle(bundleContent: string): this {
+    this.nextStep();
+    this.currentStep = {
+      loadBundle: bundleContent
+    };
+    // Loading a bundle implicitly creates a new target. We advance the `queryIdGenerator` to match.
+    this.queryIdGenerator.next(
+      queryToTarget(newQueryForPath(ResourcePath.emptyPath()))
+    );
+    return this;
+  }
+
+  setIndexConfiguration(
+    jsonOrConfiguration: string | IndexConfiguration
+  ): this {
+    this.nextStep();
+    this.currentStep = {
+      setIndexConfiguration: jsonOrConfiguration
+    };
+    return this;
+  }
+
   // PORTING NOTE: Only used by web multi-tab tests.
   becomeHidden(): this {
     this.nextStep();
@@ -353,7 +472,8 @@ export class SpecBuilder {
       enableNetwork: false,
       expectedState: {
         activeTargets: {},
-        limboDocs: []
+        activeLimboDocs: [],
+        enqueuedLimboDocs: []
       }
     };
     return this;
@@ -381,7 +501,8 @@ export class SpecBuilder {
       restart: true,
       expectedState: {
         activeTargets: {},
-        limboDocs: []
+        activeLimboDocs: [],
+        enqueuedLimboDocs: []
       }
     };
     // Reset our mappings / target ids since all existing listens will be
@@ -396,12 +517,36 @@ export class SpecBuilder {
       shutdown: true,
       expectedState: {
         activeTargets: {},
-        limboDocs: []
+        activeLimboDocs: [],
+        enqueuedLimboDocs: []
       }
     };
     // Reset our mappings / target ids since all existing listens will be
     // forgotten.
     this.clientState.reset();
+    return this;
+  }
+
+  /**
+   * Fails the specified database transaction until `recoverDatabase()` is
+   * called.
+   */
+  failDatabaseTransactions(...actions: PersistenceAction[]): this {
+    this.nextStep();
+    this.injectFailures = true;
+    this.currentStep = {
+      failDatabase: actions
+    };
+    return this;
+  }
+
+  /** Stops failing database operations. */
+  recoverDatabase(): this {
+    this.nextStep();
+    this.injectFailures = false;
+    this.currentStep = {
+      failDatabase: false
+    };
     return this;
   }
 
@@ -413,20 +558,44 @@ export class SpecBuilder {
     return this;
   }
 
+  /** Expects indexes to exist (in any order) */
+  expectIndexes(indexes: FieldIndex[]): this {
+    this.assertStep('Indexes expectation requires previous step');
+    const currentStep = this.currentStep!;
+    currentStep.expectedState = currentStep.expectedState || {};
+    currentStep.expectedState.indexes = indexes;
+    return this;
+  }
+
   /** Overrides the currently expected set of active targets. */
   expectActiveTargets(
-    ...targets: Array<{ query: Query; resumeToken: string }>
+    ...targets: Array<{
+      query: Query;
+      targetPurpose?: TargetPurpose;
+      resumeToken?: string;
+      readTime?: TestSnapshotVersion;
+      expectedCount?: number;
+    }>
   ): this {
     this.assertStep('Active target expectation requires previous step');
     const currentStep = this.currentStep!;
     this.clientState.activeTargets = {};
-    targets.forEach(({ query, resumeToken }) => {
-      this.addQueryToActiveTargets(this.getTargetId(query), query, resumeToken);
-    });
-    currentStep.expectedState = currentStep.expectedState || {};
-    currentStep.expectedState.activeTargets = objUtils.shallowCopy(
-      this.activeTargets
+    targets.forEach(
+      ({ query, resumeToken, readTime, expectedCount, targetPurpose }) => {
+        this.addQueryToActiveTargets(
+          this.getTargetId(query),
+          query,
+          {
+            resumeToken,
+            readTime,
+            expectedCount
+          },
+          targetPurpose
+        );
+      }
     );
+    currentStep.expectedState = currentStep.expectedState || {};
+    currentStep.expectedState.activeTargets = { ...this.activeTargets };
     return this;
   }
 
@@ -440,31 +609,46 @@ export class SpecBuilder {
 
     // Clear any preexisting limbo watch targets, which we'll re-create as
     // necessary from the provided keys below.
-    objUtils.forEach(this.limboMapping, (key, targetId) => {
+    forEach(this.limboMapping, (key, targetId) => {
       delete this.activeTargets[targetId];
     });
 
     keys.forEach(key => {
       const path = key.path.canonicalString();
       // Create limbo target ID mapping if it was not in limbo yet
-      if (!objUtils.contains(this.limboMapping, path)) {
+      if (!this.limboMapping[path]) {
         this.limboMapping[path] = this.limboIdGenerator.next();
       }
       // Limbo doc queries are always without resume token
       this.addQueryToActiveTargets(
         this.limboMapping[path],
-        Query.atPath(key.path),
-        ''
+        newQueryForPath(key.path),
+        { resumeToken: '' },
+        TargetPurpose.LimboResolution
       );
     });
 
     currentStep.expectedState = currentStep.expectedState || {};
-    currentStep.expectedState.limboDocs = keys.map(k =>
+    currentStep.expectedState.activeLimboDocs = keys.map(k =>
       SpecBuilder.keyToSpec(k)
     );
-    currentStep.expectedState.activeTargets = objUtils.shallowCopy(
-      this.activeTargets
+    currentStep.expectedState.activeTargets = { ...this.activeTargets };
+    return this;
+  }
+
+  /**
+   * Expects a document to be in limbo, enqueued for limbo resolution, and
+   * therefore *without* an active targetId.
+   */
+  expectEnqueuedLimboDocs(...keys: DocumentKey[]): this {
+    this.assertStep('Limbo expectation requires previous step');
+    const currentStep = this.currentStep!;
+
+    currentStep.expectedState = currentStep.expectedState || {};
+    currentStep.expectedState.enqueuedLimboDocs = keys.map(k =>
+      SpecBuilder.keyToSpec(k)
     );
+
     return this;
   }
 
@@ -473,12 +657,12 @@ export class SpecBuilder {
    * with no document for NoDocument. This is translated into normal watch
    * messages.
    */
-  ackLimbo(version: TestSnapshotVersion, doc: Document | NoDocument): this {
-    const query = Query.atPath(doc.key.path);
+  ackLimbo(version: TestSnapshotVersion, doc: Document): this {
+    const query = newQueryForPath(doc.key.path);
     this.watchAcks(query);
-    if (doc instanceof Document) {
+    if (doc.isFoundDocument()) {
       this.watchSends({ affects: [query] }, doc);
-    } else if (doc instanceof NoDocument) {
+    } else if (doc.isNoDocument()) {
       // Don't send any updates
     } else {
       fail('Unknown parameter: ' + doc);
@@ -493,8 +677,8 @@ export class SpecBuilder {
    * with either a document or with no document for NoDocument. This is
    * translated into normal watch messages.
    */
-  watchRemovesLimboTarget(doc: Document | NoDocument): this {
-    const query = Query.atPath(doc.key.path);
+  watchRemovesLimboTarget(doc: Document): this {
+    const query = newQueryForPath(doc.key.path);
     this.watchRemoves(query);
     return this;
   }
@@ -591,7 +775,7 @@ export class SpecBuilder {
     if (cause) {
       delete this.activeTargets[this.getTargetId(query)];
       this.currentStep.expectedState = {
-        activeTargets: objUtils.shallowCopy(this.activeTargets)
+        activeTargets: { ...this.activeTargets }
       };
     }
     return this;
@@ -599,7 +783,7 @@ export class SpecBuilder {
 
   watchSends(
     targets: { affects?: Query[]; removed?: Query[] },
-    ...docs: MaybeDocument[]
+    ...docs: Document[]
   ): this {
     this.nextStep();
     const affects =
@@ -637,7 +821,11 @@ export class SpecBuilder {
     return this;
   }
 
-  watchFilters(queries: Query[], ...docs: DocumentKey[]): this {
+  watchFilters(
+    queries: Query[],
+    docs: DocumentKey[] = [],
+    bloomFilter?: ProtoBloomFilter
+  ): this {
     this.nextStep();
     const targetIds = queries.map(query => {
       return this.getTargetId(query);
@@ -645,10 +833,7 @@ export class SpecBuilder {
     const keys = docs.map(key => {
       return key.path.canonicalString();
     });
-    const filter: SpecWatchFilter = [targetIds] as SpecWatchFilter;
-    for (const key of keys) {
-      filter.push(key);
-    }
+    const filter: SpecWatchFilter = { targetIds, keys, bloomFilter };
     this.currentStep = {
       watchFilter: filter
     };
@@ -709,6 +894,14 @@ export class SpecBuilder {
     return this;
   }
 
+  waitForPendingWrites(): this {
+    this.nextStep();
+    this.currentStep = {
+      waitForPendingWrites: true
+    };
+    return this;
+  }
+
   expectUserCallbacks(docs: {
     acknowledged?: string[];
     rejected?: string[];
@@ -751,7 +944,7 @@ export class SpecBuilder {
     if (!currentStep.expectedSnapshotEvents) {
       currentStep.expectedSnapshotEvents = [];
     }
-    assert(
+    debugAssert(
       !events.errorCode ||
         !(events.added || events.modified || events.removed || events.metadata),
       "Can't provide both error and events"
@@ -769,44 +962,67 @@ export class SpecBuilder {
     return this;
   }
 
-  /** Registers a query that is active in another tab. */
-  expectListen(query: Query, resumeToken?: string): this {
+  private registerQuery(
+    query: Query,
+    shouldAddWatchTarget: boolean,
+    resume?: ResumeSpec
+  ): this {
     this.assertStep('Expectations require previous step');
 
-    const target = query.toTarget();
+    const target = queryToTarget(query);
     const targetId = this.queryIdGenerator.cachedId(target);
     this.queryMapping.set(target, targetId);
 
-    this.addQueryToActiveTargets(targetId, query, resumeToken);
-
+    if (shouldAddWatchTarget) {
+      this.addQueryToActiveTargets(targetId, query, resume);
+    }
     const currentStep = this.currentStep!;
     currentStep.expectedState = currentStep.expectedState || {};
-    currentStep.expectedState.activeTargets = objUtils.shallowCopy(
-      this.activeTargets
-    );
+    currentStep.expectedState.activeTargets = { ...this.activeTargets };
     return this;
   }
 
-  /** Removes a query that is no longer active in any tab. */
-  expectUnlisten(query: Query): this {
+  /** Registers a query that is active in another tab. */
+  expectListen(query: Query, resume?: ResumeSpec): this {
+    return this.registerQuery(query, true, resume);
+  }
+
+  /** Registers a query that is listening to cache and active in another tab. */
+  expectListenToCache(query: Query, resume?: ResumeSpec): this {
+    // Listeners that source from cache would not send watch request.
+    return this.registerQuery(query, false, resume);
+  }
+
+  removeQuery(query: Query, shouldRemoveWatchTarget: boolean = true): this {
     this.assertStep('Expectations require previous step');
 
-    const target = query.toTarget();
+    const target = queryToTarget(query);
     const targetId = this.queryMapping.get(target)!;
 
-    this.removeQueryFromActiveTargets(query, targetId);
+    if (shouldRemoveWatchTarget) {
+      this.removeQueryFromActiveTargets(query, targetId);
+    }
 
-    if (this.config.useGarbageCollection && !this.activeTargets[targetId]) {
+    if (this.config.useEagerGCForMemory && !this.activeTargets[targetId]) {
       this.queryMapping.delete(target);
       this.queryIdGenerator.purge(target);
     }
 
     const currentStep = this.currentStep!;
     currentStep.expectedState = currentStep.expectedState || {};
-    currentStep.expectedState.activeTargets = objUtils.shallowCopy(
-      this.activeTargets
-    );
+    currentStep.expectedState.activeTargets = { ...this.activeTargets };
     return this;
+  }
+
+  /** Removes a query that is no longer active in any tab. */
+  expectUnlisten(query: Query): this {
+    return this.removeQuery(query);
+  }
+
+  /** Removes a query that is listening to cache and no longer active in any tab. */
+  expectUnlistenToCache(query: Query): this {
+    // Listeners that source from cache did not establish watch connection, so no active targets to remove.
+    return this.removeQuery(query, false);
   }
 
   /**
@@ -864,19 +1080,38 @@ export class SpecBuilder {
     return this;
   }
 
+  expectWaitForPendingWritesEvent(count = 1): this {
+    this.assertStep('Expectations require previous step');
+    const currentStep = this.currentStep!;
+    currentStep.expectedWaitForPendingWritesEvents = count;
+    return this;
+  }
+
+  triggerLruGC(cacheThreshold: number): this {
+    this.nextStep();
+    this.currentStep = {
+      triggerLruGC: cacheThreshold
+    };
+    return this;
+  }
+
+  removeExpectedTargetMapping(query: Query): this {
+    const target = queryToTarget(query);
+    this.queryMapping.delete(target);
+    this.queryIdGenerator.purge(target);
+    return this;
+  }
+
   private static queryToSpec(query: Query): SpecQuery {
     // TODO(dimond): full query support
     const spec: SpecQuery = { path: query.path.canonicalString() };
     if (query.collectionGroup !== null) {
       spec.collectionGroup = query.collectionGroup;
     }
-    if (query.hasLimitToFirst()) {
-      spec.limit = query.limit!;
-      spec.limitType = 'LimitToFirst';
-    }
-    if (query.hasLimitToLast()) {
-      spec.limit = query.limit!;
-      spec.limitType = 'LimitToLast';
+    if (query.limit !== null) {
+      spec.limit = query.limit;
+      spec.limitType =
+        query.limitType === LimitType.First ? 'LimitToFirst' : 'LimitToLast';
     }
     if (query.filters) {
       spec.filters = query.filters.map((filter: Filter) => {
@@ -884,8 +1119,8 @@ export class SpecBuilder {
           // TODO(dimond): Support non-JSON primitive values?
           return [
             filter.field.canonicalString(),
-            filter.op.name,
-            filter.value.value()
+            filter.op,
+            userDataWriter.convertValue(filter.value)
           ] as SpecQueryFilter;
         } else {
           return fail('Unknown filter: ' + filter);
@@ -896,19 +1131,22 @@ export class SpecBuilder {
       spec.orderBys = query.explicitOrderBy.map(orderBy => {
         return [
           orderBy.field.canonicalString(),
-          orderBy.dir.name
+          orderBy.dir
         ] as SpecQueryOrderBy;
       });
     }
     return spec;
   }
 
-  private static docToSpec(doc: MaybeDocument): SpecDocument {
-    if (doc instanceof Document) {
+  private static docToSpec(doc: Document): SpecDocument {
+    if (doc.isFoundDocument()) {
       return {
         key: SpecBuilder.keyToSpec(doc.key),
         version: doc.version.toMicroseconds(),
-        value: doc.data().value(),
+        createTime: doc.createTime.toMicroseconds(),
+        value: userDataWriter.convertValue(
+          doc.data.value
+        ) as JsonObject<unknown>,
         options: {
           hasLocalMutations: doc.hasLocalMutations,
           hasCommittedMutations: doc.hasCommittedMutations
@@ -918,6 +1156,7 @@ export class SpecBuilder {
       return {
         key: SpecBuilder.keyToSpec(doc.key),
         version: doc.version.toMicroseconds(),
+        createTime: doc.createTime.toMicroseconds(),
         value: null
       };
     }
@@ -941,40 +1180,55 @@ export class SpecBuilder {
   private addQueryToActiveTargets(
     targetId: number,
     query: Query,
-    resumeToken?: string
+    resume: ResumeSpec = {},
+    targetPurpose?: TargetPurpose
   ): void {
+    if (!(resume?.resumeToken || resume?.readTime) && resume?.expectedCount) {
+      fail('Expected count is present without a resume token or read time.');
+    }
+
     if (this.activeTargets[targetId]) {
       const activeQueries = this.activeTargets[targetId].queries;
       if (
-        !activeQueries.some(specQuery => parseQuery(specQuery).isEqual(query))
+        !activeQueries.some(specQuery =>
+          queryEquals(parseQuery(specQuery), query)
+        )
       ) {
         // `query` is not added yet.
         this.activeTargets[targetId] = {
           queries: [SpecBuilder.queryToSpec(query), ...activeQueries],
-          resumeToken: resumeToken || ''
+          targetPurpose,
+          resumeToken: resume.resumeToken || '',
+          readTime: resume.readTime
         };
       } else {
         this.activeTargets[targetId] = {
           queries: activeQueries,
-          resumeToken: resumeToken || ''
+          targetPurpose,
+          resumeToken: resume.resumeToken || '',
+          readTime: resume.readTime
         };
       }
     } else {
       this.activeTargets[targetId] = {
         queries: [SpecBuilder.queryToSpec(query)],
-        resumeToken: resumeToken || ''
+        targetPurpose,
+        resumeToken: resume.resumeToken || '',
+        readTime: resume.readTime
       };
     }
   }
 
   private removeQueryFromActiveTargets(query: Query, targetId: number): void {
     const queriesAfterRemoval = this.activeTargets[targetId].queries.filter(
-      specQuery => !parseQuery(specQuery).isEqual(query)
+      specQuery => !queryEquals(parseQuery(specQuery), query)
     );
     if (queriesAfterRemoval.length > 0) {
       this.activeTargets[targetId] = {
         queries: queriesAfterRemoval,
-        resumeToken: this.activeTargets[targetId].resumeToken
+        resumeToken: this.activeTargets[targetId].resumeToken,
+        expectedCount: this.activeTargets[targetId].expectedCount,
+        targetPurpose: this.activeTargets[targetId].targetPurpose
       };
     } else {
       delete this.activeTargets[targetId];
@@ -988,7 +1242,7 @@ export class SpecBuilder {
   }
 
   private getTargetId(query: Query): TargetId {
-    const queryTargetId = this.queryMapping.get(query.toTarget());
+    const queryTargetId = this.queryMapping.get(queryToTarget(query));
     const limboTargetId = this.limboMapping[query.path.canonicalString()];
     if (queryTargetId && limboTargetId) {
       // TODO(dimond): add support for query for doc and limbo doc at the same
@@ -996,7 +1250,7 @@ export class SpecBuilder {
       fail('Found both query and limbo doc with target ID, not supported yet');
     }
     const targetId = queryTargetId || limboTargetId;
-    assert(
+    debugAssert(
       !isNullOrUndefined(targetId),
       'No target ID found for query/limbo doc in spec'
     );
@@ -1079,11 +1333,8 @@ export function spec(): SpecBuilder {
 
 /** Starts a new multi-client SpecTest. */
 // PORTING NOTE: Only used by web multi-tab tests.
-export function client(
-  num: number,
-  withGcEnabled?: boolean
-): MultiClientSpecBuilder {
+export function client(num: number): MultiClientSpecBuilder {
   const specBuilder = new MultiClientSpecBuilder();
-  specBuilder.withGCEnabled(withGcEnabled === true);
+  specBuilder.ensureManualLruGC();
   return specBuilder.client(num);
 }

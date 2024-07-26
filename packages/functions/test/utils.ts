@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,14 @@
  * limitations under the License.
  */
 
-import { FirebaseOptions, FirebaseApp } from '@firebase/app-types';
+import { FirebaseOptions, FirebaseApp } from '@firebase/app';
 import { Provider, ComponentContainer } from '@firebase/component';
 import { FirebaseAuthInternalName } from '@firebase/auth-interop-types';
-import { FirebaseMessagingName } from '@firebase/messaging-types';
-import { Service } from '../src/api/service';
+import { AppCheckInternalComponentName } from '@firebase/app-check-interop-types';
+import { FunctionsService } from '../src/service';
+import { connectFunctionsEmulator } from '../src/api';
+import { fetch as undiciFetch } from 'undici';
+import { MessagingInternalComponentName } from '../../../packages/messaging-interop-types';
 
 export function makeFakeApp(options: FirebaseOptions = {}): FirebaseApp {
   options = {
@@ -35,8 +38,7 @@ export function makeFakeApp(options: FirebaseOptions = {}): FirebaseApp {
   return {
     name: 'appName',
     options,
-    automaticDataCollectionEnabled: true,
-    delete: async () => {}
+    automaticDataCollectionEnabled: true
   };
 }
 
@@ -47,16 +49,32 @@ export function createTestService(
     'auth-internal',
     new ComponentContainer('test')
   ),
-  messagingProvider = new Provider<FirebaseMessagingName>(
-    'messaging',
+  messagingProvider = new Provider<MessagingInternalComponentName>(
+    'messaging-internal',
+    new ComponentContainer('test')
+  ),
+  appCheckProvider = new Provider<AppCheckInternalComponentName>(
+    'app-check-internal',
     new ComponentContainer('test')
   )
-): Service {
-  const functions = new Service(app, authProvider, messagingProvider, region);
+): FunctionsService {
+  const fetchImpl: typeof fetch =
+    typeof window !== 'undefined' ? fetch.bind(window) : (undiciFetch as any);
+  const functions = new FunctionsService(
+    app,
+    authProvider,
+    messagingProvider,
+    appCheckProvider,
+    region,
+    fetchImpl
+  );
   const useEmulator = !!process.env.FIREBASE_FUNCTIONS_EMULATOR_ORIGIN;
   if (useEmulator) {
-    functions.useFunctionsEmulator(
-      process.env.FIREBASE_FUNCTIONS_EMULATOR_ORIGIN!
+    const url = new URL(process.env.FIREBASE_FUNCTIONS_EMULATOR_ORIGIN!);
+    connectFunctionsEmulator(
+      functions,
+      url.hostname,
+      Number.parseInt(url.port, 10)
     );
   }
   return functions;

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ export const enum ErrorCode {
   PERMISSION_DEFAULT = 'permission-default',
   PERMISSION_BLOCKED = 'permission-blocked',
   UNSUPPORTED_BROWSER = 'unsupported-browser',
+  INDEXED_DB_UNSUPPORTED = 'indexed-db-unsupported',
   FAILED_DEFAULT_REGISTRATION = 'failed-service-worker-registration',
   TOKEN_SUBSCRIBE_FAILED = 'token-subscribe-failed',
   TOKEN_SUBSCRIBE_NO_TOKEN = 'token-subscribe-no-token',
@@ -49,18 +50,20 @@ export const ERROR_MAP: ErrorMap<ErrorCode> = {
   [ErrorCode.PERMISSION_BLOCKED]:
     'The notification permission was not granted and blocked instead.',
   [ErrorCode.UNSUPPORTED_BROWSER]:
-    "This browser doesn't support the API's required to use the firebase SDK.",
+    "This browser doesn't support the API's required to use the Firebase SDK.",
+  [ErrorCode.INDEXED_DB_UNSUPPORTED]:
+    "This browser doesn't support indexedDb.open() (ex. Safari iFrame, Firefox Private Browsing, etc)",
   [ErrorCode.FAILED_DEFAULT_REGISTRATION]:
     'We are unable to register the default service worker. {$browserErrorMessage}',
   [ErrorCode.TOKEN_SUBSCRIBE_FAILED]:
-    'A problem occured while subscribing the user to FCM: {$errorInfo}',
+    'A problem occurred while subscribing the user to FCM: {$errorInfo}',
   [ErrorCode.TOKEN_SUBSCRIBE_NO_TOKEN]:
     'FCM returned no token when subscribing the user to push.',
   [ErrorCode.TOKEN_UNSUBSCRIBE_FAILED]:
-    'A problem occured while unsubscribing the ' +
+    'A problem occurred while unsubscribing the ' +
     'user from FCM: {$errorInfo}',
   [ErrorCode.TOKEN_UPDATE_FAILED]:
-    'A problem occured while updating the user from FCM: {$errorInfo}',
+    'A problem occurred while updating the user from FCM: {$errorInfo}',
   [ErrorCode.TOKEN_UPDATE_NO_TOKEN]:
     'FCM returned no token when updating the user to push.',
   [ErrorCode.USE_SW_AFTER_GET_TOKEN]:

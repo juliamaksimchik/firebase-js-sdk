@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,7 +30,8 @@ export const enum ErrorCode {
   FETCH_TIMEOUT = 'fetch-timeout',
   FETCH_THROTTLE = 'fetch-throttle',
   FETCH_PARSE = 'fetch-client-parse',
-  FETCH_STATUS = 'fetch-status'
+  FETCH_STATUS = 'fetch-status',
+  INDEXED_DB_UNAVAILABLE = 'indexed-db-unavailable'
 }
 
 const ERROR_DESCRIPTION_MAP: { readonly [key in ErrorCode]: string } = {
@@ -64,7 +65,9 @@ const ERROR_DESCRIPTION_MAP: { readonly [key in ErrorCode]: string } = {
     'Fetch client could not parse response.' +
     ' Original error: {$originalErrorMessage}.',
   [ErrorCode.FETCH_STATUS]:
-    'Fetch server returned an HTTP error status. HTTP status: {$httpStatus}.'
+    'Fetch server returned an HTTP error status. HTTP status: {$httpStatus}.',
+  [ErrorCode.INDEXED_DB_UNAVAILABLE]:
+    'Indexed DB is not supported by current browser'
 };
 
 // Note this is effectively a type system binding a code to params. This approach overlaps with the

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,19 +38,15 @@ function copyTests() {
    * Therefore these tests and helpers cannot have any src/ dependencies.
    */
   const testBase = resolve(__dirname, '../../packages/firestore/test');
-  const firebaseAppSdk = 'firebase/app/dist/index.esm.js';
-  const firebaseFirestoreSdk = resolve(
-    __dirname,
-    isPersistenceEnabled()
-      ? '../../packages/firestore/dist/index.esm.js'
-      : '../../packages/firestore/dist/index.memory.esm.js'
-  );
   return gulp
     .src(
       [
         testBase + '/integration/api/*.ts',
+        testBase + '/integration/util/composite_index_test_helper.ts',
         testBase + '/integration/util/events_accumulator.ts',
         testBase + '/integration/util/helpers.ts',
+        testBase + '/integration/util/settings.ts',
+        testBase + '/integration/util/testing_hooks_util.ts',
         testBase + '/util/equality_matcher.ts',
         testBase + '/util/promise.ts'
       ],
@@ -59,24 +55,18 @@ function copyTests() {
     .pipe(
       replace(
         /**
-         * This regex is designed to match the following statement used in our
-         * firestore integration test suites:
-         *
-         * import firebase from '../../util/firebase_export';
-         *
-         * It will handle variations in whitespace, single/double quote
-         * differences, as well as different paths to a valid firebase_export
+         * This regex is designed to match the Firebase import in our
+         * integration tests.
          */
-        /import\s+firebase\s+from\s+('|")[^\1]+firebase_export\1;?/,
-        `import firebase from '${firebaseAppSdk}';
-         import '${firebaseFirestoreSdk}';
-         
-         if (typeof process === 'undefined') {
-           process = { env: { INCLUDE_FIRESTORE_PERSISTENCE: '${isPersistenceEnabled()}' } } as any;
-         } else {
-           process.env.INCLUDE_FIRESTORE_PERSISTENCE = '${isPersistenceEnabled()}';
-         }
-         `
+        /\s+from '\.(\.\/util)?\/firebase_export';/,
+        ` from '${resolve(__dirname, './firebase_export')}';
+        
+if (typeof process === 'undefined') {
+  process = { env: { INCLUDE_FIRESTORE_PERSISTENCE: '${isPersistenceEnabled()}' } } as any;
+} else {
+  process.env.INCLUDE_FIRESTORE_PERSISTENCE = '${isPersistenceEnabled()}';
+}
+`
       )
     )
     .pipe(

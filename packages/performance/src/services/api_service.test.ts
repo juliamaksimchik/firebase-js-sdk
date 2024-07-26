@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2020 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,6 +47,7 @@ describe('Firebase Performance > api_service', () => {
     ]);
     // This is to make sure the test page is not changed by changing the href of location object.
     mockWindow.location = { ...self.location, href: PAGE_URL };
+
     setupApi(mockWindow);
     api = Api.getInstance();
   });
@@ -87,7 +88,7 @@ describe('Firebase Performance > api_service', () => {
     });
 
     it('does not throw if the browser does not include underlying api', () => {
-      api = new Api(({ performance: undefined } as unknown) as Window);
+      api = new Api({ performance: undefined } as unknown as Window);
 
       expect(() => {
         api.getEntriesByType('paint');
@@ -102,7 +103,7 @@ describe('Firebase Performance > api_service', () => {
     });
 
     it('does not throw if the browser does not include underlying api', () => {
-      api = new Api(({ performance: undefined } as any) as Window);
+      api = new Api({ performance: undefined } as any as Window);
 
       expect(() => {
         api.getEntriesByName('paint');

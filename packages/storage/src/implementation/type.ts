@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,43 +15,23 @@
  * limitations under the License.
  */
 
-/**
- * @return False if the object is undefined or null, true otherwise.
- */
-export function isDef<T>(p: T | null | undefined): p is T {
-  return p != null;
-}
+import { invalidArgument } from './error';
 
 export function isJustDef<T>(p: T | null | undefined): p is T | null {
   return p !== void 0;
 }
 
+// eslint-disable-next-line @typescript-eslint/ban-types
 export function isFunction(p: unknown): p is Function {
   return typeof p === 'function';
 }
 
-export function isObject(p: unknown): p is { [key: string]: unknown } | null {
-  return typeof p === 'object';
-}
-
-export function isNonNullObject(p: unknown): p is object {
-  return isObject(p) && p !== null;
-}
-
 export function isNonArrayObject(p: unknown): boolean {
-  return isObject(p) && !Array.isArray(p);
+  return typeof p === 'object' && !Array.isArray(p);
 }
 
 export function isString(p: unknown): p is string {
   return typeof p === 'string' || p instanceof String;
-}
-
-export function isInteger(p: unknown): p is number {
-  return isNumber(p) && Number.isInteger(p);
-}
-
-export function isNumber(p: unknown): p is number {
-  return typeof p === 'number' || p instanceof Number;
 }
 
 export function isNativeBlob(p: unknown): p is Blob {
@@ -60,4 +40,22 @@ export function isNativeBlob(p: unknown): p is Blob {
 
 export function isNativeBlobDefined(): boolean {
   return typeof Blob !== 'undefined';
+}
+
+export function validateNumber(
+  argument: string,
+  minValue: number,
+  maxValue: number,
+  value: number
+): void {
+  if (value < minValue) {
+    throw invalidArgument(
+      `Invalid value for '${argument}'. Expected ${minValue} or greater.`
+    );
+  }
+  if (value > maxValue) {
+    throw invalidArgument(
+      `Invalid value for '${argument}'. Expected ${maxValue} or less.`
+    );
+  }
 }

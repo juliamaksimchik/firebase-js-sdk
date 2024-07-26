@@ -15,7 +15,9 @@
  * limitations under the License.
  */
 
-import { PlatformSupport } from '../platform/platform';
+import { decodeBase64, encodeBase64 } from '../platform/base64';
+
+import { primitiveComparator } from './misc';
 
 /**
  * Immutable class that represents a "proto" byte string.
@@ -24,40 +26,56 @@ import { PlatformSupport } from '../platform/platform';
  * sent on the wire. This class abstracts away this differentiation by holding
  * the proto byte string in a common class that must be converted into a string
  * before being sent as a proto.
+ * @internal
  */
 export class ByteString {
   static readonly EMPTY_BYTE_STRING = new ByteString('');
 
-  private readonly _binaryString: string;
-
-  private constructor(binaryString: string) {
-    this._binaryString = binaryString;
-  }
+  private constructor(private readonly binaryString: string) {}
 
   static fromBase64String(base64: string): ByteString {
-    const binaryString = PlatformSupport.getPlatform().atob(base64);
+    const binaryString = decodeBase64(base64);
     return new ByteString(binaryString);
   }
 
   static fromUint8Array(array: Uint8Array): ByteString {
+    // TODO(indexing); Remove the copy of the byte string here as this method
+    // is frequently called during indexing.
     const binaryString = binaryStringFromUint8Array(array);
     return new ByteString(binaryString);
   }
 
+  [Symbol.iterator](): Iterator<number> {
+    let i = 0;
+    return {
+      next: () => {
+        if (i < this.binaryString.length) {
+          return { value: this.binaryString.charCodeAt(i++), done: false };
+        } else {
+          return { value: undefined, done: true };
+        }
+      }
+    };
+  }
+
   toBase64(): string {
-    return PlatformSupport.getPlatform().btoa(this._binaryString);
+    return encodeBase64(this.binaryString);
   }
 
   toUint8Array(): Uint8Array {
-    return uint8ArrayFromBinaryString(this._binaryString);
+    return uint8ArrayFromBinaryString(this.binaryString);
   }
 
   approximateByteSize(): number {
-    return this._binaryString.length * 2;
+    return this.binaryString.length * 2;
+  }
+
+  compareTo(other: ByteString): number {
+    return primitiveComparator(this.binaryString, other.binaryString);
   }
 
   isEqual(other: ByteString): boolean {
-    return this._binaryString === other._binaryString;
+    return this.binaryString === other.binaryString;
   }
 }
 

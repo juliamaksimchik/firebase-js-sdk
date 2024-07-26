@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,3 +31,21 @@ export const CONSOLE_CAMPAIGN_NAME = 'google.c.a.c_l';
 export const CONSOLE_CAMPAIGN_TIME = 'google.c.a.ts';
 /** Set to '1' if Analytics is enabled for the campaign */
 export const CONSOLE_CAMPAIGN_ANALYTICS_ENABLED = 'google.c.a.e';
+export const TAG = 'FirebaseMessaging: ';
+export const MAX_NUMBER_OF_EVENTS_PER_LOG_REQUEST = 1000;
+export const MAX_RETRIES = 3;
+export const LOG_INTERVAL_IN_MS = 86400000; //24 hour
+export const DEFAULT_BACKOFF_TIME_MS = 5000;
+
+// FCM log source name registered at Firelog: 'FCM_CLIENT_EVENT_LOGGING'. It uniquely identifies
+// FCM's logging configuration.
+export const FCM_LOG_SOURCE = 1249;
+
+// Defined as in proto/messaging_event.proto. Neglecting fields that are supported.
+export const SDK_PLATFORM_WEB = 3;
+export const EVENT_MESSAGE_DELIVERED = 1;
+
+export enum MessageType {
+  DATA_MESSAGE = 1,
+  DISPLAY_NOTIFICATION = 3
+}

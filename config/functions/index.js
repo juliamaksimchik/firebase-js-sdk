@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -76,6 +76,15 @@ exports.instanceIdTest = functions.https.onRequest((request, response) => {
   });
 });
 
+exports.appCheckTest = functions.https.onRequest((request, response) => {
+  cors(request, response, () => {
+    const token = request.get('X-Firebase-AppCheck');
+    assert.equal(token !== undefined, true);
+    assert.deepEqual(request.body, { data: {} });
+    response.send({ data: { token } });
+  });
+});
+
 exports.nullTest = functions.https.onRequest((request, response) => {
   cors(request, response, () => {
     assert.deepEqual(request.body, { data: null });
@@ -141,4 +150,9 @@ exports.timeoutTest = functions.https.onRequest((request, response) => {
     // Wait for longer than 500ms.
     setTimeout(() => response.send({ data: true }), 500);
   });
+});
+
+// Used by E2E test.
+exports.callTest = functions.https.onCall((data, context) => {
+  return { word: 'hellooo' };
 });

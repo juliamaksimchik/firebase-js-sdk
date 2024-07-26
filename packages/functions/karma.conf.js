@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,19 +15,29 @@
  * limitations under the License.
  */
 
-const karma = require('karma');
-const path = require('path');
 const karmaBase = require('../../config/karma.base');
+const webpackBase = require('../../config/webpack.test');
 
-const files = [`test/**/*`];
+const files = [`src/**/*.test.ts`];
 
-module.exports = function(config) {
+module.exports = function (config) {
   const karmaConfig = Object.assign({}, karmaBase, {
     // files to load into karma
-    files: files,
+    files,
     // frameworks to use
     // available frameworks: https://npmjs.org/browse/keyword/karma-adapter
-    frameworks: ['mocha']
+    frameworks: ['mocha'],
+    // undici is a fetch polyfill that test helpers call for Node tests, and browser tests should
+    // ignore its import to avoid compilation errors in those test helpers.
+    webpack: {
+      ...webpackBase,
+      resolve: {
+        ...webpackBase.resolve,
+        alias: {
+          'undici': false
+        }
+      }
+    }
   });
 
   config.set(karmaConfig);

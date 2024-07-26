@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,9 @@
  */
 
 import { Observer } from '../core/event_manager';
+
+import { FirestoreError } from './error';
+import { logError } from './log';
 import { EventHandler } from './misc';
 
 /*
@@ -30,14 +33,20 @@ export class AsyncObserver<T> implements Observer<T> {
    */
   private muted = false;
 
-  constructor(private observer: Observer<T>) {}
+  constructor(private observer: Partial<Observer<T>>) {}
 
   next(value: T): void {
-    this.scheduleEvent(this.observer.next, value);
+    if (this.observer.next) {
+      this.scheduleEvent(this.observer.next, value);
+    }
   }
 
-  error(error: Error): void {
-    this.scheduleEvent(this.observer.error, error);
+  error(error: FirestoreError): void {
+    if (this.observer.error) {
+      this.scheduleEvent(this.observer.error, error);
+    } else {
+      logError('Uncaught Error in snapshot listener:', error.toString());
+    }
   }
 
   mute(): void {

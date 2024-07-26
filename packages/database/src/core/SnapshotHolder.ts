@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,13 +16,11 @@
  */
 
 import { ChildrenNode } from './snap/ChildrenNode';
-import { Path } from './util/Path';
 import { Node } from './snap/Node';
+import { Path } from './util/Path';
 
 /**
  * Mutable object which basically just stores a reference to the "latest" immutable snapshot.
- *
- * @constructor
  */
 export class SnapshotHolder {
   private rootNode_: Node = ChildrenNode.EMPTY_NODE;

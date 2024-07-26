@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
  */
 
 import { Token } from '../api/credentials';
+import { ResourcePath } from '../model/path';
 import { FirestoreError } from '../util/error';
 
 /**
@@ -37,15 +38,19 @@ export interface Connection {
    * Invokes an RPC by name, given a request message as a JavaScript object
    * representing the JSON to send.
    *
-   * @param rpcName the name of the RPC to invoke
-   * @param request the Raw JSON object encoding of the request message
-   * @param token the Token to use for the RPC.
-   * @return a Promise containing the JSON object encoding of the response
+   * @param rpcName - the name of the RPC to invoke
+   * @param path - the path to invoke this RPC on. An array of path segments
+   * that will be encoded and joined with path separators when required.
+   * @param request - the Raw JSON object encoding of the request message
+   * @param token - the Token to use for the RPC.
+   * @returns a Promise containing the JSON object encoding of the response
    */
   invokeRPC<Req, Resp>(
     rpcName: string,
+    path: ResourcePath,
     request: Req,
-    token: Token | null
+    authToken: Token | null,
+    appCheckToken: Token | null
   ): Promise<Resp>;
 
   /**
@@ -53,28 +58,49 @@ export interface Connection {
    * object representing the JSON to send. The responses will be consumed to
    * completion and then returned as an array.
    *
-   * @param rpcName the name of the RPC to invoke
-   * @param request the Raw JSON object encoding of the request message
-   * @param token the Token to use for the RPC.
-   * @return a Promise containing an array with the JSON object encodings of the
+   * @param rpcName - the name of the RPC to invoke
+   * @param path - the path to invoke this RPC on. An array of path segments
+   * that will be encoded and joined with path separators when required.
+   * @param request - the Raw JSON object encoding of the request message
+   * @param token - the Token to use for the RPC.
+   * @returns a Promise containing an array with the JSON object encodings of the
    * responses
    */
   invokeStreamingRPC<Req, Resp>(
     rpcName: string,
+    path: ResourcePath,
     request: Req,
-    token: Token | null
+    authToken: Token | null,
+    appCheckToken: Token | null,
+    expectedResponseCount?: number
   ): Promise<Resp[]>;
 
   /**
    * Opens a stream to the given stream RPC endpoint. Returns a stream which
    * will try to open itself.
-   * @param rpcName the name of the RPC to open the stream on
-   * @param token the Token to use for the RPC.
+   * @param rpcName - the name of the RPC to open the stream on
+   * @param token - the Token to use for the RPC.
    */
   openStream<Req, Resp>(
     rpcName: string,
-    token: Token | null
+    authToken: Token | null,
+    appCheckToken: Token | null
   ): Stream<Req, Resp>;
+
+  /**
+   * Returns whether or not the implementation requires that the "path" of the resource
+   * (a document or a collection) be present in the request message. If true, then the
+   * request message must include the path. If false, then the request message must NOT
+   * include the path.
+   */
+  readonly shouldResourcePathBeIncludedInRequest: boolean;
+
+  /**
+   * Closes and cleans up any resources associated with the connection. Actual
+   * resources cleaned are implementation specific. Failure to call `terminate`
+   * on a connection may result in resource leaks.
+   */
+  terminate(): void;
 
   // TODO(mcg): subscribe to connection state changes.
 }
@@ -83,10 +109,14 @@ export interface Connection {
  * A bidirectional stream that can be used to send an receive messages.
  *
  * A stream can be closed locally with close() or can be closed remotely or
- * through network errors. onClose is guaranteed to be called. onOpen will only
- * be called if the stream successfully established a connection.
+ * through network errors. onClose is guaranteed to be called. onOpen will be
+ * called once the stream is ready to send messages (which may or may not be
+ * before an actual connection to the backend has been established). The
+ * onConnected event is called when an actual, physical connection with the
+ * backend has been established, and may occur before or after the onOpen event.
  */
 export interface Stream<I, O> {
+  onConnected(callback: () => void): void;
   onOpen(callback: () => void): void;
   onClose(callback: (err?: FirestoreError) => void): void;
   onMessage(callback: (msg: O) => void): void;

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,8 @@
  * limitations under the License.
  */
 
-export class ExistenceFilter {
-  // TODO(b/33078163): just use simplest form of existence filter for now
-  constructor(public count: number) {}
+import { BloomFilter as ProtoBloomFilter } from '../protos/firestore_proto_api';
 
-  isEqual(other: ExistenceFilter): boolean {
-    return other && other.count === this.count;
-  }
+export class ExistenceFilter {
+  constructor(public count: number, public unchangedNames?: ProtoBloomFilter) {}
 }

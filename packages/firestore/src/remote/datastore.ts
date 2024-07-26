@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,145 +16,339 @@
  */
 
 import { CredentialsProvider } from '../api/credentials';
-import { maybeDocumentMap } from '../model/collections';
-import { MaybeDocument } from '../model/document';
+import { User } from '../auth/user';
+import { Aggregate } from '../core/aggregate';
+import { DatabaseId } from '../core/database_info';
+import { queryToAggregateTarget, Query, queryToTarget } from '../core/query';
+import { Document } from '../model/document';
 import { DocumentKey } from '../model/document_key';
-import { Mutation, MutationResult } from '../model/mutation';
-import * as api from '../protos/firestore_proto_api';
-import { assert } from '../util/assert';
+import { Mutation } from '../model/mutation';
+import { ResourcePath } from '../model/path';
+import {
+  ApiClientObjectMap,
+  BatchGetDocumentsRequest as ProtoBatchGetDocumentsRequest,
+  BatchGetDocumentsResponse as ProtoBatchGetDocumentsResponse,
+  RunAggregationQueryRequest as ProtoRunAggregationQueryRequest,
+  RunAggregationQueryResponse as ProtoRunAggregationQueryResponse,
+  RunQueryRequest as ProtoRunQueryRequest,
+  RunQueryResponse as ProtoRunQueryResponse,
+  Value
+} from '../protos/firestore_proto_api';
+import { debugAssert, debugCast, hardAssert } from '../util/assert';
 import { AsyncQueue } from '../util/async_queue';
 import { Code, FirestoreError } from '../util/error';
+import { isNullOrUndefined } from '../util/types';
+
 import { Connection } from './connection';
 import {
-  WatchStreamListener,
-  WriteStreamListener,
   PersistentListenStream,
-  PersistentWriteStream
+  PersistentWriteStream,
+  WatchStreamListener,
+  WriteStreamListener
 } from './persistent_stream';
+import {
+  fromDocument,
+  fromBatchGetDocumentsResponse,
+  JsonProtoSerializer,
+  toMutation,
+  toName,
+  toQueryTarget,
+  toResourcePath,
+  toRunAggregationQueryRequest
+} from './serializer';
 
-import { JsonProtoSerializer } from './serializer';
-
-// The generated proto interfaces for these class are missing the database
-// field. So we add it here.
-// TODO(b/36015800): Remove this once the api generator is fixed.
-interface BatchGetDocumentsRequest extends api.BatchGetDocumentsRequest {
-  database?: string;
-}
-interface CommitRequest extends api.CommitRequest {
-  database?: string;
+/**
+ * Datastore and its related methods are a wrapper around the external Google
+ * Cloud Datastore grpc API, which provides an interface that is more convenient
+ * for the rest of the client SDK architecture to consume.
+ */
+export abstract class Datastore {
+  abstract terminate(): void;
+  abstract serializer: JsonProtoSerializer;
 }
 
 /**
- * Datastore is a wrapper around the external Google Cloud Datastore grpc API,
- * which provides an interface that is more convenient for the rest of the
- * client SDK architecture to consume.
+ * An implementation of Datastore that exposes additional state for internal
+ * consumption.
  */
-export class Datastore {
+class DatastoreImpl extends Datastore {
+  terminated = false;
+
   constructor(
-    private queue: AsyncQueue,
-    private connection: Connection,
-    private credentials: CredentialsProvider,
-    private serializer: JsonProtoSerializer
-  ) {}
-
-  newPersistentWriteStream(
-    listener: WriteStreamListener
-  ): PersistentWriteStream {
-    return new PersistentWriteStream(
-      this.queue,
-      this.connection,
-      this.credentials,
-      this.serializer,
-      listener
-    );
+    readonly authCredentials: CredentialsProvider<User>,
+    readonly appCheckCredentials: CredentialsProvider<string>,
+    readonly connection: Connection,
+    readonly serializer: JsonProtoSerializer
+  ) {
+    super();
   }
 
-  newPersistentWatchStream(
-    listener: WatchStreamListener
-  ): PersistentListenStream {
-    return new PersistentListenStream(
-      this.queue,
-      this.connection,
-      this.credentials,
-      this.serializer,
-      listener
-    );
-  }
-
-  commit(mutations: Mutation[]): Promise<MutationResult[]> {
-    const params: CommitRequest = {
-      database: this.serializer.encodedDatabaseId,
-      writes: mutations.map(m => this.serializer.toMutation(m))
-    };
-    return this.invokeRPC<CommitRequest, api.CommitResponse>(
-      'Commit',
-      params
-    ).then(response => {
-      return this.serializer.fromWriteResults(
-        response.writeResults,
-        response.commitTime
+  verifyInitialized(): void {
+    debugAssert(!!this.connection, 'Datastore.start() not called');
+    if (this.terminated) {
+      throw new FirestoreError(
+        Code.FAILED_PRECONDITION,
+        'The client has already been terminated.'
       );
-    });
+    }
   }
 
-  lookup(keys: DocumentKey[]): Promise<MaybeDocument[]> {
-    const params: BatchGetDocumentsRequest = {
-      database: this.serializer.encodedDatabaseId,
-      documents: keys.map(k => this.serializer.toName(k))
-    };
-    return this.invokeStreamingRPC<
-      BatchGetDocumentsRequest,
-      api.BatchGetDocumentsResponse
-    >('BatchGetDocuments', params).then(response => {
-      let docs = maybeDocumentMap();
-      response.forEach(proto => {
-        const doc = this.serializer.fromMaybeDocument(proto);
-        docs = docs.insert(doc.key, doc);
-      });
-      const result: MaybeDocument[] = [];
-      keys.forEach(key => {
-        const doc = docs.get(key);
-        assert(!!doc, 'Missing entity in write response for ' + key);
-        result.push(doc);
-      });
-      return result;
-    });
-  }
-
-  /** Gets an auth token and invokes the provided RPC. */
-  private invokeRPC<Req, Resp>(rpcName: string, request: Req): Promise<Resp> {
-    return this.credentials
-      .getToken()
-      .then(token => {
-        return this.connection.invokeRPC<Req, Resp>(rpcName, request, token);
-      })
-      .catch((error: FirestoreError) => {
-        if (error.code === Code.UNAUTHENTICATED) {
-          this.credentials.invalidateToken();
-        }
-        throw error;
-      });
-  }
-
-  /** Gets an auth token and invokes the provided RPC with streamed results. */
-  private invokeStreamingRPC<Req, Resp>(
+  /** Invokes the provided RPC with auth and AppCheck tokens. */
+  invokeRPC<Req, Resp>(
     rpcName: string,
+    databaseId: DatabaseId,
+    resourcePath: ResourcePath,
     request: Req
-  ): Promise<Resp[]> {
-    return this.credentials
-      .getToken()
-      .then(token => {
-        return this.connection.invokeStreamingRPC<Req, Resp>(
+  ): Promise<Resp> {
+    this.verifyInitialized();
+    return Promise.all([
+      this.authCredentials.getToken(),
+      this.appCheckCredentials.getToken()
+    ])
+      .then(([authToken, appCheckToken]) => {
+        return this.connection.invokeRPC<Req, Resp>(
           rpcName,
+          toResourcePath(databaseId, resourcePath),
           request,
-          token
+          authToken,
+          appCheckToken
         );
       })
       .catch((error: FirestoreError) => {
-        if (error.code === Code.UNAUTHENTICATED) {
-          this.credentials.invalidateToken();
+        if (error.name === 'FirebaseError') {
+          if (error.code === Code.UNAUTHENTICATED) {
+            this.authCredentials.invalidateToken();
+            this.appCheckCredentials.invalidateToken();
+          }
+          throw error;
+        } else {
+          throw new FirestoreError(Code.UNKNOWN, error.toString());
         }
-        throw error;
       });
   }
+
+  /** Invokes the provided RPC with streamed results with auth and AppCheck tokens. */
+  invokeStreamingRPC<Req, Resp>(
+    rpcName: string,
+    databaseId: DatabaseId,
+    resourcePath: ResourcePath,
+    request: Req,
+    expectedResponseCount?: number
+  ): Promise<Resp[]> {
+    this.verifyInitialized();
+    return Promise.all([
+      this.authCredentials.getToken(),
+      this.appCheckCredentials.getToken()
+    ])
+      .then(([authToken, appCheckToken]) => {
+        return this.connection.invokeStreamingRPC<Req, Resp>(
+          rpcName,
+          toResourcePath(databaseId, resourcePath),
+          request,
+          authToken,
+          appCheckToken,
+          expectedResponseCount
+        );
+      })
+      .catch((error: FirestoreError) => {
+        if (error.name === 'FirebaseError') {
+          if (error.code === Code.UNAUTHENTICATED) {
+            this.authCredentials.invalidateToken();
+            this.appCheckCredentials.invalidateToken();
+          }
+          throw error;
+        } else {
+          throw new FirestoreError(Code.UNKNOWN, error.toString());
+        }
+      });
+  }
+
+  terminate(): void {
+    this.terminated = true;
+    this.connection.terminate();
+  }
+}
+
+// TODO(firestorexp): Make sure there is only one Datastore instance per
+// firestore-exp client.
+export function newDatastore(
+  authCredentials: CredentialsProvider<User>,
+  appCheckCredentials: CredentialsProvider<string>,
+  connection: Connection,
+  serializer: JsonProtoSerializer
+): Datastore {
+  return new DatastoreImpl(
+    authCredentials,
+    appCheckCredentials,
+    connection,
+    serializer
+  );
+}
+
+export async function invokeCommitRpc(
+  datastore: Datastore,
+  mutations: Mutation[]
+): Promise<void> {
+  const datastoreImpl = debugCast(datastore, DatastoreImpl);
+  const request = {
+    writes: mutations.map(m => toMutation(datastoreImpl.serializer, m))
+  };
+  await datastoreImpl.invokeRPC(
+    'Commit',
+    datastoreImpl.serializer.databaseId,
+    ResourcePath.emptyPath(),
+    request
+  );
+}
+
+export async function invokeBatchGetDocumentsRpc(
+  datastore: Datastore,
+  keys: DocumentKey[]
+): Promise<Document[]> {
+  const datastoreImpl = debugCast(datastore, DatastoreImpl);
+  const request = {
+    documents: keys.map(k => toName(datastoreImpl.serializer, k))
+  };
+  const response = await datastoreImpl.invokeStreamingRPC<
+    ProtoBatchGetDocumentsRequest,
+    ProtoBatchGetDocumentsResponse
+  >(
+    'BatchGetDocuments',
+    datastoreImpl.serializer.databaseId,
+    ResourcePath.emptyPath(),
+    request,
+    keys.length
+  );
+
+  const docs = new Map<string, Document>();
+  response.forEach(proto => {
+    const doc = fromBatchGetDocumentsResponse(datastoreImpl.serializer, proto);
+    docs.set(doc.key.toString(), doc);
+  });
+  const result: Document[] = [];
+  keys.forEach(key => {
+    const doc = docs.get(key.toString());
+    hardAssert(!!doc, 'Missing entity in write response for ' + key);
+    result.push(doc);
+  });
+  return result;
+}
+
+export async function invokeRunQueryRpc(
+  datastore: Datastore,
+  query: Query
+): Promise<Document[]> {
+  const datastoreImpl = debugCast(datastore, DatastoreImpl);
+  const { queryTarget, parent } = toQueryTarget(
+    datastoreImpl.serializer,
+    queryToTarget(query)
+  );
+  const response = await datastoreImpl.invokeStreamingRPC<
+    ProtoRunQueryRequest,
+    ProtoRunQueryResponse
+  >('RunQuery', datastoreImpl.serializer.databaseId, parent, {
+    structuredQuery: queryTarget.structuredQuery
+  });
+  return (
+    response
+      // Omit RunQueryResponses that only contain readTimes.
+      .filter(proto => !!proto.document)
+      .map(proto =>
+        fromDocument(datastoreImpl.serializer, proto.document!, undefined)
+      )
+  );
+}
+
+export async function invokeRunAggregationQueryRpc(
+  datastore: Datastore,
+  query: Query,
+  aggregates: Aggregate[]
+): Promise<ApiClientObjectMap<Value>> {
+  const datastoreImpl = debugCast(datastore, DatastoreImpl);
+  const { request, aliasMap, parent } = toRunAggregationQueryRequest(
+    datastoreImpl.serializer,
+    queryToAggregateTarget(query),
+    aggregates
+  );
+
+  if (!datastoreImpl.connection.shouldResourcePathBeIncludedInRequest) {
+    delete request.parent;
+  }
+  const response = await datastoreImpl.invokeStreamingRPC<
+    ProtoRunAggregationQueryRequest,
+    ProtoRunAggregationQueryResponse
+  >(
+    'RunAggregationQuery',
+    datastoreImpl.serializer.databaseId,
+    parent,
+    request,
+    /*expectedResponseCount=*/ 1
+  );
+
+  // Omit RunAggregationQueryResponse that only contain readTimes.
+  const filteredResult = response.filter(proto => !!proto.result);
+
+  hardAssert(
+    filteredResult.length === 1,
+    'Aggregation fields are missing from result.'
+  );
+  debugAssert(
+    !isNullOrUndefined(filteredResult[0].result),
+    'aggregationQueryResponse.result'
+  );
+  debugAssert(
+    !isNullOrUndefined(filteredResult[0].result.aggregateFields),
+    'aggregationQueryResponse.result.aggregateFields'
+  );
+
+  // Remap the short-form aliases that were sent to the server
+  // to the client-side aliases. Users will access the results
+  // using the client-side alias.
+  const unmappedAggregateFields = filteredResult[0].result?.aggregateFields;
+  const remappedFields = Object.keys(unmappedAggregateFields).reduce<
+    ApiClientObjectMap<Value>
+  >((accumulator, key) => {
+    debugAssert(
+      !isNullOrUndefined(aliasMap[key]),
+      `'${key}' not present in aliasMap result`
+    );
+    accumulator[aliasMap[key]] = unmappedAggregateFields[key]!;
+    return accumulator;
+  }, {});
+
+  return remappedFields;
+}
+
+export function newPersistentWriteStream(
+  datastore: Datastore,
+  queue: AsyncQueue,
+  listener: WriteStreamListener
+): PersistentWriteStream {
+  const datastoreImpl = debugCast(datastore, DatastoreImpl);
+  datastoreImpl.verifyInitialized();
+  return new PersistentWriteStream(
+    queue,
+    datastoreImpl.connection,
+    datastoreImpl.authCredentials,
+    datastoreImpl.appCheckCredentials,
+    datastoreImpl.serializer,
+    listener
+  );
+}
+
+export function newPersistentWatchStream(
+  datastore: Datastore,
+  queue: AsyncQueue,
+  listener: WatchStreamListener
+): PersistentListenStream {
+  const datastoreImpl = debugCast(datastore, DatastoreImpl);
+  datastoreImpl.verifyInitialized();
+  return new PersistentListenStream(
+    queue,
+    datastoreImpl.connection,
+    datastoreImpl.authCredentials,
+    datastoreImpl.appCheckCredentials,
+    datastoreImpl.serializer,
+    listener
+  );
 }

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,40 @@
  * limitations under the License.
  */
 
-// Imports firebase via the raw sources and re-exports it.
-// This file exists so that the "<repo-root>/integration/firestore" test suite
-// can replace this file reference with a reference to the minified sources
-// instead.
+// Imports firebase via the raw sources and re-exports it. The
+// "<repo-root>/integration/firestore" test suite replaces this file with a
+// reference to the minified sources. If you change any exports in this file,
+// you need to also adjust "integration/firestore/firebase_export.ts".
 
-import firebase from '@firebase/app';
+import { FirebaseApp, initializeApp } from '@firebase/app';
 
-// eslint-disable-next-line import/no-default-export
-export default firebase;
+import { Firestore, initializeFirestore } from '../../../src';
+import { PrivateSettings } from '../../../src/lite-api/settings';
+
+// TODO(dimond): Right now we create a new app and Firestore instance for
+// every test and never clean them up. We may need to revisit.
+let appCount = 0;
+
+export function newTestApp(projectId: string, appName?: string): FirebaseApp {
+  if (appName === undefined) {
+    appName = 'test-app-' + appCount++;
+  }
+  return initializeApp(
+    {
+      apiKey: 'fake-api-key',
+      projectId
+    },
+    appName
+  );
+}
+
+export function newTestFirestore(
+  app: FirebaseApp,
+  settings?: PrivateSettings,
+  dbName?: string
+): Firestore {
+  return initializeFirestore(app, settings || {}, dbName);
+}
+
+export * from '../../../src';
+export { PrivateSettings };

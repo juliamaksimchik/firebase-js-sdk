@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,35 +18,106 @@
 import { expect } from 'chai';
 import { SinonStub, stub } from 'sinon';
 import '../testing/setup';
-import { DataLayer, Gtag } from '@firebase/analytics-types';
+import { DataLayer, Gtag, DynamicConfig } from './types';
 import {
-  initializeGAId,
   getOrCreateDataLayer,
   insertScriptTag,
   wrapOrCreateGtag,
-  findGtagScriptOnPage
+  findGtagScriptOnPage,
+  promiseAllSettled,
+  createGtagTrustedTypesScriptURL,
+  createTrustedTypesPolicy
 } from './helpers';
-import {
-  getFakeApp,
-  getFakeInstallations
-} from '../testing/get-fake-firebase-services';
-import { GtagCommand } from './constants';
+import { GtagCommand, GTAG_URL } from './constants';
 import { Deferred } from '@firebase/util';
+import { ConsentSettings } from './public-types';
+import { removeGtagScripts } from '../testing/gtag-script-util';
+import { logger } from './logger';
+import { AnalyticsError, ERROR_FACTORY } from './errors';
 
-const mockAnalyticsId = 'abcd-efgh-ijkl';
-const mockFid = 'fid-1234-zyxw';
+const fakeMeasurementId = 'abcd-efgh-ijkl';
+const fakeAppId = 'my-test-app-1234';
+const fakeDynamicConfig: DynamicConfig = {
+  projectId: '---',
+  appId: fakeAppId,
+  databaseURL: '---',
+  storageBucket: '---',
+  locationId: '---',
+  apiKey: '---',
+  authDomain: '---',
+  messagingSenderId: '---',
+  measurementId: fakeMeasurementId
+};
+const fakeDynamicConfigPromises = [Promise.resolve(fakeDynamicConfig)];
 
-describe('FirebaseAnalytics methods', () => {
-  it('initializeGAId gets FID from installations and calls gtag config with it', async () => {
-    const gtagStub: SinonStub = stub();
-    const app = getFakeApp(mockAnalyticsId);
-    const installations = getFakeInstallations(mockFid);
-    await initializeGAId(app, installations, gtagStub);
-    expect(gtagStub).to.be.calledWith(GtagCommand.CONFIG, mockAnalyticsId, {
-      'firebase_id': mockFid,
-      'origin': 'firebase',
-      update: true
+describe('Trusted Types policies and functions', () => {
+  if (window.trustedTypes) {
+    describe('Trusted types exists', () => {
+      let ttStub: SinonStub;
+
+      beforeEach(() => {
+        ttStub = stub(
+          window.trustedTypes as TrustedTypePolicyFactory,
+          'createPolicy'
+        ).returns({
+          createScriptURL: (s: string) => s
+        } as any);
+      });
+
+      afterEach(() => {
+        removeGtagScripts();
+        ttStub.restore();
+      });
+
+      it('Verify trustedTypes is called if the API is available', () => {
+        const trustedTypesPolicy = createTrustedTypesPolicy(
+          'firebase-js-sdk-policy',
+          {
+            createScriptURL: createGtagTrustedTypesScriptURL
+          }
+        );
+
+        expect(ttStub).to.be.called;
+        expect(trustedTypesPolicy).not.to.be.undefined;
+      });
+
+      it('createGtagTrustedTypesScriptURL verifies gtag URL base exists when a URL is provided', () => {
+        expect(createGtagTrustedTypesScriptURL(GTAG_URL)).to.equal(GTAG_URL);
+      });
+
+      it('createGtagTrustedTypesScriptURL rejects URLs with non-gtag base', () => {
+        const NON_GTAG_URL = 'http://iamnotgtag.com';
+        const loggerWarnStub = stub(logger, 'warn');
+        const errorMessage = ERROR_FACTORY.create(
+          AnalyticsError.INVALID_GTAG_RESOURCE,
+          {
+            gtagURL: NON_GTAG_URL
+          }
+        ).message;
+
+        expect(createGtagTrustedTypesScriptURL(NON_GTAG_URL)).to.equal('');
+        expect(loggerWarnStub).to.be.calledWith(errorMessage);
+      });
     });
+  }
+  describe('Trusted types does not exist', () => {
+    it('Verify trustedTypes functions are not called if the API is not available', () => {
+      delete window.trustedTypes;
+      const trustedTypesPolicy = createTrustedTypesPolicy(
+        'firebase-js-sdk-policy',
+        {
+          createScriptURL: createGtagTrustedTypesScriptURL
+        }
+      );
+
+      expect(trustedTypesPolicy).to.be.undefined;
+    });
+  });
+});
+
+describe('Gtag wrapping functions', () => {
+  afterEach(() => {
+    removeGtagScripts();
   });
 
   it('getOrCreateDataLayer is able to create a new data layer if none exists', () => {
@@ -60,11 +131,22 @@ describe('FirebaseAnalytics methods', () => {
   });
 
   it('insertScriptIfNeeded inserts script tag', () => {
-    expect(findGtagScriptOnPage()).to.be.null;
-    insertScriptTag('customDataLayerName');
-    const scriptTag = findGtagScriptOnPage();
+    const customDataLayerName = 'customDataLayerName';
+    expect(findGtagScriptOnPage(customDataLayerName)).to.be.null;
+    insertScriptTag(customDataLayerName, fakeMeasurementId);
+    const scriptTag = findGtagScriptOnPage(customDataLayerName);
     expect(scriptTag).to.not.be.null;
     expect(scriptTag!.src).to.contain(`l=customDataLayerName`);
+    expect(scriptTag!.src).to.contain(`id=${fakeMeasurementId}`);
+  });
+
+  // The test above essentially already touches this functionality but it is still valuable
+  it('findGtagScriptOnPage returns gtag instance with matching data layer name', () => {
+    const defaultDataLayerName = 'dataLayer';
+    insertScriptTag(defaultDataLayerName, fakeMeasurementId);
+    const scriptTag = findGtagScriptOnPage(defaultDataLayerName);
+    expect(scriptTag!.src).to.contain(`l=${defaultDataLayerName}`);
+    expect(findGtagScriptOnPage('NON_EXISTENT_DATA_LAYER_ID')).to.be.null;
   });
 
   describe('wrapOrCreateGtag() when user has not previously inserted a gtag script tag on this page', () => {
@@ -75,50 +157,67 @@ describe('FirebaseAnalytics methods', () => {
 
     it('wrapOrCreateGtag creates new gtag function if needed', () => {
       expect(window['gtag']).to.not.exist;
-      wrapOrCreateGtag({}, 'dataLayer', 'gtag');
+      wrapOrCreateGtag({}, fakeDynamicConfigPromises, {}, 'dataLayer', 'gtag');
       expect(window['gtag']).to.exist;
     });
 
     it('new window.gtag function waits for all initialization promises before sending group events', async () => {
-      const initPromise1 = new Deferred<void>();
-      const initPromise2 = new Deferred<void>();
+      const initPromise1 = new Deferred<string>();
+      const initPromise2 = new Deferred<string>();
       wrapOrCreateGtag(
-        { [mockAnalyticsId]: initPromise1.promise, otherId: initPromise2.promise },
+        {
+          [fakeAppId]: initPromise1.promise,
+          otherId: initPromise2.promise
+        },
+        fakeDynamicConfigPromises,
+        {},
         'dataLayer',
         'gtag'
       );
       window['dataLayer'] = [];
-      (window['gtag'] as Gtag)(GtagCommand.EVENT, 'purchase', {
+      const eventObject = {
         'transaction_id': 'abcd123',
         'send_to': 'some_group'
-      });
+      };
+      (window['gtag'] as Gtag)(GtagCommand.EVENT, 'purchase', eventObject);
       expect((window['dataLayer'] as DataLayer).length).to.equal(0);
 
-      initPromise1.resolve(); // Resolves first initialization promise.
+      initPromise1.resolve(fakeMeasurementId); // Resolves first initialization promise.
       expect((window['dataLayer'] as DataLayer).length).to.equal(0);
 
-      initPromise2.resolve(); // Resolves second initialization promise.
+      initPromise2.resolve('other-measurement-id'); // Resolves second initialization promise.
       await Promise.all([initPromise1, initPromise2]); // Wait for resolution of Promise.all()
-
-      expect((window['dataLayer'] as DataLayer).length).to.equal(1);
+      await promiseAllSettled(fakeDynamicConfigPromises);
+      const dataLayer = window['dataLayer'] as DataLayer;
+      expect(dataLayer.length).to.equal(1);
+      const data = dataLayer[0];
+      expect(data[0]).to.equal('event');
+      expect(data[1]).to.equal('purchase');
+      expect(data[2]).to.equal(eventObject);
     });
 
     it(
       'new window.gtag function waits for all initialization promises before sending ' +
         'event with at least one unknown send_to ID',
       async () => {
-        const initPromise1 = new Deferred<void>();
-        const initPromise2 = new Deferred<void>();
+        const initPromise1 = new Deferred<string>();
+        const initPromise2 = new Deferred<string>();
         wrapOrCreateGtag(
-          { [mockAnalyticsId]: initPromise1.promise, otherId: initPromise2.promise },
+          {
+            [fakeAppId]: initPromise1.promise,
+            otherId: initPromise2.promise
+          },
+          fakeDynamicConfigPromises,
+          { [fakeMeasurementId]: fakeAppId },
           'dataLayer',
           'gtag'
         );
         window['dataLayer'] = [];
-        (window['gtag'] as Gtag)(GtagCommand.EVENT, 'purchase', {
+        const eventObject = {
           'transaction_id': 'abcd123',
-          'send_to': [mockAnalyticsId, 'some_group']
-        });
+          'send_to': [fakeMeasurementId, 'some_group']
+        };
+        (window['gtag'] as Gtag)(GtagCommand.EVENT, 'purchase', eventObject);
         expect((window['dataLayer'] as DataLayer).length).to.equal(0);
 
         initPromise1.resolve(); // Resolves first initialization promise.
@@ -126,8 +225,14 @@ describe('FirebaseAnalytics methods', () => {
 
         initPromise2.resolve(); // Resolves second initialization promise.
         await Promise.all([initPromise1, initPromise2]); // Wait for resolution of Promise.all()
+        await promiseAllSettled(fakeDynamicConfigPromises);
 
-        expect((window['dataLayer'] as DataLayer).length).to.equal(1);
+        const dataLayer = window['dataLayer'] as DataLayer;
+        expect(dataLayer.length).to.equal(1);
+        const data = dataLayer[0];
+        expect(data[0]).to.equal('event');
+        expect(data[1]).to.equal('purchase');
+        expect(data[2]).to.equal(eventObject);
       }
     );
 
@@ -135,17 +240,23 @@ describe('FirebaseAnalytics methods', () => {
       'new window.gtag function waits for all initialization promises before sending ' +
         'events with no send_to field',
       async () => {
-        const initPromise1 = new Deferred<void>();
-        const initPromise2 = new Deferred<void>();
+        const initPromise1 = new Deferred<string>();
+        const initPromise2 = new Deferred<string>();
         wrapOrCreateGtag(
-          { [mockAnalyticsId]: initPromise1.promise, otherId: initPromise2.promise },
+          {
+            [fakeAppId]: initPromise1.promise,
+            otherId: initPromise2.promise
+          },
+          fakeDynamicConfigPromises,
+          { [fakeMeasurementId]: fakeAppId },
           'dataLayer',
           'gtag'
         );
         window['dataLayer'] = [];
-        (window['gtag'] as Gtag)(GtagCommand.EVENT, 'purchase', {
+        const eventObject = {
           'transaction_id': 'abcd123'
-        });
+        };
+        (window['gtag'] as Gtag)(GtagCommand.EVENT, 'purchase', eventObject);
         expect((window['dataLayer'] as DataLayer).length).to.equal(0);
 
         initPromise1.resolve(); // Resolves first initialization promise.
@@ -154,7 +265,12 @@ describe('FirebaseAnalytics methods', () => {
         initPromise2.resolve(); // Resolves second initialization promise.
         await Promise.all([initPromise1, initPromise2]); // Wait for resolution of Promise.all()
 
-        expect((window['dataLayer'] as DataLayer).length).to.equal(1);
+        const dataLayer = window['dataLayer'] as DataLayer;
+        expect(dataLayer.length).to.equal(1);
+        const data = dataLayer[0];
+        expect(data[0]).to.equal('event');
+        expect(data[1]).to.equal('purchase');
+        expect(data[2]).to.equal(eventObject);
       }
     );
 
@@ -162,29 +278,41 @@ describe('FirebaseAnalytics methods', () => {
       'new window.gtag function only waits for firebase initialization promise ' +
         'before sending event only targeted to Firebase instance GA ID',
       async () => {
-        const initPromise1 = new Deferred<void>();
-        const initPromise2 = new Deferred<void>();
+        const initPromise1 = new Deferred<string>();
+        const initPromise2 = new Deferred<string>();
         wrapOrCreateGtag(
-          { [mockAnalyticsId]: initPromise1.promise, otherId: initPromise2.promise },
+          {
+            [fakeAppId]: initPromise1.promise,
+            otherId: initPromise2.promise
+          },
+          fakeDynamicConfigPromises,
+          { [fakeMeasurementId]: fakeAppId },
           'dataLayer',
           'gtag'
         );
         window['dataLayer'] = [];
-        (window['gtag'] as Gtag)(GtagCommand.EVENT, 'purchase', {
+        const eventObject = {
           'transaction_id': 'abcd123',
-          'send_to': mockAnalyticsId
-        });
+          'send_to': fakeMeasurementId
+        };
+        (window['gtag'] as Gtag)(GtagCommand.EVENT, 'purchase', eventObject);
         expect((window['dataLayer'] as DataLayer).length).to.equal(0);
 
         initPromise1.resolve(); // Resolves first initialization promise.
+        await promiseAllSettled(fakeDynamicConfigPromises);
         await Promise.all([initPromise1]); // Wait for resolution of Promise.all()
 
-        expect((window['dataLayer'] as DataLayer).length).to.equal(1);
+        const dataLayer = window['dataLayer'] as DataLayer;
+        expect(dataLayer.length).to.equal(1);
+        const data = dataLayer[0];
+        expect(data[0]).to.equal('event');
+        expect(data[1]).to.equal('purchase');
+        expect(data[2]).to.equal(eventObject);
       }
     );
 
     it('new window.gtag function does not wait before sending events if there are no pending initialization promises', async () => {
-      wrapOrCreateGtag({}, 'dataLayer', 'gtag');
+      wrapOrCreateGtag({}, fakeDynamicConfigPromises, {}, 'dataLayer', 'gtag');
       window['dataLayer'] = [];
       (window['gtag'] as Gtag)(GtagCommand.EVENT, 'purchase', {
         'transaction_id': 'abcd123'
@@ -195,42 +323,141 @@ describe('FirebaseAnalytics methods', () => {
 
     it('new window.gtag function does not wait when sending "set" calls', async () => {
       wrapOrCreateGtag(
-        { [mockAnalyticsId]: Promise.resolve() },
+        { [fakeAppId]: Promise.resolve(fakeMeasurementId) },
+        fakeDynamicConfigPromises,
+        {},
         'dataLayer',
         'gtag'
       );
       window['dataLayer'] = [];
-      (window['gtag'] as Gtag)(GtagCommand.SET, { 'language': 'en' });
-      expect((window['dataLayer'] as DataLayer).length).to.equal(1);
+      const eventObject = { 'language': 'en' };
+      (window['gtag'] as Gtag)(GtagCommand.SET, eventObject);
+      const dataLayer = window['dataLayer'] as DataLayer;
+      expect(dataLayer.length).to.equal(1);
+      const data = dataLayer[0];
+      expect(data[0]).to.equal('set');
+      expect(data[1]).to.equal(eventObject);
+    });
+
+    it('new window.gtag function does not wait when sending "consent" calls', async () => {
+      const consentParameters: ConsentSettings = {
+        'analytics_storage': 'granted',
+        'functionality_storage': 'denied'
+      };
+      wrapOrCreateGtag(
+        { [fakeAppId]: Promise.resolve(fakeMeasurementId) },
+        fakeDynamicConfigPromises,
+        {},
+        'dataLayer',
+        'gtag'
+      );
+      window['dataLayer'] = [];
+      (window['gtag'] as Gtag)(
+        GtagCommand.CONSENT,
+        'update',
+        consentParameters
+      );
+      const dataLayer = window['dataLayer'] as DataLayer;
+      expect(dataLayer.length).to.equal(1);
+      const data = dataLayer[0];
+      expect(data[0]).to.equal('consent');
+      expect(data[1]).to.equal('update');
+      expect(data[2]).to.equal(consentParameters);
+    });
+
+    it('new window.gtag function does not wait when sending "get" calls', async () => {
+      wrapOrCreateGtag(
+        { [fakeAppId]: Promise.resolve(fakeMeasurementId) },
+        fakeDynamicConfigPromises,
+        {},
+        'dataLayer',
+        'gtag'
+      );
+      window['dataLayer'] = [];
+      (window['gtag'] as Gtag)(
+        GtagCommand.GET,
+        fakeMeasurementId,
+        'client_id',
+        clientId => console.log(clientId)
+      );
+      const dataLayer = window['dataLayer'] as DataLayer;
+      expect(dataLayer.length).to.equal(1);
+      const data = dataLayer[0];
+      expect(data[0]).to.equal('get');
+      expect(data[1]).to.equal(fakeMeasurementId);
+      expect(data[2]).to.equal('client_id');
+      expect(data[3]).to.not.be.undefined;
+    });
+
+    it('new window.gtag function does not wait when sending an unknown command', async () => {
+      wrapOrCreateGtag(
+        { [fakeAppId]: Promise.resolve(fakeMeasurementId) },
+        fakeDynamicConfigPromises,
+        {},
+        'dataLayer',
+        'gtag'
+      );
+      window['dataLayer'] = [];
+      (window['gtag'] as Gtag)('new-command-from-gtag-team', fakeMeasurementId);
+      const dataLayer = window['dataLayer'] as DataLayer;
+      expect(dataLayer.length).to.equal(1);
+      const data = dataLayer[0];
+      expect(data[0]).to.equal('new-command-from-gtag-team');
+      expect(data[1]).to.equal(fakeMeasurementId);
     });
 
     it('new window.gtag function waits for initialization promise when sending "config" calls', async () => {
-      const initPromise1 = new Deferred<void>();
+      const initPromise1 = new Deferred<string>();
       wrapOrCreateGtag(
-        { [mockAnalyticsId]: initPromise1.promise },
+        { [fakeAppId]: initPromise1.promise },
+        fakeDynamicConfigPromises,
+        {},
         'dataLayer',
         'gtag'
       );
       window['dataLayer'] = [];
-      (window['gtag'] as Gtag)(GtagCommand.CONFIG, mockAnalyticsId, {
+      const eventObject = {
         'language': 'en'
-      });
+      };
+      (window['gtag'] as Gtag)(
+        GtagCommand.CONFIG,
+        fakeMeasurementId,
+        eventObject
+      );
       expect((window['dataLayer'] as DataLayer).length).to.equal(0);
 
-      initPromise1.resolve();
-      await Promise.all([initPromise1]); // Wait for resolution of Promise.all()
+      initPromise1.resolve(fakeMeasurementId);
+      await promiseAllSettled(fakeDynamicConfigPromises); // Resolves dynamic config fetches.
+      expect((window['dataLayer'] as DataLayer).length).to.equal(0);
 
-      expect((window['dataLayer'] as DataLayer).length).to.equal(1);
+      await Promise.all([initPromise1]); // Wait for resolution of Promise.all()
+      const dataLayer = window['dataLayer'] as DataLayer;
+      expect(dataLayer.length).to.equal(1);
+      const data = dataLayer[0];
+      expect(data[0]).to.equal('config');
+      expect(data[1]).to.equal(fakeMeasurementId);
+      expect(data[2]).to.equal(eventObject);
     });
 
     it('new window.gtag function does not wait when sending "config" calls if there are no pending initialization promises', async () => {
-      wrapOrCreateGtag({}, 'dataLayer', 'gtag');
+      wrapOrCreateGtag({}, fakeDynamicConfigPromises, {}, 'dataLayer', 'gtag');
       window['dataLayer'] = [];
-      (window['gtag'] as Gtag)(GtagCommand.CONFIG, mockAnalyticsId, {
+      const eventObject = {
         'transaction_id': 'abcd123'
-      });
-      await Promise.resolve(); // Config call is always chained onto a promise, even if empty.
-      expect((window['dataLayer'] as DataLayer).length).to.equal(1);
+      };
+      (window['gtag'] as Gtag)(
+        GtagCommand.CONFIG,
+        fakeMeasurementId,
+        eventObject
+      );
+      await promiseAllSettled(fakeDynamicConfigPromises);
+      await Promise.resolve(); // Config call is always chained onto initialization promise list, even if empty.
+      const dataLayer = window['dataLayer'] as DataLayer;
+      expect(dataLayer.length).to.equal(1);
+      const data = dataLayer[0];
+      expect(data[0]).to.equal('config');
+      expect(data[1]).to.equal(fakeMeasurementId);
+      expect(data[2]).to.equal(eventObject);
     });
   });
 
@@ -246,10 +473,15 @@ describe('FirebaseAnalytics methods', () => {
     });
 
     it('new window.gtag function waits for all initialization promises before sending group events', async () => {
-      const initPromise1 = new Deferred<void>();
-      const initPromise2 = new Deferred<void>();
+      const initPromise1 = new Deferred<string>();
+      const initPromise2 = new Deferred<string>();
       wrapOrCreateGtag(
-        { [mockAnalyticsId]: initPromise1.promise, otherId: initPromise2.promise },
+        {
+          [fakeAppId]: initPromise1.promise,
+          otherId: initPromise2.promise
+        },
+        fakeDynamicConfigPromises,
+        { [fakeMeasurementId]: fakeAppId },
         'dataLayer',
         'gtag'
       );
@@ -263,6 +495,9 @@ describe('FirebaseAnalytics methods', () => {
       expect(existingGtagStub).to.not.be.called;
 
       initPromise2.resolve(); // Resolves second initialization promise.
+      await promiseAllSettled(fakeDynamicConfigPromises); // Resolves dynamic config fetches.
+      expect(existingGtagStub).to.not.be.called;
+
       await Promise.all([initPromise1, initPromise2]); // Wait for resolution of Promise.all()
 
       expect(existingGtagStub).to.be.calledWith(GtagCommand.EVENT, 'purchase', {
@@ -275,16 +510,21 @@ describe('FirebaseAnalytics methods', () => {
       'new window.gtag function waits for all initialization promises before sending ' +
         'event with at least one unknown send_to ID',
       async () => {
-        const initPromise1 = new Deferred<void>();
-        const initPromise2 = new Deferred<void>();
+        const initPromise1 = new Deferred<string>();
+        const initPromise2 = new Deferred<string>();
         wrapOrCreateGtag(
-          { [mockAnalyticsId]: initPromise1.promise, otherId: initPromise2.promise },
+          {
+            [fakeAppId]: initPromise1.promise,
+            otherId: initPromise2.promise
+          },
+          fakeDynamicConfigPromises,
+          { [fakeMeasurementId]: fakeAppId },
           'dataLayer',
           'gtag'
         );
         (window['gtag'] as Gtag)(GtagCommand.EVENT, 'purchase', {
           'transaction_id': 'abcd123',
-          'send_to': [mockAnalyticsId, 'some_group']
+          'send_to': [fakeMeasurementId, 'some_group']
         });
         expect(existingGtagStub).to.not.be.called;
 
@@ -292,13 +532,16 @@ describe('FirebaseAnalytics methods', () => {
         expect(existingGtagStub).to.not.be.called;
 
         initPromise2.resolve(); // Resolves second initialization promise.
+        await promiseAllSettled(fakeDynamicConfigPromises); // Resolves dynamic config fetches.
+        expect(existingGtagStub).to.not.be.called;
+
         await Promise.all([initPromise1, initPromise2]); // Wait for resolution of Promise.all()
 
         expect(existingGtagStub).to.be.calledWith(
           GtagCommand.EVENT,
           'purchase',
           {
-            'send_to': [mockAnalyticsId, 'some_group'],
+            'send_to': [fakeMeasurementId, 'some_group'],
             'transaction_id': 'abcd123'
           }
         );
@@ -309,10 +552,15 @@ describe('FirebaseAnalytics methods', () => {
       'new window.gtag function waits for all initialization promises before sending ' +
         'events with no send_to field',
       async () => {
-        const initPromise1 = new Deferred<void>();
-        const initPromise2 = new Deferred<void>();
+        const initPromise1 = new Deferred<string>();
+        const initPromise2 = new Deferred<string>();
         wrapOrCreateGtag(
-          { [mockAnalyticsId]: initPromise1.promise, otherId: initPromise2.promise },
+          {
+            [fakeAppId]: initPromise1.promise,
+            otherId: initPromise2.promise
+          },
+          fakeDynamicConfigPromises,
+          { [fakeMeasurementId]: fakeAppId },
           'dataLayer',
           'gtag'
         );
@@ -325,6 +573,7 @@ describe('FirebaseAnalytics methods', () => {
         expect(existingGtagStub).to.not.be.called;
 
         initPromise2.resolve(); // Resolves second initialization promise.
+
         await Promise.all([initPromise1, initPromise2]); // Wait for resolution of Promise.all()
 
         expect(existingGtagStub).to.be.calledWith(
@@ -339,32 +588,40 @@ describe('FirebaseAnalytics methods', () => {
       'new window.gtag function only waits for firebase initialization promise ' +
         'before sending event only targeted to Firebase instance GA ID',
       async () => {
-        const initPromise1 = new Deferred<void>();
-        const initPromise2 = new Deferred<void>();
+        const initPromise1 = new Deferred<string>();
+        const initPromise2 = new Deferred<string>();
         wrapOrCreateGtag(
-          { [mockAnalyticsId]: initPromise1.promise, otherId: initPromise2.promise },
+          {
+            [fakeAppId]: initPromise1.promise,
+            otherId: initPromise2.promise
+          },
+          fakeDynamicConfigPromises,
+          { [fakeMeasurementId]: fakeAppId },
           'dataLayer',
           'gtag'
         );
         (window['gtag'] as Gtag)(GtagCommand.EVENT, 'purchase', {
           'transaction_id': 'abcd123',
-          'send_to': mockAnalyticsId
+          'send_to': fakeMeasurementId
         });
         expect(existingGtagStub).to.not.be.called;
 
         initPromise1.resolve(); // Resolves first initialization promise.
+        await promiseAllSettled(fakeDynamicConfigPromises); // Resolves dynamic config fetches.
+        expect(existingGtagStub).to.not.be.called;
+
         await Promise.all([initPromise1]); // Wait for resolution of Promise.all()
 
         expect(existingGtagStub).to.be.calledWith(
           GtagCommand.EVENT,
           'purchase',
-          { 'send_to': mockAnalyticsId, 'transaction_id': 'abcd123' }
+          { 'send_to': fakeMeasurementId, 'transaction_id': 'abcd123' }
         );
       }
     );
 
     it('wrapped window.gtag function does not wait if there are no pending initialization promises', async () => {
-      wrapOrCreateGtag({}, 'dataLayer', 'gtag');
+      wrapOrCreateGtag({}, fakeDynamicConfigPromises, {}, 'dataLayer', 'gtag');
       window['dataLayer'] = [];
       (window['gtag'] as Gtag)(GtagCommand.EVENT, 'purchase', {
         'transaction_id': 'abcd321'
@@ -377,7 +634,9 @@ describe('FirebaseAnalytics methods', () => {
 
     it('wrapped window.gtag function does not wait when sending "set" calls', async () => {
       wrapOrCreateGtag(
-        { [mockAnalyticsId]: Promise.resolve() },
+        { [fakeAppId]: Promise.resolve(fakeMeasurementId) },
+        fakeDynamicConfigPromises,
+        {},
         'dataLayer',
         'gtag'
       );
@@ -389,24 +648,29 @@ describe('FirebaseAnalytics methods', () => {
     });
 
     it('new window.gtag function waits for initialization promise when sending "config" calls', async () => {
-      const initPromise1 = new Deferred<void>();
+      const initPromise1 = new Deferred<string>();
       wrapOrCreateGtag(
-        { [mockAnalyticsId]: initPromise1.promise },
+        { [fakeAppId]: initPromise1.promise },
+        fakeDynamicConfigPromises,
+        {},
         'dataLayer',
         'gtag'
       );
       window['dataLayer'] = [];
-      (window['gtag'] as Gtag)(GtagCommand.CONFIG, mockAnalyticsId, {
+      (window['gtag'] as Gtag)(GtagCommand.CONFIG, fakeMeasurementId, {
         'language': 'en'
       });
       expect(existingGtagStub).to.not.be.called;
 
-      initPromise1.resolve();
+      initPromise1.resolve(fakeMeasurementId);
+      await promiseAllSettled(fakeDynamicConfigPromises); // Resolves dynamic config fetches.
+      expect(existingGtagStub).to.not.be.called;
+
       await Promise.all([initPromise1]); // Wait for resolution of Promise.all()
 
       expect(existingGtagStub).to.be.calledWith(
         GtagCommand.CONFIG,
-        mockAnalyticsId,
+        fakeMeasurementId,
         {
           'language': 'en'
         }
@@ -414,15 +678,17 @@ describe('FirebaseAnalytics methods', () => {
     });
 
     it('new window.gtag function does not wait when sending "config" calls if there are no pending initialization promises', async () => {
-      wrapOrCreateGtag({}, 'dataLayer', 'gtag');
+      wrapOrCreateGtag({}, fakeDynamicConfigPromises, {}, 'dataLayer', 'gtag');
       window['dataLayer'] = [];
-      (window['gtag'] as Gtag)(GtagCommand.CONFIG, mockAnalyticsId, {
+      (window['gtag'] as Gtag)(GtagCommand.CONFIG, fakeMeasurementId, {
         'transaction_id': 'abcd123'
       });
-      await Promise.resolve(); // Config call is always chained onto a promise, even if empty.
+      await promiseAllSettled(fakeDynamicConfigPromises); // Resolves dynamic config fetches.
+      expect(existingGtagStub).to.not.be.called;
+      await Promise.resolve(); // Config call is always chained onto initialization promise list, even if empty.
       expect(existingGtagStub).to.be.calledWith(
         GtagCommand.CONFIG,
-        mockAnalyticsId,
+        fakeMeasurementId,
         {
           'transaction_id': 'abcd123'
         }

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2020 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,20 +26,23 @@ import { ERROR_FACTORY, ErrorCode } from '../utils/errors';
 import { Api } from './api_service';
 import { getAuthTokenPromise } from './iid_service';
 import { SettingsService } from './settings_service';
+import { PerformanceController } from '../controllers/perf';
+import { getProjectId, getApiKey, getAppId } from '../utils/app_utils';
 
 const REMOTE_CONFIG_SDK_VERSION = '0.0.1';
 
 interface SecondaryConfig {
   loggingEnabled?: boolean;
-  logEndPointUrl?: string;
   logSource?: number;
+  logEndPointUrl?: string;
+  transportKey?: string;
   tracesSamplingRate?: number;
   networkRequestsSamplingRate?: number;
 }
 
 // These values will be used if the remote config object is successfully
 // retrieved, but the template does not have these fields.
-const SECONDARY_CONFIGS: SecondaryConfig = {
+const DEFAULT_CONFIGS: SecondaryConfig = {
   loggingEnabled: true
 };
 
@@ -48,6 +51,8 @@ interface RemoteConfigTemplate {
   fpr_enabled?: string;
   fpr_log_source?: string;
   fpr_log_endpoint_url?: string;
+  fpr_log_transport_key?: string;
+  fpr_log_transport_web_percent?: string;
   fpr_vc_network_request_sampling_rate?: string;
   fpr_vc_trace_sampling_rate?: string;
   fpr_vc_session_sampling_rate?: string;
@@ -61,15 +66,18 @@ interface RemoteConfigResponse {
 
 const FIS_AUTH_PREFIX = 'FIREBASE_INSTALLATIONS_AUTH';
 
-export function getConfig(iid: string): Promise<void> {
+export function getConfig(
+  performanceController: PerformanceController,
+  iid: string
+): Promise<void> {
   const config = getStoredConfig();
   if (config) {
     processConfig(config);
     return Promise.resolve();
   }
 
-  return getRemoteConfig(iid)
-    .then(config => processConfig(config))
+  return getRemoteConfig(performanceController, iid)
+    .then(processConfig)
     .then(
       config => storeConfig(config),
       /** Do nothing for error, use defaults set in settings service. */
@@ -119,13 +127,15 @@ const COULD_NOT_GET_CONFIG_MSG =
   'Could not fetch config, will use default configs';
 
 function getRemoteConfig(
+  performanceController: PerformanceController,
   iid: string
 ): Promise<RemoteConfigResponse | undefined> {
   // Perf needs auth token only to retrieve remote config.
-  return getAuthTokenPromise()
+  return getAuthTokenPromise(performanceController.installations)
     .then(authToken => {
-      const projectId = SettingsService.getInstance().getProjectId();
-      const configEndPoint = `https://firebaseremoteconfig.googleapis.com/v1/projects/${projectId}/namespaces/fireperf:fetch?key=${SettingsService.getInstance().getApiKey()}`;
+      const projectId = getProjectId(performanceController.app);
+      const apiKey = getApiKey(performanceController.app);
+      const configEndPoint = `https://firebaseremoteconfig.googleapis.com/v1/projects/${projectId}/namespaces/fireperf:fetch?key=${apiKey}`;
       const request = new Request(configEndPoint, {
         method: 'POST',
         headers: { Authorization: `${FIS_AUTH_PREFIX} ${authToken}` },
@@ -133,7 +143,7 @@ function getRemoteConfig(
         body: JSON.stringify({
           app_instance_id: iid,
           app_instance_id_token: authToken,
-          app_id: SettingsService.getInstance().getAppId(),
+          app_id: getAppId(performanceController.app),
           app_version: SDK_VERSION,
           sdk_version: REMOTE_CONFIG_SDK_VERSION
         })
@@ -156,10 +166,10 @@ function getRemoteConfig(
 /**
  * Processes config coming either from calling RC or from local storage.
  * This method only runs if call is successful or config in storage
- * is valie.
+ * is valid.
  */
 function processConfig(
-  config: RemoteConfigResponse | undefined
+  config?: RemoteConfigResponse
 ): RemoteConfigResponse | undefined {
   if (!config) {
     return config;
@@ -171,36 +181,45 @@ function processConfig(
     // known.
     settingsServiceInstance.loggingEnabled =
       String(entries.fpr_enabled) === 'true';
-  } else if (SECONDARY_CONFIGS.loggingEnabled !== undefined) {
+  } else if (DEFAULT_CONFIGS.loggingEnabled !== undefined) {
     // Config retrieved successfully, but there is no fpr_enabled in template.
     // Use secondary configs value.
-    settingsServiceInstance.loggingEnabled = SECONDARY_CONFIGS.loggingEnabled;
+    settingsServiceInstance.loggingEnabled = DEFAULT_CONFIGS.loggingEnabled;
   }
   if (entries.fpr_log_source) {
     settingsServiceInstance.logSource = Number(entries.fpr_log_source);
-  } else if (SECONDARY_CONFIGS.logSource) {
-    settingsServiceInstance.logSource = SECONDARY_CONFIGS.logSource;
+  } else if (DEFAULT_CONFIGS.logSource) {
+    settingsServiceInstance.logSource = DEFAULT_CONFIGS.logSource;
   }
+
   if (entries.fpr_log_endpoint_url) {
     settingsServiceInstance.logEndPointUrl = entries.fpr_log_endpoint_url;
-  } else if (SECONDARY_CONFIGS.logEndPointUrl) {
-    settingsServiceInstance.logEndPointUrl = SECONDARY_CONFIGS.logEndPointUrl;
+  } else if (DEFAULT_CONFIGS.logEndPointUrl) {
+    settingsServiceInstance.logEndPointUrl = DEFAULT_CONFIGS.logEndPointUrl;
   }
+
+  // Key from Remote Config has to be non-empty string, otherwise use local value.
+  if (entries.fpr_log_transport_key) {
+    settingsServiceInstance.transportKey = entries.fpr_log_transport_key;
+  } else if (DEFAULT_CONFIGS.transportKey) {
+    settingsServiceInstance.transportKey = DEFAULT_CONFIGS.transportKey;
+  }
+
   if (entries.fpr_vc_network_request_sampling_rate !== undefined) {
     settingsServiceInstance.networkRequestsSamplingRate = Number(
       entries.fpr_vc_network_request_sampling_rate
     );
-  } else if (SECONDARY_CONFIGS.networkRequestsSamplingRate !== undefined) {
+  } else if (DEFAULT_CONFIGS.networkRequestsSamplingRate !== undefined) {
     settingsServiceInstance.networkRequestsSamplingRate =
-      SECONDARY_CONFIGS.networkRequestsSamplingRate;
+      DEFAULT_CONFIGS.networkRequestsSamplingRate;
   }
   if (entries.fpr_vc_trace_sampling_rate !== undefined) {
     settingsServiceInstance.tracesSamplingRate = Number(
       entries.fpr_vc_trace_sampling_rate
     );
-  } else if (SECONDARY_CONFIGS.tracesSamplingRate !== undefined) {
+  } else if (DEFAULT_CONFIGS.tracesSamplingRate !== undefined) {
     settingsServiceInstance.tracesSamplingRate =
-      SECONDARY_CONFIGS.tracesSamplingRate;
+      DEFAULT_CONFIGS.tracesSamplingRate;
   }
   // Set the per session trace and network logging flags.
   settingsServiceInstance.logTraceAfterSampling = shouldLogAfterSampling(

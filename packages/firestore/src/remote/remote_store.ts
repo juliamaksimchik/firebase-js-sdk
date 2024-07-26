@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,48 +15,67 @@
  * limitations under the License.
  */
 
+import { User } from '../auth/user';
 import { SnapshotVersion } from '../core/snapshot_version';
-import { Transaction } from '../core/transaction';
 import { OnlineState, TargetId } from '../core/types';
-import { ignoreIfPrimaryLeaseLoss, LocalStore } from '../local/local_store';
-import { TargetData, TargetPurpose } from '../local/target_data';
-import { MutationResult } from '../model/mutation';
+import { LocalStore } from '../local/local_store';
 import {
-  BATCHID_UNKNOWN,
-  MutationBatch,
-  MutationBatchResult
-} from '../model/mutation_batch';
-import { assert } from '../util/assert';
-import { FirestoreError } from '../util/error';
-import * as log from '../util/log';
-import * as objUtils from '../util/obj';
-
-import { DocumentKeySet } from '../model/collections';
+  localStoreGetLastRemoteSnapshotVersion,
+  localStoreGetNextMutationBatch
+} from '../local/local_store_impl';
+import { isIndexedDbTransactionError } from '../local/simple_db';
+import { TargetData } from '../local/target_data';
+import { MutationResult } from '../model/mutation';
+import { MutationBatch, MutationBatchResult } from '../model/mutation_batch';
+import { debugAssert, debugCast } from '../util/assert';
 import { AsyncQueue } from '../util/async_queue';
+import { ByteString } from '../util/byte_string';
+import { FirestoreError } from '../util/error';
+import { logDebug } from '../util/log';
+import { BATCHID_UNKNOWN } from '../util/types';
+
 import { ConnectivityMonitor, NetworkStatus } from './connectivity_monitor';
-import { Datastore } from './datastore';
+import {
+  Datastore,
+  newPersistentWatchStream,
+  newPersistentWriteStream
+} from './datastore';
 import { OnlineStateTracker } from './online_state_tracker';
 import {
   PersistentListenStream,
   PersistentWriteStream
 } from './persistent_stream';
 import { RemoteSyncer } from './remote_syncer';
-import { isPermanentError, isPermanentWriteError } from './rpc_error';
+import { isPermanentWriteError } from './rpc_error';
 import {
   DocumentWatchChange,
   ExistenceFilterChange,
-  TargetMetadataProvider,
   WatchChange,
   WatchChangeAggregator,
   WatchTargetChange,
   WatchTargetChangeState
 } from './watch_change';
-import { ByteString } from '../util/byte_string';
 
 const LOG_TAG = 'RemoteStore';
 
 // TODO(b/35853402): Negotiate this with the stream.
 const MAX_PENDING_WRITES = 10;
+
+/** Reasons for why the RemoteStore may be offline. */
+const enum OfflineCause {
+  /** The user has explicitly disabled the network (via `disableNetwork()`). */
+  UserDisabled,
+  /** An IndexedDb failure occurred while persisting a stream update. */
+  IndexedDbFailed,
+  /** The tab is not the primary tab (only relevant with multi-tab). */
+  IsSecondary,
+  /** We are restarting the streams due to an Auth credential change. */
+  CredentialChange,
+  /** The connectivity state of the environment has changed. */
+  ConnectivityChange,
+  /** The RemoteStore has been shut down. */
+  Shutdown
+}
 
 /**
  * RemoteStore - An interface to remotely stored data, basically providing a
@@ -77,7 +96,17 @@ const MAX_PENDING_WRITES = 10;
  * - retrying mutations that failed because of network problems.
  * - acking mutations to the SyncEngine once they are accepted or rejected.
  */
-export class RemoteStore implements TargetMetadataProvider {
+export interface RemoteStore {
+  /**
+   * SyncEngine to notify of watch and write events. This must be set
+   * immediately after construction.
+   */
+  remoteSyncer: RemoteSyncer;
+}
+
+class RemoteStoreImpl implements RemoteStore {
+  remoteSyncer: RemoteSyncer = {};
+
   /**
    * A list of up to MAX_PENDING_WRITES writes that we have fetched from the
    * LocalStore via fillWritePipeline() and have or will send to the write
@@ -95,7 +124,7 @@ export class RemoteStore implements TargetMetadataProvider {
    * purely based on order, and so we can just shift() writes from the front of
    * the writePipeline as we receive responses.
    */
-  private writePipeline: MutationBatch[] = [];
+  writePipeline: MutationBatch[] = [];
 
   /**
    * A mapping of watched targets that the client cares about tracking and the
@@ -106,43 +135,53 @@ export class RemoteStore implements TargetMetadataProvider {
    * to the server. The targets removed with unlistens are removed eagerly
    * without waiting for confirmation from the listen stream.
    */
-  private listenTargets: { [targetId: number]: TargetData } = {};
+  listenTargets = new Map<TargetId, TargetData>();
 
-  private connectivityMonitor: ConnectivityMonitor;
-  private watchStream: PersistentListenStream;
-  private writeStream: PersistentWriteStream;
-  private watchChangeAggregator: WatchChangeAggregator | null = null;
+  connectivityMonitor: ConnectivityMonitor;
+  watchStream?: PersistentListenStream;
+  writeStream?: PersistentWriteStream;
+  watchChangeAggregator?: WatchChangeAggregator;
 
   /**
-   * Set to true by enableNetwork() and false by disableNetwork() and indicates
-   * the user-preferred network state.
+   * A set of reasons for why the RemoteStore may be offline. If empty, the
+   * RemoteStore may start its network connections.
    */
-  private networkEnabled = false;
+  offlineCauses = new Set<OfflineCause>();
 
-  private isPrimary = false;
+  /**
+   * Event handlers that get called when the network is disabled or enabled.
+   *
+   * PORTING NOTE: These functions are used on the Web client to create the
+   * underlying streams (to support tree-shakeable streams). On Android and iOS,
+   * the streams are created during construction of RemoteStore.
+   */
+  onNetworkStatusChange: Array<(enabled: boolean) => Promise<void>> = [];
 
-  private onlineStateTracker: OnlineStateTracker;
+  onlineStateTracker: OnlineStateTracker;
 
   constructor(
     /**
      * The local store, used to fill the write pipeline with outbound mutations.
      */
-    private localStore: LocalStore,
+    readonly localStore: LocalStore,
     /** The client-side proxy for interacting with the backend. */
-    private datastore: Datastore,
-    asyncQueue: AsyncQueue,
+    readonly datastore: Datastore,
+    readonly asyncQueue: AsyncQueue,
     onlineStateHandler: (onlineState: OnlineState) => void,
     connectivityMonitor: ConnectivityMonitor
   ) {
     this.connectivityMonitor = connectivityMonitor;
-    this.connectivityMonitor.addCallback((status: NetworkStatus) => {
+    this.connectivityMonitor.addCallback((_: NetworkStatus) => {
       asyncQueue.enqueueAndForget(async () => {
-        if (this.canUseNetwork()) {
-          log.debug(
+        // Porting Note: Unlike iOS, `restartNetwork()` is called even when the
+        // network becomes unreachable as we don't have any other way to tear
+        // down our streams.
+        if (canUseNetwork(this)) {
+          logDebug(
             LOG_TAG,
             'Restarting streams for network reachability change.'
           );
-          await this.restartNetwork();
+          await restartNetwork(this);
         }
       });
     });
@@ -151,588 +190,823 @@ export class RemoteStore implements TargetMetadataProvider {
       asyncQueue,
       onlineStateHandler
     );
-
-    // Create streams (but note they're not started yet).
-    this.watchStream = this.datastore.newPersistentWatchStream({
-      onOpen: this.onWatchStreamOpen.bind(this),
-      onClose: this.onWatchStreamClose.bind(this),
-      onWatchChange: this.onWatchStreamChange.bind(this)
-    });
-
-    this.writeStream = this.datastore.newPersistentWriteStream({
-      onOpen: this.onWriteStreamOpen.bind(this),
-      onClose: this.onWriteStreamClose.bind(this),
-      onHandshakeComplete: this.onWriteHandshakeComplete.bind(this),
-      onMutationResult: this.onMutationResult.bind(this)
-    });
   }
+}
 
-  /**
-   * SyncEngine to notify of watch and write events. This must be set
-   * immediately after construction.
-   */
-  syncEngine!: RemoteSyncer;
+export function newRemoteStore(
+  localStore: LocalStore,
+  datastore: Datastore,
+  asyncQueue: AsyncQueue,
+  onlineStateHandler: (onlineState: OnlineState) => void,
+  connectivityMonitor: ConnectivityMonitor
+): RemoteStore {
+  return new RemoteStoreImpl(
+    localStore,
+    datastore,
+    asyncQueue,
+    onlineStateHandler,
+    connectivityMonitor
+  );
+}
 
-  /**
-   * Starts up the remote store, creating streams, restoring state from
-   * LocalStore, etc.
-   */
-  start(): Promise<void> {
-    return this.enableNetwork();
-  }
+/** Re-enables the network. Idempotent. */
+export function remoteStoreEnableNetwork(
+  remoteStore: RemoteStore
+): Promise<void> {
+  const remoteStoreImpl = debugCast(remoteStore, RemoteStoreImpl);
+  remoteStoreImpl.offlineCauses.delete(OfflineCause.UserDisabled);
+  return enableNetworkInternal(remoteStoreImpl);
+}
 
-  /** Re-enables the network. Idempotent. */
-  async enableNetwork(): Promise<void> {
-    this.networkEnabled = true;
-
-    if (this.canUseNetwork()) {
-      this.writeStream.lastStreamToken = await this.localStore.getLastStreamToken();
-
-      if (this.shouldStartWatchStream()) {
-        this.startWatchStream();
-      } else {
-        this.onlineStateTracker.set(OnlineState.Unknown);
-      }
-
-      // This will start the write stream if necessary.
-      await this.fillWritePipeline();
+async function enableNetworkInternal(
+  remoteStoreImpl: RemoteStoreImpl
+): Promise<void> {
+  if (canUseNetwork(remoteStoreImpl)) {
+    for (const networkStatusHandler of remoteStoreImpl.onNetworkStatusChange) {
+      await networkStatusHandler(/* enabled= */ true);
     }
   }
+}
 
-  /**
-   * Temporarily disables the network. The network can be re-enabled using
-   * enableNetwork().
-   */
-  async disableNetwork(): Promise<void> {
-    this.networkEnabled = false;
-    await this.disableNetworkInternal();
+/**
+ * Temporarily disables the network. The network can be re-enabled using
+ * enableNetwork().
+ */
+export async function remoteStoreDisableNetwork(
+  remoteStore: RemoteStore
+): Promise<void> {
+  const remoteStoreImpl = debugCast(remoteStore, RemoteStoreImpl);
+  remoteStoreImpl.offlineCauses.add(OfflineCause.UserDisabled);
+  await disableNetworkInternal(remoteStoreImpl);
 
-    // Set the OnlineState to Offline so get()s return from cache, etc.
-    this.onlineStateTracker.set(OnlineState.Offline);
+  // Set the OnlineState to Offline so get()s return from cache, etc.
+  remoteStoreImpl.onlineStateTracker.set(OnlineState.Offline);
+}
+
+async function disableNetworkInternal(
+  remoteStoreImpl: RemoteStoreImpl
+): Promise<void> {
+  for (const networkStatusHandler of remoteStoreImpl.onNetworkStatusChange) {
+    await networkStatusHandler(/* enabled= */ false);
+  }
+}
+
+export async function remoteStoreShutdown(
+  remoteStore: RemoteStore
+): Promise<void> {
+  const remoteStoreImpl = debugCast(remoteStore, RemoteStoreImpl);
+  logDebug(LOG_TAG, 'RemoteStore shutting down.');
+  remoteStoreImpl.offlineCauses.add(OfflineCause.Shutdown);
+  await disableNetworkInternal(remoteStoreImpl);
+  remoteStoreImpl.connectivityMonitor.shutdown();
+
+  // Set the OnlineState to Unknown (rather than Offline) to avoid potentially
+  // triggering spurious listener events with cached data, etc.
+  remoteStoreImpl.onlineStateTracker.set(OnlineState.Unknown);
+}
+
+/**
+ * Starts new listen for the given target. Uses resume token if provided. It
+ * is a no-op if the target of given `TargetData` is already being listened to.
+ */
+export function remoteStoreListen(
+  remoteStore: RemoteStore,
+  targetData: TargetData
+): void {
+  const remoteStoreImpl = debugCast(remoteStore, RemoteStoreImpl);
+
+  if (remoteStoreImpl.listenTargets.has(targetData.targetId)) {
+    return;
   }
 
-  private async disableNetworkInternal(): Promise<void> {
-    await this.writeStream.stop();
-    await this.watchStream.stop();
+  // Mark this as something the client is currently listening for.
+  remoteStoreImpl.listenTargets.set(targetData.targetId, targetData);
 
-    if (this.writePipeline.length > 0) {
-      log.debug(
+  if (shouldStartWatchStream(remoteStoreImpl)) {
+    // The listen will be sent in onWatchStreamOpen
+    startWatchStream(remoteStoreImpl);
+  } else if (ensureWatchStream(remoteStoreImpl).isOpen()) {
+    sendWatchRequest(remoteStoreImpl, targetData);
+  }
+}
+
+/**
+ * Removes the listen from server. It is a no-op if the given target id is
+ * not being listened to.
+ */
+export function remoteStoreUnlisten(
+  remoteStore: RemoteStore,
+  targetId: TargetId
+): void {
+  const remoteStoreImpl = debugCast(remoteStore, RemoteStoreImpl);
+  const watchStream = ensureWatchStream(remoteStoreImpl);
+
+  debugAssert(
+    remoteStoreImpl.listenTargets.has(targetId),
+    `unlisten called on target no currently watched: ${targetId}`
+  );
+
+  remoteStoreImpl.listenTargets.delete(targetId);
+  if (watchStream.isOpen()) {
+    sendUnwatchRequest(remoteStoreImpl, targetId);
+  }
+
+  if (remoteStoreImpl.listenTargets.size === 0) {
+    if (watchStream.isOpen()) {
+      watchStream.markIdle();
+    } else if (canUseNetwork(remoteStoreImpl)) {
+      // Revert to OnlineState.Unknown if the watch stream is not open and we
+      // have no listeners, since without any listens to send we cannot
+      // confirm if the stream is healthy and upgrade to OnlineState.Online.
+      remoteStoreImpl.onlineStateTracker.set(OnlineState.Unknown);
+    }
+  }
+}
+
+/**
+ * We need to increment the expected number of pending responses we're due
+ * from watch so we wait for the ack to process any messages from this target.
+ */
+function sendWatchRequest(
+  remoteStoreImpl: RemoteStoreImpl,
+  targetData: TargetData
+): void {
+  remoteStoreImpl.watchChangeAggregator!.recordPendingTargetRequest(
+    targetData.targetId
+  );
+
+  if (
+    targetData.resumeToken.approximateByteSize() > 0 ||
+    targetData.snapshotVersion.compareTo(SnapshotVersion.min()) > 0
+  ) {
+    const expectedCount = remoteStoreImpl.remoteSyncer.getRemoteKeysForTarget!(
+      targetData.targetId
+    ).size;
+    targetData = targetData.withExpectedCount(expectedCount);
+  }
+
+  ensureWatchStream(remoteStoreImpl).watch(targetData);
+}
+
+/**
+ * We need to increment the expected number of pending responses we're due
+ * from watch so we wait for the removal on the server before we process any
+ * messages from this target.
+ */
+function sendUnwatchRequest(
+  remoteStoreImpl: RemoteStoreImpl,
+  targetId: TargetId
+): void {
+  remoteStoreImpl.watchChangeAggregator!.recordPendingTargetRequest(targetId);
+  ensureWatchStream(remoteStoreImpl).unwatch(targetId);
+}
+
+function startWatchStream(remoteStoreImpl: RemoteStoreImpl): void {
+  debugAssert(
+    shouldStartWatchStream(remoteStoreImpl),
+    'startWatchStream() called when shouldStartWatchStream() is false.'
+  );
+  debugAssert(
+    !!remoteStoreImpl.remoteSyncer.getRemoteKeysForTarget,
+    'getRemoteKeysForTarget() not set'
+  );
+
+  remoteStoreImpl.watchChangeAggregator = new WatchChangeAggregator({
+    getRemoteKeysForTarget: targetId =>
+      remoteStoreImpl.remoteSyncer.getRemoteKeysForTarget!(targetId),
+    getTargetDataForTarget: targetId =>
+      remoteStoreImpl.listenTargets.get(targetId) || null,
+    getDatabaseId: () => remoteStoreImpl.datastore.serializer.databaseId
+  });
+  ensureWatchStream(remoteStoreImpl).start();
+  remoteStoreImpl.onlineStateTracker.handleWatchStreamStart();
+}
+
+/**
+ * Returns whether the watch stream should be started because it's necessary
+ * and has not yet been started.
+ */
+function shouldStartWatchStream(remoteStoreImpl: RemoteStoreImpl): boolean {
+  return (
+    canUseNetwork(remoteStoreImpl) &&
+    !ensureWatchStream(remoteStoreImpl).isStarted() &&
+    remoteStoreImpl.listenTargets.size > 0
+  );
+}
+
+export function canUseNetwork(remoteStore: RemoteStore): boolean {
+  const remoteStoreImpl = debugCast(remoteStore, RemoteStoreImpl);
+  return remoteStoreImpl.offlineCauses.size === 0;
+}
+
+function cleanUpWatchStreamState(remoteStoreImpl: RemoteStoreImpl): void {
+  remoteStoreImpl.watchChangeAggregator = undefined;
+}
+
+async function onWatchStreamConnected(
+  remoteStoreImpl: RemoteStoreImpl
+): Promise<void> {
+  // Mark the client as online since we got a "connected" notification.
+  remoteStoreImpl.onlineStateTracker.set(OnlineState.Online);
+}
+
+async function onWatchStreamOpen(
+  remoteStoreImpl: RemoteStoreImpl
+): Promise<void> {
+  remoteStoreImpl.listenTargets.forEach((targetData, targetId) => {
+    sendWatchRequest(remoteStoreImpl, targetData);
+  });
+}
+
+async function onWatchStreamClose(
+  remoteStoreImpl: RemoteStoreImpl,
+  error?: FirestoreError
+): Promise<void> {
+  if (error === undefined) {
+    // Graceful stop (due to stop() or idle timeout). Make sure that's
+    // desirable.
+    debugAssert(
+      !shouldStartWatchStream(remoteStoreImpl),
+      'Watch stream was stopped gracefully while still needed.'
+    );
+  }
+
+  cleanUpWatchStreamState(remoteStoreImpl);
+
+  // If we still need the watch stream, retry the connection.
+  if (shouldStartWatchStream(remoteStoreImpl)) {
+    remoteStoreImpl.onlineStateTracker.handleWatchStreamFailure(error!);
+
+    startWatchStream(remoteStoreImpl);
+  } else {
+    // No need to restart watch stream because there are no active targets.
+    // The online state is set to unknown because there is no active attempt
+    // at establishing a connection
+    remoteStoreImpl.onlineStateTracker.set(OnlineState.Unknown);
+  }
+}
+
+async function onWatchStreamChange(
+  remoteStoreImpl: RemoteStoreImpl,
+  watchChange: WatchChange,
+  snapshotVersion: SnapshotVersion
+): Promise<void> {
+  // Mark the client as online since we got a message from the server
+  remoteStoreImpl.onlineStateTracker.set(OnlineState.Online);
+
+  if (
+    watchChange instanceof WatchTargetChange &&
+    watchChange.state === WatchTargetChangeState.Removed &&
+    watchChange.cause
+  ) {
+    // There was an error on a target, don't wait for a consistent snapshot
+    // to raise events
+    try {
+      await handleTargetError(remoteStoreImpl, watchChange);
+    } catch (e) {
+      logDebug(
         LOG_TAG,
-        `Stopping write stream with ${this.writePipeline.length} pending writes`
+        'Failed to remove targets %s: %s ',
+        watchChange.targetIds.join(','),
+        e
       );
-      this.writePipeline = [];
+      await disableNetworkUntilRecovery(remoteStoreImpl, e as FirestoreError);
+    }
+    return;
+  }
+
+  if (watchChange instanceof DocumentWatchChange) {
+    remoteStoreImpl.watchChangeAggregator!.handleDocumentChange(watchChange);
+  } else if (watchChange instanceof ExistenceFilterChange) {
+    remoteStoreImpl.watchChangeAggregator!.handleExistenceFilter(watchChange);
+  } else {
+    debugAssert(
+      watchChange instanceof WatchTargetChange,
+      'Expected watchChange to be an instance of WatchTargetChange'
+    );
+    remoteStoreImpl.watchChangeAggregator!.handleTargetChange(watchChange);
+  }
+
+  if (!snapshotVersion.isEqual(SnapshotVersion.min())) {
+    try {
+      const lastRemoteSnapshotVersion =
+        await localStoreGetLastRemoteSnapshotVersion(
+          remoteStoreImpl.localStore
+        );
+      if (snapshotVersion.compareTo(lastRemoteSnapshotVersion) >= 0) {
+        // We have received a target change with a global snapshot if the snapshot
+        // version is not equal to SnapshotVersion.min().
+        await raiseWatchSnapshot(remoteStoreImpl, snapshotVersion);
+      }
+    } catch (e) {
+      logDebug(LOG_TAG, 'Failed to raise snapshot:', e);
+      await disableNetworkUntilRecovery(remoteStoreImpl, e as FirestoreError);
+    }
+  }
+}
+
+/**
+ * Recovery logic for IndexedDB errors that takes the network offline until
+ * `op` succeeds. Retries are scheduled with backoff using
+ * `enqueueRetryable()`. If `op()` is not provided, IndexedDB access is
+ * validated via a generic operation.
+ *
+ * The returned Promise is resolved once the network is disabled and before
+ * any retry attempt.
+ */
+async function disableNetworkUntilRecovery(
+  remoteStoreImpl: RemoteStoreImpl,
+  e: FirestoreError,
+  op?: () => Promise<unknown>
+): Promise<void> {
+  if (isIndexedDbTransactionError(e)) {
+    debugAssert(
+      !remoteStoreImpl.offlineCauses.has(OfflineCause.IndexedDbFailed),
+      'Unexpected network event when IndexedDB was marked failed.'
+    );
+    remoteStoreImpl.offlineCauses.add(OfflineCause.IndexedDbFailed);
+
+    // Disable network and raise offline snapshots
+    await disableNetworkInternal(remoteStoreImpl);
+    remoteStoreImpl.onlineStateTracker.set(OnlineState.Offline);
+
+    if (!op) {
+      // Use a simple read operation to determine if IndexedDB recovered.
+      // Ideally, we would expose a health check directly on SimpleDb, but
+      // RemoteStore only has access to persistence through LocalStore.
+      op = () =>
+        localStoreGetLastRemoteSnapshotVersion(remoteStoreImpl.localStore);
     }
 
-    this.cleanUpWatchStreamState();
+    // Probe IndexedDB periodically and re-enable network
+    remoteStoreImpl.asyncQueue.enqueueRetryable(async () => {
+      logDebug(LOG_TAG, 'Retrying IndexedDB access');
+      await op!();
+      remoteStoreImpl.offlineCauses.delete(OfflineCause.IndexedDbFailed);
+      await enableNetworkInternal(remoteStoreImpl);
+    });
+  } else {
+    throw e;
   }
+}
 
-  async shutdown(): Promise<void> {
-    log.debug(LOG_TAG, 'RemoteStore shutting down.');
-    this.networkEnabled = false;
-    await this.disableNetworkInternal();
-    this.connectivityMonitor.shutdown();
+/**
+ * Executes `op`. If `op` fails, takes the network offline until `op`
+ * succeeds. Returns after the first attempt.
+ */
+function executeWithRecovery(
+  remoteStoreImpl: RemoteStoreImpl,
+  op: () => Promise<void>
+): Promise<void> {
+  return op().catch(e => disableNetworkUntilRecovery(remoteStoreImpl, e, op));
+}
 
-    // Set the OnlineState to Unknown (rather than Offline) to avoid potentially
-    // triggering spurious listener events with cached data, etc.
-    this.onlineStateTracker.set(OnlineState.Unknown);
-  }
+/**
+ * Takes a batch of changes from the Datastore, repackages them as a
+ * RemoteEvent, and passes that on to the listener, which is typically the
+ * SyncEngine.
+ */
+function raiseWatchSnapshot(
+  remoteStoreImpl: RemoteStoreImpl,
+  snapshotVersion: SnapshotVersion
+): Promise<void> {
+  debugAssert(
+    !snapshotVersion.isEqual(SnapshotVersion.min()),
+    "Can't raise event for unknown SnapshotVersion"
+  );
+  const remoteEvent =
+    remoteStoreImpl.watchChangeAggregator!.createRemoteEvent(snapshotVersion);
 
-  /**
-   * Starts new listen for the given target. Uses resume token if provided. It
-   * is a no-op if the target of given `TargetData` is already being listened to.
-   */
-  listen(targetData: TargetData): void {
-    if (objUtils.contains(this.listenTargets, targetData.targetId)) {
+  // Update in-memory resume tokens. LocalStore will update the
+  // persistent view of these when applying the completed RemoteEvent.
+  remoteEvent.targetChanges.forEach((change, targetId) => {
+    if (change.resumeToken.approximateByteSize() > 0) {
+      const targetData = remoteStoreImpl.listenTargets.get(targetId);
+      // A watched target might have been removed already.
+      if (targetData) {
+        remoteStoreImpl.listenTargets.set(
+          targetId,
+          targetData.withResumeToken(change.resumeToken, snapshotVersion)
+        );
+      }
+    }
+  });
+
+  // Re-establish listens for the targets that have been invalidated by
+  // existence filter mismatches.
+  remoteEvent.targetMismatches.forEach((targetId, targetPurpose) => {
+    const targetData = remoteStoreImpl.listenTargets.get(targetId);
+    if (!targetData) {
+      // A watched target might have been removed already.
       return;
     }
 
-    // Mark this as something the client is currently listening for.
-    this.listenTargets[targetData.targetId] = targetData;
-
-    if (this.shouldStartWatchStream()) {
-      // The listen will be sent in onWatchStreamOpen
-      this.startWatchStream();
-    } else if (this.watchStream.isOpen()) {
-      this.sendWatchRequest(targetData);
-    }
-  }
-
-  /**
-   * Removes the listen from server. It is a no-op if the given target id is
-   * not being listened to.
-   */
-  unlisten(targetId: TargetId): void {
-    assert(
-      objUtils.contains(this.listenTargets, targetId),
-      `unlisten called on target no currently watched: ${targetId}`
-    );
-
-    delete this.listenTargets[targetId];
-    if (this.watchStream.isOpen()) {
-      this.sendUnwatchRequest(targetId);
-    }
-
-    if (objUtils.isEmpty(this.listenTargets)) {
-      if (this.watchStream.isOpen()) {
-        this.watchStream.markIdle();
-      } else if (this.canUseNetwork()) {
-        // Revert to OnlineState.Unknown if the watch stream is not open and we
-        // have no listeners, since without any listens to send we cannot
-        // confirm if the stream is healthy and upgrade to OnlineState.Online.
-        this.onlineStateTracker.set(OnlineState.Unknown);
-      }
-    }
-  }
-
-  /** {@link TargetMetadataProvider.getTargetDataForTarget} */
-  getTargetDataForTarget(targetId: TargetId): TargetData | null {
-    return this.listenTargets[targetId] || null;
-  }
-
-  /** {@link TargetMetadataProvider.getRemoteKeysForTarget} */
-  getRemoteKeysForTarget(targetId: TargetId): DocumentKeySet {
-    return this.syncEngine.getRemoteKeysForTarget(targetId);
-  }
-
-  /**
-   * We need to increment the the expected number of pending responses we're due
-   * from watch so we wait for the ack to process any messages from this target.
-   */
-  private sendWatchRequest(targetData: TargetData): void {
-    this.watchChangeAggregator!.recordPendingTargetRequest(targetData.targetId);
-    this.watchStream.watch(targetData);
-  }
-
-  /**
-   * We need to increment the expected number of pending responses we're due
-   * from watch so we wait for the removal on the server before we process any
-   * messages from this target.
-   */
-  private sendUnwatchRequest(targetId: TargetId): void {
-    this.watchChangeAggregator!.recordPendingTargetRequest(targetId);
-    this.watchStream.unwatch(targetId);
-  }
-
-  private startWatchStream(): void {
-    assert(
-      this.shouldStartWatchStream(),
-      'startWatchStream() called when shouldStartWatchStream() is false.'
-    );
-
-    this.watchChangeAggregator = new WatchChangeAggregator(this);
-    this.watchStream.start();
-    this.onlineStateTracker.handleWatchStreamStart();
-  }
-
-  /**
-   * Returns whether the watch stream should be started because it's necessary
-   * and has not yet been started.
-   */
-  private shouldStartWatchStream(): boolean {
-    return (
-      this.canUseNetwork() &&
-      !this.watchStream.isStarted() &&
-      !objUtils.isEmpty(this.listenTargets)
-    );
-  }
-
-  canUseNetwork(): boolean {
-    return this.isPrimary && this.networkEnabled;
-  }
-
-  private cleanUpWatchStreamState(): void {
-    this.watchChangeAggregator = null;
-  }
-
-  private async onWatchStreamOpen(): Promise<void> {
-    objUtils.forEachNumber(this.listenTargets, (targetId, targetData) => {
-      this.sendWatchRequest(targetData);
-    });
-  }
-
-  private async onWatchStreamClose(error?: FirestoreError): Promise<void> {
-    if (error === undefined) {
-      // Graceful stop (due to stop() or idle timeout). Make sure that's
-      // desirable.
-      assert(
-        !this.shouldStartWatchStream(),
-        'Watch stream was stopped gracefully while still needed.'
-      );
-    }
-
-    this.cleanUpWatchStreamState();
-
-    // If we still need the watch stream, retry the connection.
-    if (this.shouldStartWatchStream()) {
-      this.onlineStateTracker.handleWatchStreamFailure(error!);
-
-      this.startWatchStream();
-    } else {
-      // No need to restart watch stream because there are no active targets.
-      // The online state is set to unknown because there is no active attempt
-      // at establishing a connection
-      this.onlineStateTracker.set(OnlineState.Unknown);
-    }
-  }
-
-  private async onWatchStreamChange(
-    watchChange: WatchChange,
-    snapshotVersion: SnapshotVersion
-  ): Promise<void> {
-    // Mark the client as online since we got a message from the server
-    this.onlineStateTracker.set(OnlineState.Online);
-
-    if (
-      watchChange instanceof WatchTargetChange &&
-      watchChange.state === WatchTargetChangeState.Removed &&
-      watchChange.cause
-    ) {
-      // There was an error on a target, don't wait for a consistent snapshot
-      // to raise events
-      return this.handleTargetError(watchChange);
-    }
-
-    if (watchChange instanceof DocumentWatchChange) {
-      this.watchChangeAggregator!.handleDocumentChange(watchChange);
-    } else if (watchChange instanceof ExistenceFilterChange) {
-      this.watchChangeAggregator!.handleExistenceFilter(watchChange);
-    } else {
-      assert(
-        watchChange instanceof WatchTargetChange,
-        'Expected watchChange to be an instance of WatchTargetChange'
-      );
-      this.watchChangeAggregator!.handleTargetChange(watchChange);
-    }
-
-    if (!snapshotVersion.isEqual(SnapshotVersion.MIN)) {
-      const lastRemoteSnapshotVersion = await this.localStore.getLastRemoteSnapshotVersion();
-      if (snapshotVersion.compareTo(lastRemoteSnapshotVersion) >= 0) {
-        // We have received a target change with a global snapshot if the snapshot
-        // version is not equal to SnapshotVersion.MIN.
-        await this.raiseWatchSnapshot(snapshotVersion);
-      }
-    }
-  }
-
-  /**
-   * Takes a batch of changes from the Datastore, repackages them as a
-   * RemoteEvent, and passes that on to the listener, which is typically the
-   * SyncEngine.
-   */
-  private raiseWatchSnapshot(snapshotVersion: SnapshotVersion): Promise<void> {
-    assert(
-      !snapshotVersion.isEqual(SnapshotVersion.MIN),
-      "Can't raise event for unknown SnapshotVersion"
-    );
-    const remoteEvent = this.watchChangeAggregator!.createRemoteEvent(
-      snapshotVersion
-    );
-
-    // Update in-memory resume tokens. LocalStore will update the
-    // persistent view of these when applying the completed RemoteEvent.
-    objUtils.forEachNumber(remoteEvent.targetChanges, (targetId, change) => {
-      if (change.resumeToken.approximateByteSize() > 0) {
-        const targetData = this.listenTargets[targetId];
-        // A watched target might have been removed already.
-        if (targetData) {
-          this.listenTargets[targetId] = targetData.withResumeToken(
-            change.resumeToken,
-            snapshotVersion
-          );
-        }
-      }
-    });
-
-    // Re-establish listens for the targets that have been invalidated by
-    // existence filter mismatches.
-    remoteEvent.targetMismatches.forEach(targetId => {
-      const targetData = this.listenTargets[targetId];
-      if (!targetData) {
-        // A watched target might have been removed already.
-        return;
-      }
-
-      // Clear the resume token for the target, since we're in a known mismatch
-      // state.
-      this.listenTargets[targetId] = targetData.withResumeToken(
+    // Clear the resume token for the target, since we're in a known mismatch
+    // state.
+    remoteStoreImpl.listenTargets.set(
+      targetId,
+      targetData.withResumeToken(
         ByteString.EMPTY_BYTE_STRING,
         targetData.snapshotVersion
-      );
+      )
+    );
 
-      // Cause a hard reset by unwatching and rewatching immediately, but
-      // deliberately don't send a resume token so that we get a full update.
-      this.sendUnwatchRequest(targetId);
+    // Cause a hard reset by unwatching and rewatching immediately, but
+    // deliberately don't send a resume token so that we get a full update.
+    sendUnwatchRequest(remoteStoreImpl, targetId);
 
-      // Mark the target we send as being on behalf of an existence filter
-      // mismatch, but don't actually retain that in listenTargets. This ensures
-      // that we flag the first re-listen this way without impacting future
-      // listens of this target (that might happen e.g. on reconnect).
-      const requestTargetData = new TargetData(
-        targetData.target,
-        targetId,
-        TargetPurpose.ExistenceFilterMismatch,
-        targetData.sequenceNumber
-      );
-      this.sendWatchRequest(requestTargetData);
-    });
+    // Mark the target we send as being on behalf of an existence filter
+    // mismatch, but don't actually retain that in listenTargets. This ensures
+    // that we flag the first re-listen this way without impacting future
+    // listens of this target (that might happen e.g. on reconnect).
+    const requestTargetData = new TargetData(
+      targetData.target,
+      targetId,
+      targetPurpose,
+      targetData.sequenceNumber
+    );
+    sendWatchRequest(remoteStoreImpl, requestTargetData);
+  });
 
-    // Finally raise remote event
-    return this.syncEngine.applyRemoteEvent(remoteEvent);
+  // Finally raise remote event
+  debugAssert(
+    !!remoteStoreImpl.remoteSyncer.applyRemoteEvent,
+    'applyRemoteEvent() not set'
+  );
+  return remoteStoreImpl.remoteSyncer.applyRemoteEvent(remoteEvent);
+}
+
+/** Handles an error on a target */
+async function handleTargetError(
+  remoteStoreImpl: RemoteStoreImpl,
+  watchChange: WatchTargetChange
+): Promise<void> {
+  debugAssert(
+    !!remoteStoreImpl.remoteSyncer.rejectListen,
+    'rejectListen() not set'
+  );
+  debugAssert(!!watchChange.cause, 'Handling target error without a cause');
+  const error = watchChange.cause!;
+  for (const targetId of watchChange.targetIds) {
+    // A watched target might have been removed already.
+    if (remoteStoreImpl.listenTargets.has(targetId)) {
+      await remoteStoreImpl.remoteSyncer.rejectListen(targetId, error);
+      remoteStoreImpl.listenTargets.delete(targetId);
+      remoteStoreImpl.watchChangeAggregator!.removeTarget(targetId);
+    }
   }
+}
 
-  /** Handles an error on a target */
-  private handleTargetError(watchChange: WatchTargetChange): Promise<void> {
-    assert(!!watchChange.cause, 'Handling target error without a cause');
-    const error = watchChange.cause!;
-    let promiseChain = Promise.resolve();
-    watchChange.targetIds.forEach(targetId => {
-      promiseChain = promiseChain.then(async () => {
-        // A watched target might have been removed already.
-        if (objUtils.contains(this.listenTargets, targetId)) {
-          delete this.listenTargets[targetId];
-          this.watchChangeAggregator!.removeTarget(targetId);
-          return this.syncEngine.rejectListen(targetId, error);
-        }
-      });
-    });
-    return promiseChain;
-  }
+/**
+ * Attempts to fill our write pipeline with writes from the LocalStore.
+ *
+ * Called internally to bootstrap or refill the write pipeline and by
+ * SyncEngine whenever there are new mutations to process.
+ *
+ * Starts the write stream if necessary.
+ */
+export async function fillWritePipeline(
+  remoteStore: RemoteStore
+): Promise<void> {
+  const remoteStoreImpl = debugCast(remoteStore, RemoteStoreImpl);
+  const writeStream = ensureWriteStream(remoteStoreImpl);
 
-  /**
-   * Attempts to fill our write pipeline with writes from the LocalStore.
-   *
-   * Called internally to bootstrap or refill the write pipeline and by
-   * SyncEngine whenever there are new mutations to process.
-   *
-   * Starts the write stream if necessary.
-   */
-  async fillWritePipeline(): Promise<void> {
-    if (this.canAddToWritePipeline()) {
-      const lastBatchIdRetrieved =
-        this.writePipeline.length > 0
-          ? this.writePipeline[this.writePipeline.length - 1].batchId
-          : BATCHID_UNKNOWN;
-      const batch = await this.localStore.nextMutationBatch(
+  let lastBatchIdRetrieved =
+    remoteStoreImpl.writePipeline.length > 0
+      ? remoteStoreImpl.writePipeline[remoteStoreImpl.writePipeline.length - 1]
+          .batchId
+      : BATCHID_UNKNOWN;
+
+  while (canAddToWritePipeline(remoteStoreImpl)) {
+    try {
+      const batch = await localStoreGetNextMutationBatch(
+        remoteStoreImpl.localStore,
         lastBatchIdRetrieved
       );
 
       if (batch === null) {
-        if (this.writePipeline.length === 0) {
-          this.writeStream.markIdle();
+        if (remoteStoreImpl.writePipeline.length === 0) {
+          writeStream.markIdle();
+        }
+        break;
+      } else {
+        lastBatchIdRetrieved = batch.batchId;
+        addToWritePipeline(remoteStoreImpl, batch);
+      }
+    } catch (e) {
+      await disableNetworkUntilRecovery(remoteStoreImpl, e as FirestoreError);
+    }
+  }
+
+  if (shouldStartWriteStream(remoteStoreImpl)) {
+    startWriteStream(remoteStoreImpl);
+  }
+}
+
+/**
+ * Returns true if we can add to the write pipeline (i.e. the network is
+ * enabled and the write pipeline is not full).
+ */
+function canAddToWritePipeline(remoteStoreImpl: RemoteStoreImpl): boolean {
+  return (
+    canUseNetwork(remoteStoreImpl) &&
+    remoteStoreImpl.writePipeline.length < MAX_PENDING_WRITES
+  );
+}
+
+// For testing
+export function outstandingWrites(remoteStore: RemoteStore): number {
+  const remoteStoreImpl = debugCast(remoteStore, RemoteStoreImpl);
+  return remoteStoreImpl.writePipeline.length;
+}
+
+/**
+ * Queues additional writes to be sent to the write stream, sending them
+ * immediately if the write stream is established.
+ */
+function addToWritePipeline(
+  remoteStoreImpl: RemoteStoreImpl,
+  batch: MutationBatch
+): void {
+  debugAssert(
+    canAddToWritePipeline(remoteStoreImpl),
+    'addToWritePipeline called when pipeline is full'
+  );
+  remoteStoreImpl.writePipeline.push(batch);
+
+  const writeStream = ensureWriteStream(remoteStoreImpl);
+  if (writeStream.isOpen() && writeStream.handshakeComplete) {
+    writeStream.writeMutations(batch.mutations);
+  }
+}
+
+function shouldStartWriteStream(remoteStoreImpl: RemoteStoreImpl): boolean {
+  return (
+    canUseNetwork(remoteStoreImpl) &&
+    !ensureWriteStream(remoteStoreImpl).isStarted() &&
+    remoteStoreImpl.writePipeline.length > 0
+  );
+}
+
+function startWriteStream(remoteStoreImpl: RemoteStoreImpl): void {
+  debugAssert(
+    shouldStartWriteStream(remoteStoreImpl),
+    'startWriteStream() called when shouldStartWriteStream() is false.'
+  );
+  ensureWriteStream(remoteStoreImpl).start();
+}
+
+async function onWriteStreamOpen(
+  remoteStoreImpl: RemoteStoreImpl
+): Promise<void> {
+  ensureWriteStream(remoteStoreImpl).writeHandshake();
+}
+
+async function onWriteHandshakeComplete(
+  remoteStoreImpl: RemoteStoreImpl
+): Promise<void> {
+  const writeStream = ensureWriteStream(remoteStoreImpl);
+  // Send the write pipeline now that the stream is established.
+  for (const batch of remoteStoreImpl.writePipeline) {
+    writeStream.writeMutations(batch.mutations);
+  }
+}
+
+async function onMutationResult(
+  remoteStoreImpl: RemoteStoreImpl,
+  commitVersion: SnapshotVersion,
+  results: MutationResult[]
+): Promise<void> {
+  // This is a response to a write containing mutations and should be
+  // correlated to the first write in our write pipeline.
+  debugAssert(
+    remoteStoreImpl.writePipeline.length > 0,
+    'Got result for empty write pipeline'
+  );
+  const batch = remoteStoreImpl.writePipeline.shift()!;
+  const success = MutationBatchResult.from(batch, commitVersion, results);
+
+  debugAssert(
+    !!remoteStoreImpl.remoteSyncer.applySuccessfulWrite,
+    'applySuccessfulWrite() not set'
+  );
+  await executeWithRecovery(remoteStoreImpl, () =>
+    remoteStoreImpl.remoteSyncer.applySuccessfulWrite!(success)
+  );
+
+  // It's possible that with the completion of this mutation another
+  // slot has freed up.
+  await fillWritePipeline(remoteStoreImpl);
+}
+
+async function onWriteStreamClose(
+  remoteStoreImpl: RemoteStoreImpl,
+  error?: FirestoreError
+): Promise<void> {
+  if (error === undefined) {
+    // Graceful stop (due to stop() or idle timeout). Make sure that's
+    // desirable.
+    debugAssert(
+      !shouldStartWriteStream(remoteStoreImpl),
+      'Write stream was stopped gracefully while still needed.'
+    );
+  }
+
+  // If the write stream closed after the write handshake completes, a write
+  // operation failed and we fail the pending operation.
+  if (error && ensureWriteStream(remoteStoreImpl).handshakeComplete) {
+    // This error affects the actual write.
+    await handleWriteError(remoteStoreImpl, error!);
+  }
+
+  // The write stream might have been started by refilling the write
+  // pipeline for failed writes
+  if (shouldStartWriteStream(remoteStoreImpl)) {
+    startWriteStream(remoteStoreImpl);
+  }
+}
+
+async function handleWriteError(
+  remoteStoreImpl: RemoteStoreImpl,
+  error: FirestoreError
+): Promise<void> {
+  // Only handle permanent errors here. If it's transient, just let the retry
+  // logic kick in.
+  if (isPermanentWriteError(error.code)) {
+    // This was a permanent error, the request itself was the problem
+    // so it's not going to succeed if we resend it.
+    const batch = remoteStoreImpl.writePipeline.shift()!;
+
+    // In this case it's also unlikely that the server itself is melting
+    // down -- this was just a bad request so inhibit backoff on the next
+    // restart.
+    ensureWriteStream(remoteStoreImpl).inhibitBackoff();
+
+    debugAssert(
+      !!remoteStoreImpl.remoteSyncer.rejectFailedWrite,
+      'rejectFailedWrite() not set'
+    );
+    await executeWithRecovery(remoteStoreImpl, () =>
+      remoteStoreImpl.remoteSyncer.rejectFailedWrite!(batch.batchId, error)
+    );
+
+    // It's possible that with the completion of this mutation
+    // another slot has freed up.
+    await fillWritePipeline(remoteStoreImpl);
+  } else {
+    // Transient error, just let the retry logic kick in.
+  }
+}
+
+async function restartNetwork(remoteStore: RemoteStore): Promise<void> {
+  const remoteStoreImpl = debugCast(remoteStore, RemoteStoreImpl);
+  remoteStoreImpl.offlineCauses.add(OfflineCause.ConnectivityChange);
+  await disableNetworkInternal(remoteStoreImpl);
+  remoteStoreImpl.onlineStateTracker.set(OnlineState.Unknown);
+  remoteStoreImpl.offlineCauses.delete(OfflineCause.ConnectivityChange);
+  await enableNetworkInternal(remoteStoreImpl);
+}
+
+export async function remoteStoreHandleCredentialChange(
+  remoteStore: RemoteStore,
+  user: User
+): Promise<void> {
+  const remoteStoreImpl = debugCast(remoteStore, RemoteStoreImpl);
+  remoteStoreImpl.asyncQueue.verifyOperationInProgress();
+  debugAssert(
+    !!remoteStoreImpl.remoteSyncer.handleCredentialChange,
+    'handleCredentialChange() not set'
+  );
+
+  logDebug(LOG_TAG, 'RemoteStore received new credentials');
+  const usesNetwork = canUseNetwork(remoteStoreImpl);
+
+  // Tear down and re-create our network streams. This will ensure we get a
+  // fresh auth token for the new user and re-fill the write pipeline with
+  // new mutations from the LocalStore (since mutations are per-user).
+  remoteStoreImpl.offlineCauses.add(OfflineCause.CredentialChange);
+  await disableNetworkInternal(remoteStoreImpl);
+  if (usesNetwork) {
+    // Don't set the network status to Unknown if we are offline.
+    remoteStoreImpl.onlineStateTracker.set(OnlineState.Unknown);
+  }
+  await remoteStoreImpl.remoteSyncer.handleCredentialChange(user);
+  remoteStoreImpl.offlineCauses.delete(OfflineCause.CredentialChange);
+  await enableNetworkInternal(remoteStoreImpl);
+}
+
+/**
+ * Toggles the network state when the client gains or loses its primary lease.
+ */
+export async function remoteStoreApplyPrimaryState(
+  remoteStore: RemoteStore,
+  isPrimary: boolean
+): Promise<void> {
+  const remoteStoreImpl = debugCast(remoteStore, RemoteStoreImpl);
+  if (isPrimary) {
+    remoteStoreImpl.offlineCauses.delete(OfflineCause.IsSecondary);
+    await enableNetworkInternal(remoteStoreImpl);
+  } else if (!isPrimary) {
+    remoteStoreImpl.offlineCauses.add(OfflineCause.IsSecondary);
+    await disableNetworkInternal(remoteStoreImpl);
+    remoteStoreImpl.onlineStateTracker.set(OnlineState.Unknown);
+  }
+}
+
+/**
+ * If not yet initialized, registers the WatchStream and its network state
+ * callback with `remoteStoreImpl`. Returns the existing stream if one is
+ * already available.
+ *
+ * PORTING NOTE: On iOS and Android, the WatchStream gets registered on startup.
+ * This is not done on Web to allow it to be tree-shaken.
+ */
+function ensureWatchStream(
+  remoteStoreImpl: RemoteStoreImpl
+): PersistentListenStream {
+  if (!remoteStoreImpl.watchStream) {
+    // Create stream (but note that it is not started yet).
+    remoteStoreImpl.watchStream = newPersistentWatchStream(
+      remoteStoreImpl.datastore,
+      remoteStoreImpl.asyncQueue,
+      {
+        onConnected: onWatchStreamConnected.bind(null, remoteStoreImpl),
+        onOpen: onWatchStreamOpen.bind(null, remoteStoreImpl),
+        onClose: onWatchStreamClose.bind(null, remoteStoreImpl),
+        onWatchChange: onWatchStreamChange.bind(null, remoteStoreImpl)
+      }
+    );
+
+    remoteStoreImpl.onNetworkStatusChange.push(async enabled => {
+      if (enabled) {
+        remoteStoreImpl.watchStream!.inhibitBackoff();
+        if (shouldStartWatchStream(remoteStoreImpl)) {
+          startWatchStream(remoteStoreImpl);
+        } else {
+          remoteStoreImpl.onlineStateTracker.set(OnlineState.Unknown);
         }
       } else {
-        this.addToWritePipeline(batch);
-        await this.fillWritePipeline();
+        await remoteStoreImpl.watchStream!.stop();
+        cleanUpWatchStreamState(remoteStoreImpl);
       }
-    }
-
-    if (this.shouldStartWriteStream()) {
-      this.startWriteStream();
-    }
-  }
-
-  /**
-   * Returns true if we can add to the write pipeline (i.e. the network is
-   * enabled and the write pipeline is not full).
-   */
-  private canAddToWritePipeline(): boolean {
-    return (
-      this.canUseNetwork() && this.writePipeline.length < MAX_PENDING_WRITES
-    );
-  }
-
-  // For testing
-  outstandingWrites(): number {
-    return this.writePipeline.length;
-  }
-
-  /**
-   * Queues additional writes to be sent to the write stream, sending them
-   * immediately if the write stream is established.
-   */
-  private addToWritePipeline(batch: MutationBatch): void {
-    assert(
-      this.canAddToWritePipeline(),
-      'addToWritePipeline called when pipeline is full'
-    );
-    this.writePipeline.push(batch);
-
-    if (this.writeStream.isOpen() && this.writeStream.handshakeComplete) {
-      this.writeStream.writeMutations(batch.mutations);
-    }
-  }
-
-  private shouldStartWriteStream(): boolean {
-    return (
-      this.canUseNetwork() &&
-      !this.writeStream.isStarted() &&
-      this.writePipeline.length > 0
-    );
-  }
-
-  private startWriteStream(): void {
-    assert(
-      this.shouldStartWriteStream(),
-      'startWriteStream() called when shouldStartWriteStream() is false.'
-    );
-    this.writeStream.start();
-  }
-
-  private async onWriteStreamOpen(): Promise<void> {
-    this.writeStream.writeHandshake();
-  }
-
-  private onWriteHandshakeComplete(): Promise<void> {
-    // Record the stream token.
-    return this.localStore
-      .setLastStreamToken(this.writeStream.lastStreamToken)
-      .then(() => {
-        // Send the write pipeline now that the stream is established.
-        for (const batch of this.writePipeline) {
-          this.writeStream.writeMutations(batch.mutations);
-        }
-      })
-      .catch(ignoreIfPrimaryLeaseLoss);
-  }
-
-  private onMutationResult(
-    commitVersion: SnapshotVersion,
-    results: MutationResult[]
-  ): Promise<void> {
-    // This is a response to a write containing mutations and should be
-    // correlated to the first write in our write pipeline.
-    assert(
-      this.writePipeline.length > 0,
-      'Got result for empty write pipeline'
-    );
-    const batch = this.writePipeline.shift()!;
-    const success = MutationBatchResult.from(
-      batch,
-      commitVersion,
-      results,
-      this.writeStream.lastStreamToken
-    );
-    return this.syncEngine.applySuccessfulWrite(success).then(() => {
-      // It's possible that with the completion of this mutation another
-      // slot has freed up.
-      return this.fillWritePipeline();
     });
   }
 
-  private async onWriteStreamClose(error?: FirestoreError): Promise<void> {
-    if (error === undefined) {
-      // Graceful stop (due to stop() or idle timeout). Make sure that's
-      // desirable.
-      assert(
-        !this.shouldStartWriteStream(),
-        'Write stream was stopped gracefully while still needed.'
-      );
-    }
+  return remoteStoreImpl.watchStream;
+}
 
-    // If the write stream closed due to an error, invoke the error callbacks if
-    // there are pending writes.
-    if (error && this.writePipeline.length > 0) {
-      // A promise that is resolved after we processed the error
-      let errorHandling: Promise<void>;
-      if (this.writeStream.handshakeComplete) {
-        // This error affects the actual write.
-        errorHandling = this.handleWriteError(error!);
-      } else {
-        // If there was an error before the handshake has finished, it's
-        // possible that the server is unable to process the stream token
-        // we're sending. (Perhaps it's too old?)
-        errorHandling = this.handleHandshakeError(error!);
+/**
+ * If not yet initialized, registers the WriteStream and its network state
+ * callback with `remoteStoreImpl`. Returns the existing stream if one is
+ * already available.
+ *
+ * PORTING NOTE: On iOS and Android, the WriteStream gets registered on startup.
+ * This is not done on Web to allow it to be tree-shaken.
+ */
+function ensureWriteStream(
+  remoteStoreImpl: RemoteStoreImpl
+): PersistentWriteStream {
+  if (!remoteStoreImpl.writeStream) {
+    debugAssert(
+      remoteStoreImpl.writePipeline.length === 0,
+      'Should not issue writes before WriteStream is enabled'
+    );
+
+    // Create stream (but note that it is not started yet).
+    remoteStoreImpl.writeStream = newPersistentWriteStream(
+      remoteStoreImpl.datastore,
+      remoteStoreImpl.asyncQueue,
+      {
+        onConnected: () => Promise.resolve(),
+        onOpen: onWriteStreamOpen.bind(null, remoteStoreImpl),
+        onClose: onWriteStreamClose.bind(null, remoteStoreImpl),
+        onHandshakeComplete: onWriteHandshakeComplete.bind(
+          null,
+          remoteStoreImpl
+        ),
+        onMutationResult: onMutationResult.bind(null, remoteStoreImpl)
       }
+    );
 
-      return errorHandling.then(() => {
-        // The write stream might have been started by refilling the write
-        // pipeline for failed writes
-        if (this.shouldStartWriteStream()) {
-          this.startWriteStream();
+    remoteStoreImpl.onNetworkStatusChange.push(async enabled => {
+      if (enabled) {
+        remoteStoreImpl.writeStream!.inhibitBackoff();
+
+        // This will start the write stream if necessary.
+        await fillWritePipeline(remoteStoreImpl);
+      } else {
+        await remoteStoreImpl.writeStream!.stop();
+
+        if (remoteStoreImpl.writePipeline.length > 0) {
+          logDebug(
+            LOG_TAG,
+            `Stopping write stream with ${remoteStoreImpl.writePipeline.length} pending writes`
+          );
+          remoteStoreImpl.writePipeline = [];
         }
-      });
-    }
-    // No pending writes, nothing to do
+      }
+    });
   }
 
-  private async handleHandshakeError(error: FirestoreError): Promise<void> {
-    // Reset the token if it's a permanent error, signaling the write stream is
-    // no longer valid. Note that the handshake does not count as a write: see
-    // comments on isPermanentWriteError for details.
-    if (isPermanentError(error.code)) {
-      log.debug(
-        LOG_TAG,
-        'RemoteStore error before completed handshake; resetting stream token: ',
-        this.writeStream.lastStreamToken
-      );
-      this.writeStream.lastStreamToken = ByteString.EMPTY_BYTE_STRING;
-
-      return this.localStore
-        .setLastStreamToken(ByteString.EMPTY_BYTE_STRING)
-        .catch(ignoreIfPrimaryLeaseLoss);
-    } else {
-      // Some other error, don't reset stream token. Our stream logic will
-      // just retry with exponential backoff.
-    }
-  }
-
-  private async handleWriteError(error: FirestoreError): Promise<void> {
-    // Only handle permanent errors here. If it's transient, just let the retry
-    // logic kick in.
-    if (isPermanentWriteError(error.code)) {
-      // This was a permanent error, the request itself was the problem
-      // so it's not going to succeed if we resend it.
-      const batch = this.writePipeline.shift()!;
-
-      // In this case it's also unlikely that the server itself is melting
-      // down -- this was just a bad request so inhibit backoff on the next
-      // restart.
-      this.writeStream.inhibitBackoff();
-
-      return this.syncEngine
-        .rejectFailedWrite(batch.batchId, error)
-        .then(() => {
-          // It's possible that with the completion of this mutation
-          // another slot has freed up.
-          return this.fillWritePipeline();
-        });
-    } else {
-      // Transient error, just let the retry logic kick in.
-    }
-  }
-
-  createTransaction(): Transaction {
-    return new Transaction(this.datastore);
-  }
-
-  private async restartNetwork(): Promise<void> {
-    this.networkEnabled = false;
-    await this.disableNetworkInternal();
-    this.onlineStateTracker.set(OnlineState.Unknown);
-    await this.enableNetwork();
-  }
-
-  async handleCredentialChange(): Promise<void> {
-    if (this.canUseNetwork()) {
-      // Tear down and re-create our network streams. This will ensure we get a fresh auth token
-      // for the new user and re-fill the write pipeline with new mutations from the LocalStore
-      // (since mutations are per-user).
-      log.debug(LOG_TAG, 'RemoteStore restarting streams for new credential');
-      await this.restartNetwork();
-    }
-  }
-
-  /**
-   * Toggles the network state when the client gains or loses its primary lease.
-   */
-  async applyPrimaryState(isPrimary: boolean): Promise<void> {
-    this.isPrimary = isPrimary;
-
-    if (isPrimary && this.networkEnabled) {
-      await this.enableNetwork();
-    } else if (!isPrimary) {
-      await this.disableNetworkInternal();
-      this.onlineStateTracker.set(OnlineState.Unknown);
-    }
-  }
+  return remoteStoreImpl.writeStream;
 }

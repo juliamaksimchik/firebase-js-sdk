@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2021 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,22 +15,39 @@
  * limitations under the License.
  */
 
-declare let MozWebSocket: WebSocket;
+import { FirebaseApp, initializeApp } from '@firebase/app';
+import { uuidv4 } from '@firebase/util';
+import { expect } from 'chai';
 
-import firebase from '@firebase/app';
-import '../../index';
-import { Reference } from '../../src/api/Reference';
-import { Query } from '../../src/api/Query';
+import {
+  Database,
+  DatabaseReference,
+  getDatabase,
+  onValue,
+  ref,
+  set
+} from '../../src';
 import { ConnectionTarget } from '../../src/api/test_access';
-import { _FirebaseNamespace } from '@firebase/app-types/private';
-import { Component, ComponentType } from '@firebase/component';
+import { Path } from '../../src/core/util/Path';
+
+import { EventAccumulator } from './EventAccumulator';
+
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 export const TEST_PROJECT = require('../../../../config/project.json');
-
 const EMULATOR_PORT = process.env.RTDB_EMULATOR_PORT;
 const EMULATOR_NAMESPACE = process.env.RTDB_EMULATOR_NAMESPACE;
-
 const USE_EMULATOR = !!EMULATOR_PORT;
+
+let freshRepoId = 0;
+const activeFreshApps: FirebaseApp[] = [];
+export function getFreshRepo(path: Path) {
+  const app = initializeApp(
+    { databaseURL: DATABASE_URL },
+    'ISOLATED_REPO_' + freshRepoId++
+  );
+  activeFreshApps.push(app);
+  return ref(getDatabase(app), path.toString());
+}
 
 /*
  * When running against the emulator, the hostname will be "localhost" rather
@@ -47,149 +64,6 @@ export const DATABASE_ADDRESS = USE_EMULATOR
 export const DATABASE_URL = USE_EMULATOR
   ? `${DATABASE_ADDRESS}?ns=${EMULATOR_NAMESPACE}`
   : TEST_PROJECT.databaseURL;
-
-console.log(`USE_EMULATOR: ${USE_EMULATOR}. DATABASE_URL: ${DATABASE_URL}.`);
-
-let numDatabases = 0;
-
-// mock authentication functions for testing
-(firebase as _FirebaseNamespace).INTERNAL.registerComponent(
-  new Component(
-    'auth-internal',
-    () => ({
-      getToken: async () => null,
-      addAuthTokenListener: () => {},
-      removeAuthTokenListener: () => {},
-      getUid: () => null
-    }),
-    ComponentType.PRIVATE
-  )
-);
-
-export function createTestApp() {
-  const app = firebase.initializeApp({ databaseURL: DATABASE_URL });
-  return app;
-}
-
-/**
- * Gets or creates a root node to the test namespace. All calls sharing the
- * value of opt_i will share an app context.
- * @param {number=} i
- * @param {string=} ref
- * @return {Reference}
- */
-export function getRootNode(i = 0, ref?: string) {
-  if (i + 1 > numDatabases) {
-    numDatabases = i + 1;
-  }
-  let app;
-  try {
-    app = firebase.app('TEST-' + i);
-  } catch (e) {
-    app = firebase.initializeApp({ databaseURL: DATABASE_URL }, 'TEST-' + i);
-  }
-  const db = app.database();
-  return db.ref(ref);
-}
-
-/**
- * Create multiple refs to the same top level
- * push key - each on it's own Firebase.Context.
- * @param {int=} numNodes
- * @return {Reference|Array<Reference>}
- */
-export function getRandomNode(numNodes?): Reference | Reference[] {
-  if (numNodes === undefined) {
-    return getRandomNode(1)[0] as Reference;
-  }
-
-  let child;
-  const nodeList = [];
-  for (let i = 0; i < numNodes; i++) {
-    const ref = getRootNode(i);
-    if (child === undefined) {
-      child = ref.push().key;
-    }
-
-    nodeList[i] = ref.child(child);
-  }
-
-  return nodeList as Reference[];
-}
-
-export function getQueryValue(query: Query) {
-  return query.once('value').then(snap => snap.val());
-}
-
-export function pause(milliseconds: number) {
-  return new Promise(resolve => {
-    setTimeout(() => resolve(), milliseconds);
-  });
-}
-
-export function getPath(query: Query) {
-  return query.toString().replace(DATABASE_ADDRESS, '');
-}
-
-export function shuffle(arr, randFn = Math.random) {
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(randFn() * (i + 1));
-    const tmp = arr[i];
-    arr[i] = arr[j];
-    arr[j] = tmp;
-  }
-}
-
-let freshRepoId = 1;
-const activeFreshApps = [];
-
-export function getFreshRepo(path) {
-  const app = firebase.initializeApp(
-    { databaseURL: DATABASE_URL },
-    'ISOLATED_REPO_' + freshRepoId++
-  );
-  activeFreshApps.push(app);
-  return (app as any).database().ref(path);
-}
-
-export function getFreshRepoFromReference(ref) {
-  const host = ref.root.toString();
-  const path = ref.toString().replace(host, '');
-  return getFreshRepo(path);
-}
-
-// Little helpers to get the currently cached snapshot / value.
-export function getSnap(path) {
-  let snap;
-  const callback = function(snapshot) {
-    snap = snapshot;
-  };
-  path.once('value', callback);
-  return snap;
-}
-
-export function getVal(path) {
-  const snap = getSnap(path);
-  return snap ? snap.val() : undefined;
-}
-
-export function canCreateExtraConnections() {
-  return (
-    typeof MozWebSocket !== 'undefined' || typeof WebSocket !== 'undefined'
-  );
-}
-
-export function buildObjFromKey(key) {
-  const keys = key.split('.');
-  const obj = {};
-  let parent = obj;
-  for (let i = 0; i < keys.length; i++) {
-    const key = keys[i];
-    parent[key] = i < keys.length - 1 ? {} : 'test_value';
-    parent = parent[key];
-  }
-  return obj;
-}
 
 export function testRepoInfo(url) {
   const regex = /https?:\/\/(.*).firebaseio.com/;
@@ -212,4 +86,61 @@ export function repoInfoForConnectionTest() {
   } else {
     return testRepoInfo(TEST_PROJECT.databaseURL);
   }
+}
+
+export function shuffle(arr, randFn = Math.random) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(randFn() * (i + 1));
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+}
+
+// Waits for specific number of milliseconds before resolving
+// Example: await waitFor(4000) will wait until 4 seconds to execute the next line of code.
+export function waitFor(waitTimeInMS: number) {
+  return new Promise(resolve => setTimeout(resolve, waitTimeInMS));
+}
+
+// Creates a unique reference using uuid
+export function getUniqueRef(db: Database) {
+  const path = uuidv4();
+  return ref(db, path);
+}
+
+// Get separate Reader and Writer Refs to prevent caching.
+export function getRWRefs(db: Database) {
+  const readerRef = getUniqueRef(db);
+  const writerRef = getFreshRepo(readerRef._path);
+  return { readerRef, writerRef };
+}
+
+// Validates that the ref was successfully written to.
+export async function writeAndValidate(
+  writerRef: DatabaseReference,
+  readerRef: DatabaseReference,
+  toWrite: unknown,
+  ec: EventAccumulator
+) {
+  await set(writerRef, toWrite);
+  onValue(readerRef, snapshot => {
+    ec.addEvent(snapshot);
+  });
+  const [snap] = await ec.promise;
+  expect(snap.val()).to.deep.eq(toWrite);
+}
+
+// Waits until callback function returns true
+export async function waitUntil(cb: () => boolean, maxRetries = 5) {
+  let count = 1;
+  return new Promise((resolve, reject) => {
+    if (cb()) {
+      resolve(true);
+    } else {
+      if (count++ === maxRetries) {
+        reject('waited too many times for conditional to be true');
+      }
+    }
+  });
 }

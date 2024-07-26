@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,21 +49,21 @@
  *   fs.stat(path, callback);
  * });
  *
- * @param action a function that takes a node-style callback as an argument and
- *     then uses that callback to invoke some node-style API.
- * @return a new Promise which will be rejected if the callback is given the
+ * @param action - a function that takes a node-style callback as an argument
+ *     and then uses that callback to invoke some node-style API.
+ * @returns a new Promise which will be rejected if the callback is given the
  *     first Error parameter or will resolve to the value given otherwise.
  */
 export function nodePromise<R>(
   action: (callback: NodeCallback<R>) => void
 ): Promise<R> {
   return new Promise(
-    (resolve: (value?: R) => void, reject: (error?: unknown) => void) => {
+    (resolve: (value: R) => void, reject: (error?: unknown) => void) => {
       action((error?: unknown, value?: R) => {
         if (error) {
           reject(error);
         } else {
-          resolve(value);
+          resolve(value!);
         }
       });
     }

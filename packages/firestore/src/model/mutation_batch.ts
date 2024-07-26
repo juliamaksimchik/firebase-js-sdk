@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,37 +15,44 @@
  * limitations under the License.
  */
 
-import { Timestamp } from '../api/timestamp';
 import { SnapshotVersion } from '../core/snapshot_version';
 import { BatchId } from '../core/types';
-import { assert } from '../util/assert';
-import * as misc from '../util/misc';
-import { ByteString } from '../util/byte_string';
+import { Timestamp } from '../lite-api/timestamp';
+import { debugAssert, hardAssert } from '../util/assert';
+import { arrayEquals } from '../util/misc';
+
 import {
   documentKeySet,
   DocumentKeySet,
+  MutationMap,
   DocumentVersionMap,
   documentVersionMap,
-  MaybeDocumentMap
+  newMutationMap,
+  OverlayedDocumentMap
 } from './collections';
-import { MaybeDocument } from './document';
-import { DocumentKey } from './document_key';
-import { Mutation, MutationResult } from './mutation';
-
-export const BATCHID_UNKNOWN = -1;
+import { MutableDocument } from './document';
+import { FieldMask } from './field_mask';
+import {
+  calculateOverlayMutation,
+  Mutation,
+  mutationApplyToLocalView,
+  mutationApplyToRemoteDocument,
+  mutationEquals,
+  MutationResult
+} from './mutation';
 
 /**
  * A batch of mutations that will be sent as one unit to the backend.
  */
 export class MutationBatch {
   /**
-   * @param batchId The unique ID of this mutation batch.
-   * @param localWriteTime The original write time of this mutation.
-   * @param baseMutations Mutations that are used to populate the base
+   * @param batchId - The unique ID of this mutation batch.
+   * @param localWriteTime - The original write time of this mutation.
+   * @param baseMutations - Mutations that are used to populate the base
    * values when this mutation is applied locally. This can be used to locally
    * overwrite values that are persisted in the remote document cache. Base
    * mutations are never sent to the backend.
-   * @param mutations The user-provided mutations in this mutation batch.
+   * @param mutations - The user-provided mutations in this mutation batch.
    * User-provided mutations are applied both locally and remotely on the
    * backend.
    */
@@ -55,33 +62,23 @@ export class MutationBatch {
     public baseMutations: Mutation[],
     public mutations: Mutation[]
   ) {
-    assert(mutations.length > 0, 'Cannot create an empty mutation batch');
+    debugAssert(mutations.length > 0, 'Cannot create an empty mutation batch');
   }
 
   /**
    * Applies all the mutations in this MutationBatch to the specified document
-   * to create a new remote document
+   * to compute the state of the remote document
    *
-   * @param docKey The key of the document to apply mutations to.
-   * @param maybeDoc The document to apply mutations to.
-   * @param batchResult The result of applying the MutationBatch to the
+   * @param document - The document to apply mutations to.
+   * @param batchResult - The result of applying the MutationBatch to the
    * backend.
    */
   applyToRemoteDocument(
-    docKey: DocumentKey,
-    maybeDoc: MaybeDocument | null,
+    document: MutableDocument,
     batchResult: MutationBatchResult
-  ): MaybeDocument | null {
-    if (maybeDoc) {
-      assert(
-        maybeDoc.key.isEqual(docKey),
-        `applyToRemoteDocument: key ${docKey} should match maybeDoc key
-        ${maybeDoc.key}`
-      );
-    }
-
+  ): void {
     const mutationResults = batchResult.mutationResults;
-    assert(
+    debugAssert(
       mutationResults.length === this.mutations.length,
       `Mismatch between mutations length
       (${this.mutations.length}) and mutation results length
@@ -90,79 +87,91 @@ export class MutationBatch {
 
     for (let i = 0; i < this.mutations.length; i++) {
       const mutation = this.mutations[i];
-      if (mutation.key.isEqual(docKey)) {
+      if (mutation.key.isEqual(document.key)) {
         const mutationResult = mutationResults[i];
-        maybeDoc = mutation.applyToRemoteDocument(maybeDoc, mutationResult);
+        mutationApplyToRemoteDocument(mutation, document, mutationResult);
       }
     }
-    return maybeDoc;
   }
 
   /**
    * Computes the local view of a document given all the mutations in this
    * batch.
    *
-   * @param docKey The key of the document to apply mutations to.
-   * @param maybeDoc The document to apply mutations to.
+   * @param document - The document to apply mutations to.
+   * @param mutatedFields - Fields that have been updated before applying this mutation batch.
+   * @returns A `FieldMask` representing all the fields that are mutated.
    */
   applyToLocalView(
-    docKey: DocumentKey,
-    maybeDoc: MaybeDocument | null
-  ): MaybeDocument | null {
-    if (maybeDoc) {
-      assert(
-        maybeDoc.key.isEqual(docKey),
-        `applyToLocalDocument: key ${docKey} should match maybeDoc key
-        ${maybeDoc.key}`
-      );
-    }
-
+    document: MutableDocument,
+    mutatedFields: FieldMask | null
+  ): FieldMask | null {
     // First, apply the base state. This allows us to apply non-idempotent
     // transform against a consistent set of values.
     for (const mutation of this.baseMutations) {
-      if (mutation.key.isEqual(docKey)) {
-        maybeDoc = mutation.applyToLocalView(
-          maybeDoc,
-          maybeDoc,
+      if (mutation.key.isEqual(document.key)) {
+        mutatedFields = mutationApplyToLocalView(
+          mutation,
+          document,
+          mutatedFields,
           this.localWriteTime
         );
       }
     }
-
-    const baseDoc = maybeDoc;
 
     // Second, apply all user-provided mutations.
     for (const mutation of this.mutations) {
-      if (mutation.key.isEqual(docKey)) {
-        maybeDoc = mutation.applyToLocalView(
-          maybeDoc,
-          baseDoc,
+      if (mutation.key.isEqual(document.key)) {
+        mutatedFields = mutationApplyToLocalView(
+          mutation,
+          document,
+          mutatedFields,
           this.localWriteTime
         );
       }
     }
-    return maybeDoc;
+    return mutatedFields;
   }
 
   /**
    * Computes the local view for all provided documents given the mutations in
-   * this batch.
+   * this batch. Returns a `DocumentKey` to `Mutation` map which can be used to
+   * replace all the mutation applications.
    */
-  applyToLocalDocumentSet(maybeDocs: MaybeDocumentMap): MaybeDocumentMap {
+  applyToLocalDocumentSet(
+    documentMap: OverlayedDocumentMap,
+    documentsWithoutRemoteVersion: DocumentKeySet
+  ): MutationMap {
     // TODO(mrschmidt): This implementation is O(n^2). If we apply the mutations
     // directly (as done in `applyToLocalView()`), we can reduce the complexity
     // to O(n).
-    let mutatedDocuments = maybeDocs;
+    const overlays = newMutationMap();
     this.mutations.forEach(m => {
-      const mutatedDocument = this.applyToLocalView(
-        m.key,
-        maybeDocs.get(m.key)
+      const overlayedDocument = documentMap.get(m.key)!;
+      // TODO(mutabledocuments): This method should take a MutableDocumentMap
+      // and we should remove this cast.
+      const mutableDocument =
+        overlayedDocument.overlayedDocument as MutableDocument;
+      let mutatedFields = this.applyToLocalView(
+        mutableDocument,
+        overlayedDocument.mutatedFields
       );
-      if (mutatedDocument) {
-        mutatedDocuments = mutatedDocuments.insert(m.key, mutatedDocument);
+      // Set mutatedFields to null if the document is only from local mutations.
+      // This creates a Set or Delete mutation, instead of trying to create a
+      // patch mutation as the overlay.
+      mutatedFields = documentsWithoutRemoteVersion.has(m.key)
+        ? null
+        : mutatedFields;
+      const overlay = calculateOverlayMutation(mutableDocument, mutatedFields);
+      if (overlay !== null) {
+        overlays.set(m.key, overlay);
+      }
+
+      if (!mutableDocument.isValidDocument()) {
+        mutableDocument.convertToNoDocument(SnapshotVersion.min());
       }
     });
-    return mutatedDocuments;
+    return overlays;
   }
 
   keys(): DocumentKeySet {
@@ -175,8 +184,12 @@ export class MutationBatch {
   isEqual(other: MutationBatch): boolean {
     return (
       this.batchId === other.batchId &&
-      misc.arrayEquals(this.mutations, other.mutations) &&
-      misc.arrayEquals(this.baseMutations, other.baseMutations)
+      arrayEquals(this.mutations, other.mutations, (l, r) =>
+        mutationEquals(l, r)
+      ) &&
+      arrayEquals(this.baseMutations, other.baseMutations, (l, r) =>
+        mutationEquals(l, r)
+      )
     );
   }
 }
@@ -187,7 +200,6 @@ export class MutationBatchResult {
     readonly batch: MutationBatch,
     readonly commitVersion: SnapshotVersion,
     readonly mutationResults: MutationResult[],
-    readonly streamToken: ByteString,
     /**
      * A pre-computed mapping from each mutated document to the resulting
      * version.
@@ -198,15 +210,14 @@ export class MutationBatchResult {
   /**
    * Creates a new MutationBatchResult for the given batch and results. There
    * must be one result for each mutation in the batch. This static factory
-   * caches a document=>version mapping (docVersions).
+   * caches a document=&gt;version mapping (docVersions).
    */
   static from(
     batch: MutationBatch,
     commitVersion: SnapshotVersion,
-    results: MutationResult[],
-    streamToken: ByteString
+    results: MutationResult[]
   ): MutationBatchResult {
-    assert(
+    hardAssert(
       batch.mutations.length === results.length,
       'Mutations sent ' +
         batch.mutations.length +
@@ -220,12 +231,6 @@ export class MutationBatchResult {
       versionMap = versionMap.insert(mutations[i].key, results[i].version);
     }
 
-    return new MutationBatchResult(
-      batch,
-      commitVersion,
-      results,
-      streamToken,
-      versionMap
-    );
+    return new MutationBatchResult(batch, commitVersion, results, versionMap);
   }
 }

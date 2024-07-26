@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,10 +27,10 @@ export type Resolver<T> = (value?: T) => void;
 export type Rejector = (error: Error) => void;
 
 /**
- * PersistencePromise<> is essentially a re-implementation of Promise<> except
+ * PersistencePromise is essentially a re-implementation of Promise except
  * it has a .next() method instead of .then() and .next() and .catch() callbacks
  * are executed synchronously when a PersistencePromise resolves rather than
- * asynchronously (Promise<> implementations use setImmediate() or similar).
+ * asynchronously (Promise implementations use setImmediate() or similar).
  *
  * This is necessary to interoperate with IndexedDB which will automatically
  * commit transactions if control is returned to the event loop without
@@ -124,7 +124,7 @@ export class PersistencePromise<T> {
         return PersistencePromise.resolve(result);
       }
     } catch (e) {
-      return PersistencePromise.reject<R>(e);
+      return PersistencePromise.reject<R>(e as Error);
     }
   }
 
@@ -136,7 +136,7 @@ export class PersistencePromise<T> {
       return this.wrapUserFunction(() => nextFn(value));
     } else {
       // If there's no nextFn, then R must be the same as T
-      return PersistencePromise.resolve<R>((value as unknown) as R);
+      return PersistencePromise.resolve<R>(value as unknown as R);
     }
   }
 
@@ -204,9 +204,8 @@ export class PersistencePromise<T> {
   static or(
     predicates: Array<() => PersistencePromise<boolean>>
   ): PersistencePromise<boolean> {
-    let p: PersistencePromise<boolean> = PersistencePromise.resolve<boolean>(
-      false
-    );
+    let p: PersistencePromise<boolean> =
+      PersistencePromise.resolve<boolean>(false);
     for (const predicate of predicates) {
       p = p.next(isTrue => {
         if (isTrue) {
@@ -243,5 +242,56 @@ export class PersistencePromise<T> {
       promises.push(f.call(this, r, s));
     });
     return this.waitFor(promises);
+  }
+
+  /**
+   * Concurrently map all array elements through asynchronous function.
+   */
+  static mapArray<T, U>(
+    array: T[],
+    f: (t: T) => PersistencePromise<U>
+  ): PersistencePromise<U[]> {
+    return new PersistencePromise<U[]>((resolve, reject) => {
+      const expectedCount = array.length;
+      const results: U[] = new Array(expectedCount);
+      let resolvedCount = 0;
+      for (let i = 0; i < expectedCount; i++) {
+        const current = i;
+        f(array[current]).next(
+          result => {
+            results[current] = result;
+            ++resolvedCount;
+            if (resolvedCount === expectedCount) {
+              resolve(results);
+            }
+          },
+          err => reject(err)
+        );
+      }
+    });
+  }
+
+  /**
+   * An alternative to recursive PersistencePromise calls, that avoids
+   * potential memory problems from unbounded chains of promises.
+   *
+   * The `action` will be called repeatedly while `condition` is true.
+   */
+  static doWhile(
+    condition: () => boolean,
+    action: () => PersistencePromise<void>
+  ): PersistencePromise<void> {
+    return new PersistencePromise<void>((resolve, reject) => {
+      const process = (): void => {
+        if (condition() === true) {
+          action().next(() => {
+            process();
+          }, reject);
+        } else {
+          resolve();
+        }
+      };
+      process();
+    });
   }
 }

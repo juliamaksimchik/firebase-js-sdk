@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,29 +15,23 @@
  * limitations under the License.
  */
 
-import { Timestamp } from '../api/timestamp';
+import { Timestamp } from '../lite-api/timestamp';
 
 /**
  * A version of a document in Firestore. This corresponds to the version
  * timestamp, such as update_time or read_time.
  */
 export class SnapshotVersion {
-  static readonly MIN = new SnapshotVersion(new Timestamp(0, 0));
-
-  // TODO(b/34176344): Once we no longer need to use the old alpha protos,
-  // delete this constructor and use a timestamp-backed version everywhere.
-  static fromMicroseconds(value: number): SnapshotVersion {
-    const seconds = Math.floor(value / 1e6);
-    const nanos = (value % 1e6) * 1e3;
-    return new SnapshotVersion(new Timestamp(seconds, nanos));
-  }
-
   static fromTimestamp(value: Timestamp): SnapshotVersion {
     return new SnapshotVersion(value);
   }
 
-  static forDeletedDoc(): SnapshotVersion {
-    return SnapshotVersion.MIN;
+  static min(): SnapshotVersion {
+    return new SnapshotVersion(new Timestamp(0, 0));
+  }
+
+  static max(): SnapshotVersion {
+    return new SnapshotVersion(new Timestamp(253402300799, 1e9 - 1));
   }
 
   private constructor(private timestamp: Timestamp) {}

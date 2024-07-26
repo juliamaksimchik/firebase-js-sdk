@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,26 +16,31 @@
  */
 
 import { expect } from 'chai';
-import { Query } from '../../../src/core/query';
+
+import { Timestamp } from '../../../src/api/timestamp';
+import { queryToTarget } from '../../../src/core/query';
 import { SnapshotVersion } from '../../../src/core/snapshot_version';
+import {
+  canonifyTarget,
+  Target,
+  targetEquals,
+  TargetImpl
+} from '../../../src/core/target';
 import { TargetId } from '../../../src/core/types';
 import { IndexedDbPersistence } from '../../../src/local/indexeddb_persistence';
 import { Persistence } from '../../../src/local/persistence';
-import { ReferenceSet } from '../../../src/local/reference_set';
 import { TargetData, TargetPurpose } from '../../../src/local/target_data';
 import { addEqualityMatcher } from '../../util/equality_matcher';
 import {
   filter,
   key,
-  path,
+  query,
   resumeTokenForSnapshot,
   version
 } from '../../util/helpers';
 
-import { Timestamp } from '../../../src/api/timestamp';
 import * as persistenceHelpers from './persistence_test_helpers';
 import { TestTargetCache } from './test_target_cache';
-import { Target } from '../../../src/core/target';
 
 describe('MemoryTargetCache', () => {
   genericTargetCacheTests(persistenceHelpers.testMemoryEagerPersistence);
@@ -66,7 +71,7 @@ describe('IndexedDbTargetCache', () => {
     const lastLimboFreeSnapshotVersion = SnapshotVersion.fromTimestamp(
       new Timestamp(3, 4)
     );
-    const target = Query.atPath(path('rooms')).toTarget();
+    const target = queryToTarget(query('rooms'));
     const targetData = new TargetData(
       target,
       targetId,
@@ -92,14 +97,10 @@ describe('IndexedDbTargetCache', () => {
       originalSequenceNumber
     );
     const actualTargetData = await targetCache2.getTargetData(target);
+    expect(targetData).to.deep.equal(actualTargetData);
 
-    if (process.env.USE_MOCK_PERSISTENCE !== 'YES') {
-      // TODO(b/140573486): This fails on Node with persistence since the
-      // resume token is read back as a string.
-      expect(targetData.isEqual(actualTargetData!)).to.be.true;
-    }
-
-    const actualSnapshotVersion = await targetCache2.getLastRemoteSnapshotVersion();
+    const actualSnapshotVersion =
+      await targetCache2.getLastRemoteSnapshotVersion();
     expect(snapshotVersion.isEqual(actualSnapshotVersion)).to.be.true;
     await db2.shutdown();
     await persistenceHelpers.clearTestPersistence();
@@ -112,27 +113,27 @@ describe('IndexedDbTargetCache', () => {
 function genericTargetCacheTests(
   persistencePromise: () => Promise<Persistence>
 ): void {
-  addEqualityMatcher();
+  addEqualityMatcher({ equalsFn: targetEquals, forType: TargetImpl });
   let cache: TestTargetCache;
 
-  const QUERY_ROOMS = Query.atPath(path('rooms')).toTarget();
-  const QUERY_HALLS = Query.atPath(path('halls')).toTarget();
-  const QUERY_GARAGES = Query.atPath(path('garages')).toTarget();
+  const QUERY_ROOMS = queryToTarget(query('rooms'));
+  const QUERY_HALLS = queryToTarget(query('halls'));
+  const QUERY_GARAGES = queryToTarget(query('garages'));
 
   /**
-   * Creates a new TargetData object from the the given parameters, synthesizing
+   * Creates a new TargetData object from the given parameters, synthesizing
    * a resume token from the snapshot version.
    */
   let previousSequenceNumber = 0;
   function testTargetData(
     target: Target,
     targetId: TargetId,
-    version?: number
+    testVersion?: number
   ): TargetData {
-    if (version === undefined) {
-      version = 0;
+    if (testVersion === undefined) {
+      testVersion = 0;
     }
-    const snapshotVersion = SnapshotVersion.fromMicroseconds(version);
+    const snapshotVersion = version(testVersion);
     const resumeToken = resumeTokenForSnapshot(snapshotVersion);
     return new TargetData(
       target,
@@ -140,7 +141,7 @@ function genericTargetCacheTests(
       TargetPurpose.Listen,
       ++previousSequenceNumber,
       snapshotVersion,
-      /* lastLimboFreeSnapshotVersion= */ SnapshotVersion.MIN,
+      /* lastLimboFreeSnapshotVersion= */ SnapshotVersion.min(),
       resumeToken
     );
   }
@@ -148,7 +149,6 @@ function genericTargetCacheTests(
   let persistence: Persistence;
   beforeEach(async () => {
     persistence = await persistencePromise();
-    persistence.referenceDelegate.setInMemoryPins(new ReferenceSet());
     cache = new TestTargetCache(persistence, persistence.getTargetCache());
   });
 
@@ -175,13 +175,9 @@ function genericTargetCacheTests(
   it('handles canonical ID collisions', async () => {
     // Type information is currently lost in our canonicalID implementations so
     // this currently an easy way to force colliding canonicalIDs
-    const q1 = Query.atPath(path('a'))
-      .addFilter(filter('foo', '==', 1))
-      .toTarget();
-    const q2 = Query.atPath(path('a'))
-      .addFilter(filter('foo', '==', '1'))
-      .toTarget();
-    expect(q1.canonicalId()).to.equal(q2.canonicalId());
+    const q1 = queryToTarget(query('a', filter('foo', '==', 1)));
+    const q2 = queryToTarget(query('a', filter('foo', '==', '1')));
+    expect(canonifyTarget(q1)).to.equal(canonifyTarget(q2));
 
     const data1 = testTargetData(q1, 1, 1);
     await cache.addTargetData(data1);
@@ -354,7 +350,7 @@ function genericTargetCacheTests(
 
   it('can get / set targets metadata', async () => {
     expect(await cache.getLastRemoteSnapshotVersion()).to.deep.equal(
-      SnapshotVersion.MIN
+      SnapshotVersion.min()
     );
 
     // Can set the snapshot version.

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,10 @@
  * limitations under the License.
  */
 
-import { ConsoleMessageData } from '../interfaces/message-payload';
 import { CONSOLE_CAMPAIGN_ID } from '../util/constants';
+import { ConsoleMessageData } from '../interfaces/internal-message-payload';
 
 export function isConsoleMessage(data: unknown): data is ConsoleMessageData {
-  // This message has a campaign ID, meaning it was sent using the
-  // Firebase Console.
+  // This message has a campaign ID, meaning it was sent using the Firebase Console.
   return typeof data === 'object' && !!data && CONSOLE_CAMPAIGN_ID in data;
 }

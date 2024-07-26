@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,25 +16,34 @@
  */
 
 import { expect } from 'chai';
-import firebase from '../util/firebase_export';
+
+import {
+  FieldPath,
+  getDoc,
+  getDocs,
+  orderBy,
+  query,
+  setDoc,
+  startAt,
+  Timestamp,
+  updateDoc,
+  where
+} from '../util/firebase_export';
 import {
   apiDescribe,
-  DEFAULT_SETTINGS,
   toDataArray,
   withTestCollection,
   withTestCollectionSettings,
-  withTestDoc
+  withTestDoc,
+  withTestDocAndSettings
 } from '../util/helpers';
-
-const FieldPath = firebase.firestore!.FieldPath;
-const FieldValue = firebase.firestore!.FieldValue;
-const Timestamp = firebase.firestore!.Timestamp;
+import { DEFAULT_SETTINGS } from '../util/settings';
 
 // Allow custom types for testing.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyTestData = any;
 
-apiDescribe('Nested Fields', (persistence: boolean) => {
+apiDescribe('Nested Fields', persistence => {
   const testData = (n?: number): AnyTestData => {
     n = n || 1;
     return {
@@ -50,9 +59,8 @@ apiDescribe('Nested Fields', (persistence: boolean) => {
 
   it('can be written with set()', () => {
     return withTestDoc(persistence, doc => {
-      return doc
-        .set(testData())
-        .then(() => doc.get())
+      return setDoc(doc, testData())
+        .then(() => getDoc(doc))
         .then(docSnap => {
           expect(docSnap.data()).to.deep.equal(testData());
         });
@@ -62,9 +70,8 @@ apiDescribe('Nested Fields', (persistence: boolean) => {
   it('can be read directly with .get(<string>)', () => {
     return withTestDoc(persistence, doc => {
       const obj = testData();
-      return doc
-        .set(obj)
-        .then(() => doc.get())
+      return setDoc(doc, obj)
+        .then(() => getDoc(doc))
         .then(docSnap => {
           expect(docSnap.data()).to.deep.equal(obj);
           expect(docSnap.get('name')).to.deep.equal(obj.name);
@@ -81,9 +88,8 @@ apiDescribe('Nested Fields', (persistence: boolean) => {
   it('can be read directly with .get(<FieldPath>)', () => {
     return withTestDoc(persistence, doc => {
       const obj = testData();
-      return doc
-        .set(obj)
-        .then(() => doc.get())
+      return setDoc(doc, obj)
+        .then(() => getDoc(doc))
         .then(docSnap => {
           expect(docSnap.data()).to.deep.equal(obj);
           expect(docSnap.get(new FieldPath('name'))).to.deep.equal(obj.name);
@@ -103,15 +109,14 @@ apiDescribe('Nested Fields', (persistence: boolean) => {
 
   it('can be updated with update(<string>)', () => {
     return withTestDoc(persistence, doc => {
-      return doc
-        .set(testData())
-        .then(() => {
-          return doc.update({
+      return setDoc(doc, testData())
+        .then(() =>
+          updateDoc(doc, {
             'metadata.deep.field': 100,
             'metadata.added': 200
-          });
-        })
-        .then(() => doc.get())
+          })
+        )
+        .then(() => getDoc(doc))
         .then(docSnap => {
           expect(docSnap.data()).to.deep.equal({
             name: 'room 1',
@@ -129,17 +134,17 @@ apiDescribe('Nested Fields', (persistence: boolean) => {
 
   it('can be updated with update(<FieldPath>)', () => {
     return withTestDoc(persistence, doc => {
-      return doc
-        .set(testData())
-        .then(() => {
-          return doc.update(
+      return setDoc(doc, testData())
+        .then(() =>
+          updateDoc(
+            doc,
             new FieldPath('metadata', 'deep', 'field'),
             100,
             new FieldPath('metadata', 'added'),
             200
-          );
-        })
-        .then(() => doc.get())
+          )
+        )
+        .then(() => getDoc(doc))
         .then(docSnap => {
           expect(docSnap.data()).to.deep.equal({
             name: 'room 1',
@@ -162,16 +167,15 @@ apiDescribe('Nested Fields', (persistence: boolean) => {
       '3': testData(200)
     };
     return withTestCollection(persistence, testDocs, coll => {
-      return coll
-        .where('metadata.createdAt', '>=', 200)
-        .get()
-        .then(results => {
+      return getDocs(query(coll, where('metadata.createdAt', '>=', 200))).then(
+        results => {
           // inequality adds implicit sort on field
           expect(toDataArray(results)).to.deep.equal([
             testData(200),
             testData(300)
           ]);
-        });
+        }
+      );
     });
   });
 
@@ -182,16 +186,15 @@ apiDescribe('Nested Fields', (persistence: boolean) => {
       '3': testData(200)
     };
     return withTestCollection(persistence, testDocs, coll => {
-      return coll
-        .where(new FieldPath('metadata', 'createdAt'), '>=', 200)
-        .get()
-        .then(results => {
-          // inequality adds implicit sort on field
-          expect(toDataArray(results)).to.deep.equal([
-            testData(200),
-            testData(300)
-          ]);
-        });
+      return getDocs(
+        query(coll, where(new FieldPath('metadata', 'createdAt'), '>=', 200))
+      ).then(results => {
+        // inequality adds implicit sort on field
+        expect(toDataArray(results)).to.deep.equal([
+          testData(200),
+          testData(300)
+        ]);
+      });
     });
   });
 
@@ -202,16 +205,15 @@ apiDescribe('Nested Fields', (persistence: boolean) => {
       '3': testData(200)
     };
     return withTestCollection(persistence, testDocs, coll => {
-      return coll
-        .orderBy('metadata.createdAt')
-        .get()
-        .then(results => {
+      return getDocs(query(coll, orderBy('metadata.createdAt'))).then(
+        results => {
           expect(toDataArray(results)).to.deep.equal([
             testData(100),
             testData(200),
             testData(300)
           ]);
-        });
+        }
+      );
     });
   });
 
@@ -222,16 +224,15 @@ apiDescribe('Nested Fields', (persistence: boolean) => {
       '3': testData(200)
     };
     return withTestCollection(persistence, testDocs, coll => {
-      return coll
-        .orderBy(new FieldPath('metadata', 'createdAt'))
-        .get()
-        .then(results => {
-          expect(toDataArray(results)).to.deep.equal([
-            testData(100),
-            testData(200),
-            testData(300)
-          ]);
-        });
+      return getDocs(
+        query(coll, orderBy(new FieldPath('metadata', 'createdAt')))
+      ).then(results => {
+        expect(toDataArray(results)).to.deep.equal([
+          testData(100),
+          testData(200),
+          testData(300)
+        ]);
+      });
     });
   });
 });
@@ -239,7 +240,7 @@ apiDescribe('Nested Fields', (persistence: boolean) => {
 // NOTE(mikelehen): I originally combined these tests with the above ones, but
 // Datastore currently prohibits having nested fields and fields with dots in
 // the same entity, so I'm separating them.
-apiDescribe('Fields with special characters', (persistence: boolean) => {
+apiDescribe('Fields with special characters', persistence => {
   const testData = (n?: number): AnyTestData => {
     n = n || 1;
     return {
@@ -251,9 +252,8 @@ apiDescribe('Fields with special characters', (persistence: boolean) => {
 
   it('can be written with set()', () => {
     return withTestDoc(persistence, doc => {
-      return doc
-        .set(testData())
-        .then(() => doc.get())
+      return setDoc(doc, testData())
+        .then(() => getDoc(doc))
         .then(docSnap => {
           expect(docSnap.data()).to.deep.equal(testData());
         });
@@ -263,9 +263,8 @@ apiDescribe('Fields with special characters', (persistence: boolean) => {
   it('can be read directly with .data(<field>)', () => {
     return withTestDoc(persistence, doc => {
       const obj = testData();
-      return doc
-        .set(obj)
-        .then(() => doc.get())
+      return setDoc(doc, obj)
+        .then(() => getDoc(doc))
         .then(docSnap => {
           expect(docSnap.data()).to.deep.equal(obj);
           expect(docSnap.get(new FieldPath('field.dot'))).to.deep.equal(
@@ -280,17 +279,17 @@ apiDescribe('Fields with special characters', (persistence: boolean) => {
 
   it('can be updated with update()', () => {
     return withTestDoc(persistence, doc => {
-      return doc
-        .set(testData())
+      return setDoc(doc, testData())
         .then(() => {
-          return doc.update(
+          return updateDoc(
+            doc,
             new FieldPath('field.dot'),
             100,
             'field\\slash',
             200
           );
         })
-        .then(() => doc.get())
+        .then(() => getDoc(doc))
         .then(docSnap => {
           expect(docSnap.data()).to.deep.equal({
             field: 'field 1',
@@ -310,13 +309,11 @@ apiDescribe('Fields with special characters', (persistence: boolean) => {
     return withTestCollection(persistence, testDocs, coll => {
       // inequality adds implicit sort on field
       const expected = [testData(200), testData(300)];
-      return coll
-        .where(new FieldPath('field.dot'), '>=', 200)
-        .get()
+      return getDocs(query(coll, where(new FieldPath('field.dot'), '>=', 200)))
         .then(results => {
           expect(toDataArray(results)).to.deep.equal(expected);
         })
-        .then(() => coll.where('field\\slash', '>=', 200).get())
+        .then(() => getDocs(query(coll, where('field\\slash', '>=', 200))))
         .then(results => {
           expect(toDataArray(results)).to.deep.equal(expected);
         });
@@ -331,13 +328,11 @@ apiDescribe('Fields with special characters', (persistence: boolean) => {
     };
     return withTestCollection(persistence, testDocs, coll => {
       const expected = [testData(100), testData(200), testData(300)];
-      return coll
-        .orderBy(new FieldPath('field.dot'))
-        .get()
+      return getDocs(query(coll, orderBy(new FieldPath('field.dot'))))
         .then(results => {
           expect(toDataArray(results)).to.deep.equal(expected);
         })
-        .then(() => coll.orderBy('field\\slash').get())
+        .then(() => getDocs(query(coll, orderBy('field\\slash'))))
         .then(results => {
           expect(toDataArray(results)).to.deep.equal(expected);
         });
@@ -345,40 +340,12 @@ apiDescribe('Fields with special characters', (persistence: boolean) => {
   });
 });
 
-apiDescribe('Timestamp Fields in snapshots', (persistence: boolean) => {
+apiDescribe('Timestamp Fields in snapshots', persistence => {
   // Figure out how to pass in the Timestamp type
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const testDataWithTimestamps = (ts: any): AnyTestData => {
     return { timestamp: ts, nested: { timestamp2: ts } };
   };
-
-  it('are returned as native dates if timestampsInSnapshots set to false', () => {
-    const settings = { ...DEFAULT_SETTINGS };
-    settings['timestampsInSnapshots'] = false;
-
-    const timestamp = new Timestamp(100, 123456789);
-    const testDocs = { a: testDataWithTimestamps(timestamp) };
-    return withTestCollectionSettings(persistence, settings, testDocs, coll => {
-      return coll
-        .doc('a')
-        .get()
-        .then(docSnap => {
-          expect(docSnap.get('timestamp'))
-            .to.be.a('date')
-            .that.deep.equals(timestamp.toDate());
-          expect(docSnap.data()!['timestamp'])
-            .to.be.a('date')
-            .that.deep.equals(timestamp.toDate());
-
-          expect(docSnap.get('nested.timestamp2'))
-            .to.be.a('date')
-            .that.deep.equals(timestamp.toDate());
-          expect(docSnap.data()!['nested']['timestamp2'])
-            .to.be.a('date')
-            .that.deep.equals(timestamp.toDate());
-        });
-    });
-  });
 
   it('are returned as Timestamps', () => {
     const timestamp = new Timestamp(100, 123456000);
@@ -391,9 +358,8 @@ apiDescribe('Timestamp Fields in snapshots', (persistence: boolean) => {
     );
 
     return withTestDoc(persistence, doc => {
-      return doc
-        .set(testDataWithTimestamps(timestamp))
-        .then(() => doc.get())
+      return setDoc(doc, testDataWithTimestamps(timestamp))
+        .then(() => getDoc(doc))
         .then(docSnap => {
           expect(docSnap.get('timestamp'))
             .to.be.an.instanceof(Timestamp)
@@ -411,25 +377,75 @@ apiDescribe('Timestamp Fields in snapshots', (persistence: boolean) => {
         });
     });
   });
+});
 
-  it('timestampsInSnapshots affects server timestamps', () => {
-    const settings = { ...DEFAULT_SETTINGS };
-    settings['timestampsInSnapshots'] = false;
-    const testDocs = {
-      a: { timestamp: FieldValue.serverTimestamp() }
-    };
+apiDescribe('`undefined` properties', persistence => {
+  const settings = { ...DEFAULT_SETTINGS };
+  settings.ignoreUndefinedProperties = true;
 
-    return withTestCollectionSettings(persistence, settings, testDocs, coll => {
-      return coll
-        .doc('a')
-        .get()
-        .then(docSnap => {
-          expect(
-            docSnap.get('timestamp', {
-              serverTimestamps: 'estimate'
-            })
-          ).to.be.an.instanceof(Date);
-        });
+  it('are ignored in set()', () => {
+    return withTestDocAndSettings(persistence, settings, async doc => {
+      await setDoc(doc, { foo: 'foo', 'bar': undefined });
+      const docSnap = await getDoc(doc);
+      expect(docSnap.data()).to.deep.equal({ foo: 'foo' });
     });
+  });
+
+  it('are ignored in set({ merge: true })', () => {
+    return withTestDocAndSettings(persistence, settings, async doc => {
+      await setDoc(doc, { foo: 'foo', bar: 'unchanged' });
+      await setDoc(doc, { foo: 'foo', bar: undefined }, { merge: true });
+      const docSnap = await getDoc(doc);
+      expect(docSnap.data()).to.deep.equal({ foo: 'foo', bar: 'unchanged' });
+    });
+  });
+
+  it('are ignored in update()', () => {
+    return withTestDocAndSettings(persistence, settings, async doc => {
+      await setDoc(doc, {});
+      await updateDoc(doc, { a: { foo: 'foo', 'bar': undefined } });
+      await updateDoc(doc, 'b', { foo: 'foo', 'bar': undefined });
+      const docSnap = await getDoc(doc);
+      expect(docSnap.data()).to.deep.equal({
+        a: { foo: 'foo' },
+        b: { foo: 'foo' }
+      });
+    });
+  });
+
+  it('are ignored in Query.where()', () => {
+    return withTestCollectionSettings(
+      persistence,
+      settings,
+      { 'doc1': { nested: { foo: 'foo' } } },
+      async coll => {
+        const filteredQuery = query(
+          coll,
+          where('nested', '==', {
+            foo: 'foo',
+            'bar': undefined
+          })
+        );
+        const querySnap = await getDocs(filteredQuery);
+        expect(querySnap.size).to.equal(1);
+      }
+    );
+  });
+
+  it('are ignored in Query.startAt()', () => {
+    return withTestCollectionSettings(
+      persistence,
+      settings,
+      { 'doc1': { nested: { foo: 'foo' } } },
+      async coll => {
+        const orderedQuery = query(
+          coll,
+          orderBy('nested'),
+          startAt({ foo: 'foo', 'bar': undefined })
+        );
+        const querySnap = await getDocs(orderedQuery);
+        expect(querySnap.size).to.equal(1);
+      }
+    );
   });
 });

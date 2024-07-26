@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,21 +16,16 @@
  */
 
 import { expect } from 'chai';
-import { primitiveComparator } from '../../../src/util/misc';
-import { SortedMap } from '../../../src/util/sorted_map';
-import { SortedSet } from '../../../src/util/sorted_set';
 
+import { primitiveComparator } from '../../../src/util/misc';
+import { diffSortedSets, SortedSet } from '../../../src/util/sorted_set';
 import { expectSetToEqual } from '../../util/helpers';
 
 describe('SortedSet', () => {
   it('keeps elements in the right order', () => {
     let set = new SortedSet<number>(primitiveComparator);
 
-    set = set
-      .add(4)
-      .add(2)
-      .add(-1)
-      .add(0);
+    set = set.add(4).add(2).add(-1).add(0);
 
     expectSetToEqual(set, [-1, 0, 2, 4]);
 
@@ -129,12 +124,7 @@ describe('SortedSet', () => {
 
   it('can find element equal or greater to provided.', () => {
     const empty = new SortedSet<number>(primitiveComparator);
-    const set = empty
-      .add(0)
-      .add(2)
-      .add(5)
-      .add(10)
-      .add(12);
+    const set = empty.add(0).add(2).add(5).add(10).add(12);
 
     expect(set.firstAfterOrEqual(2)).to.equal(2);
     expect(set.firstAfterOrEqual(3)).to.equal(5);
@@ -144,36 +134,10 @@ describe('SortedSet', () => {
 
   it('can unionWith another set.', () => {
     const empty = new SortedSet<number>(primitiveComparator);
-    const set = empty
-      .add(0)
-      .add(1)
-      .add(2);
-    const set2 = empty
-      .add(2)
-      .add(3)
-      .add(4);
-    const expected = empty
-      .add(0)
-      .add(1)
-      .add(2)
-      .add(3)
-      .add(4);
+    const set = empty.add(0).add(1).add(2);
+    const set2 = empty.add(2).add(3).add(4);
+    const expected = empty.add(0).add(1).add(2).add(3).add(4);
     expect(set.unionWith(set2)).to.deep.equal(expected);
-  });
-
-  it('can build set from map keys.', () => {
-    const empty = new SortedSet<number>(primitiveComparator);
-    const map = new SortedMap<number, string>(primitiveComparator)
-      .insert(0, 'zero')
-      .insert(2, 'two')
-      .insert(4, 'four');
-    const set = SortedSet.fromMapKeys(map);
-    expect(set).to.deep.equal(
-      empty
-        .add(0)
-        .add(2)
-        .add(4)
-    );
   });
 
   it('returns indexes of elements', () => {
@@ -192,4 +156,63 @@ describe('SortedSet', () => {
     expect(set.indexOf(4)).to.equal(-1);
     expect(set.indexOf(5)).to.equal(4);
   });
+
+  it('diff sorted sets with missing element', () => {
+    const { added, removed } = computeDiffs(['a', 'b', 'c'], ['a', 'b']);
+    expect(added).to.have.members([]);
+    expect(removed).to.have.members(['c']);
+  });
+
+  it('diff sorted sets with added element', () => {
+    const { added, removed } = computeDiffs(['a', 'b'], ['a', 'b', 'c']);
+    expect(added).to.have.members(['c']);
+    expect(removed).to.have.members([]);
+  });
+
+  it('diff sorted sets with empty sets', () => {
+    {
+      const { added, removed } = computeDiffs(['a'], []);
+      expect(added).to.have.members([]);
+      expect(removed).to.have.members(['a']);
+    }
+    {
+      const { added, removed } = computeDiffs([], ['a']);
+      expect(added).to.have.members(['a']);
+      expect(removed).to.have.members([]);
+    }
+    {
+      const { added, removed } = computeDiffs([], []);
+      expect(added).to.have.members([]);
+      expect(removed).to.have.members([]);
+    }
+  });
+
+  function computeDiffs(
+    before: string[],
+    after: string[]
+  ): { added: string[]; removed: string[] } {
+    let beforeSorted = new SortedSet<string>(primitiveComparator);
+    let afterSorted = new SortedSet<string>(primitiveComparator);
+    before.forEach(v => {
+      beforeSorted = beforeSorted.add(v);
+    });
+    after.forEach(v => {
+      afterSorted = afterSorted.add(v);
+    });
+
+    const added: string[] = [];
+    const removed: string[] = [];
+    diffSortedSets(
+      beforeSorted,
+      afterSorted,
+      primitiveComparator,
+      v => {
+        added.push(v);
+      },
+      v => {
+        removed.push(v);
+      }
+    );
+    return { added, removed };
+  }
 });

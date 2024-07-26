@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,33 +20,6 @@ const path = require('path');
 const webpackTestConfig = require('./webpack.test');
 const { argv } = require('yargs');
 
-/**
- * Custom SauceLabs Launchers
- */
-const sauceLabsBrowsers = {
-  desktop_Safari: {
-    base: 'SauceLabs',
-    browserName: 'safari',
-    platform: 'OS X 10.11',
-    version: '9.0'
-  },
-  iOS_Safari: {
-    appiumVersion: '1.6.5',
-    base: 'SauceLabs',
-    browserName: 'Safari',
-    deviceName: 'iPhone Simulator',
-    deviceOrientation: 'portrait',
-    platformName: 'iOS',
-    platformVersion: '9.0'
-  },
-  IE_11: {
-    base: 'SauceLabs',
-    browserName: 'internet explorer',
-    platform: 'Windows 8.1',
-    version: '11'
-  }
-};
-
 const config = {
   // disable watcher
   autoWatch: false,
@@ -57,14 +30,17 @@ const config = {
   // preprocess matching files before serving them to the browser
   // available preprocessors:
   // https://npmjs.org/browse/keyword/karma-preprocessor
-  preprocessors: { 'test/**/*.ts': ['webpack', 'sourcemap'] },
+  preprocessors: {
+    'test/**/*.ts': ['webpack', 'sourcemap'],
+    'src/**/*.test.ts': ['webpack', 'sourcemap']
+  },
 
   mime: { 'text/x-typescript': ['ts', 'tsx'] },
 
   // test results reporter to use
   // possible values: 'dots', 'progress'
   // available reporters: https://npmjs.org/browse/keyword/karma-reporter
-  reporters: ['spec', 'coverage-istanbul' /*, 'saucelabs' */],
+  reporters: ['mocha', 'coverage-istanbul'],
 
   // web server port
   port: 8089,
@@ -81,23 +57,14 @@ const config = {
   // changes
   autoWatch: false,
 
-  customLaunchers: sauceLabsBrowsers,
-
   // start these browsers
   // available browser launchers:
   // https://npmjs.org/browse/keyword/karma-launcher
-  browsers: ['ChromeHeadless'],
+  browsers: process.env?.BROWSERS?.split(',') ?? ['ChromeHeadless'],
 
   webpack: webpackTestConfig,
 
   webpackMiddleware: { quiet: true, stats: { colors: true } },
-
-  sauceLabs: {
-    tunnelIdentifier: process.env.TRAVIS_JOB_NUMBER,
-    username: process.env.SAUCE_USERNAME,
-    accessKey: process.env.SAUCE_ACCESS_KEY,
-    startConnect: false
-  },
 
   singleRun: false,
 
@@ -117,9 +84,8 @@ const config = {
   }
 };
 
-// In CI environment, use saucelabs to test
-if (false /* process.env.TRAVIS */) {
-  config.browsers = [...config.browsers, ...Object.keys(sauceLabsBrowsers)];
-}
+config.mochaReporter = {
+  showDiff: true
+};
 
 module.exports = config;

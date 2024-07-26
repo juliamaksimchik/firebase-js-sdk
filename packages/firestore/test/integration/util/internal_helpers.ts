@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,86 +15,100 @@
  * limitations under the License.
  */
 
-import * as firestore from '@firebase/firestore-types';
-
-import { DatabaseId, DatabaseInfo } from '../../../src/core/database_info';
-import { Datastore } from '../../../src/remote/datastore';
-
 import {
   CredentialChangeListener,
   CredentialsProvider,
-  EmptyCredentialsProvider
+  EmptyAppCheckTokenProvider,
+  EmptyAuthCredentialsProvider
 } from '../../../src/api/credentials';
-import { Firestore } from '../../../src/api/database';
-import { PlatformSupport } from '../../../src/platform/platform';
-import { AsyncQueue } from '../../../src/util/async_queue';
-import {
-  DEFAULT_PROJECT_ID,
-  DEFAULT_SETTINGS,
-  withTestDbsSettings
-} from './helpers';
+import { cloneLongPollingOptions } from '../../../src/api/long_polling_options';
 import { User } from '../../../src/auth/user';
+import { DatabaseId, DatabaseInfo } from '../../../src/core/database_info';
+import { newConnection } from '../../../src/platform/connection';
+import { newSerializer } from '../../../src/platform/serializer';
+import { newDatastore, Datastore } from '../../../src/remote/datastore';
+import { AsyncQueue } from '../../../src/util/async_queue';
+import { AsyncQueueImpl } from '../../../src/util/async_queue_impl';
+import { TestBundleBuilder } from '../../unit/util/bundle_data';
+import { collectionReference } from '../../util/api_helpers';
+import { key } from '../../util/helpers';
 
-/** Helper to retrieve the AsyncQueue for a give FirebaseFirestore instance. */
-export function asyncQueue(db: firestore.FirebaseFirestore): AsyncQueue {
-  return (db as Firestore)._queue;
+import {
+  Firestore,
+  DocumentData,
+  PrivateSettings,
+  query,
+  orderBy,
+  limit,
+  limitToLast
+} from './firebase_export';
+import { withTestDbsSettings, PersistenceMode } from './helpers';
+import { DEFAULT_PROJECT_ID, DEFAULT_SETTINGS } from './settings';
+
+export function asyncQueue(db: Firestore): AsyncQueueImpl {
+  return db._queue as AsyncQueueImpl;
 }
 
 export function getDefaultDatabaseInfo(): DatabaseInfo {
   return new DatabaseInfo(
     new DatabaseId(DEFAULT_PROJECT_ID),
+    'test-app-id',
     'persistenceKey',
     DEFAULT_SETTINGS.host!,
     !!DEFAULT_SETTINGS.ssl,
-    !!DEFAULT_SETTINGS.experimentalForceLongPolling
+    !!DEFAULT_SETTINGS.experimentalForceLongPolling,
+    !!DEFAULT_SETTINGS.experimentalAutoDetectLongPolling,
+    cloneLongPollingOptions(
+      DEFAULT_SETTINGS.experimentalLongPollingOptions ?? {}
+    ),
+    /*use FetchStreams= */ false
   );
 }
 
 export function withTestDatastore(
   fn: (datastore: Datastore) => Promise<void>,
-  queue?: AsyncQueue,
-  credentialsProvider?: CredentialsProvider
+  authCredentialsProvider: CredentialsProvider<User> = new EmptyAuthCredentialsProvider(),
+  appCheckTokenProvider: CredentialsProvider<string> = new EmptyAppCheckTokenProvider()
 ): Promise<void> {
   const databaseInfo = getDefaultDatabaseInfo();
-  return PlatformSupport.getPlatform()
-    .loadConnection(databaseInfo)
-    .then(conn => {
-      const serializer = PlatformSupport.getPlatform().newSerializer(
-        databaseInfo.databaseId
-      );
-      const datastore = new Datastore(
-        queue || new AsyncQueue(),
-        conn,
-        credentialsProvider || new EmptyCredentialsProvider(),
-        serializer
-      );
-
-      return fn(datastore);
-    });
+  const connection = newConnection(databaseInfo);
+  const serializer = newSerializer(databaseInfo.databaseId);
+  const datastore = newDatastore(
+    authCredentialsProvider,
+    appCheckTokenProvider,
+    connection,
+    serializer
+  );
+  return fn(datastore);
 }
 
-export class MockCredentialsProvider extends EmptyCredentialsProvider {
-  private listener: CredentialChangeListener | null = null;
+export class MockAuthCredentialsProvider extends EmptyAuthCredentialsProvider {
+  private listener: CredentialChangeListener<User> | null = null;
+  private asyncQueue: AsyncQueue | null = null;
 
   triggerUserChange(newUser: User): void {
-    this.listener!(newUser);
+    this.asyncQueue!.enqueueRetryable(async () => this.listener!(newUser));
   }
 
-  setChangeListener(listener: CredentialChangeListener): void {
-    super.setChangeListener(listener);
+  start(
+    asyncQueue: AsyncQueue,
+    listener: CredentialChangeListener<User>
+  ): void {
+    super.start(asyncQueue, listener);
+    this.asyncQueue = asyncQueue;
     this.listener = listener;
   }
 }
 
 export function withMockCredentialProviderTestDb(
-  persistence: boolean,
+  persistence: PersistenceMode,
   fn: (
-    db: firestore.FirebaseFirestore,
-    mockCredential: MockCredentialsProvider
+    db: Firestore,
+    mockCredential: MockAuthCredentialsProvider
   ) => Promise<void>
 ): Promise<void> {
-  const mockCredentialsProvider = new MockCredentialsProvider();
-  const settings = {
+  const mockCredentialsProvider = new MockAuthCredentialsProvider();
+  const settings: PrivateSettings = {
     ...DEFAULT_SETTINGS,
     credentials: { client: mockCredentialsProvider, type: 'provider' }
   };
@@ -107,4 +121,58 @@ export function withMockCredentialProviderTestDb(
       return fn(db, mockCredentialsProvider);
     }
   );
+}
+
+/**
+ * Returns a testing bundle string for the given projectId.
+ *
+ * The function is not referenced by bundle.test.ts, instead the bundle string
+ * used there is generated by this function and copied over there. The reason is
+ * this function accesses SDK internals, which is not available in
+ * test:minified.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function bundleWithTestDocsAndQueries(
+  projectId: string = 'test-project'
+): string {
+  const testDocs: { [key: string]: DocumentData } = {
+    a: { k: { stringValue: 'a' }, bar: { integerValue: 1 } },
+    b: { k: { stringValue: 'b' }, bar: { integerValue: 2 } }
+  };
+
+  const a = key('coll-1/a');
+  const b = key('coll-1/b');
+  const builder = new TestBundleBuilder(new DatabaseId(projectId));
+
+  builder.addNamedQuery(
+    'limit',
+    { seconds: 1000, nanos: 9999 },
+    query(collectionReference('coll-1'), orderBy('bar', 'desc'), limit(1))
+      ._query
+  );
+  builder.addNamedQuery(
+    'limit-to-last',
+    { seconds: 1000, nanos: 9999 },
+    query(collectionReference('coll-1'), orderBy('bar', 'desc'), limitToLast(1))
+      ._query
+  );
+
+  builder.addDocumentMetadata(a, { seconds: 1000, nanos: 9999 }, true);
+  builder.addDocument(
+    a,
+    { seconds: 1, nanos: 9 },
+    { seconds: 1, nanos: 9 },
+    testDocs.a
+  );
+  builder.addDocumentMetadata(b, { seconds: 1000, nanos: 9999 }, true);
+  builder.addDocument(
+    b,
+    { seconds: 1, nanos: 9 },
+    { seconds: 1, nanos: 9 },
+    testDocs.b
+  );
+
+  return builder
+    .build('test-bundle', { seconds: 1001, nanos: 9999 })
+    .toString();
 }

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ export function jsonEval(str: string): unknown {
 
 /**
  * Returns JSON representing a javascript object.
- * @param {*} data Javascript object to be stringified.
+ * @param {*} data JavaScript object to be stringified.
  * @return {string} The JSON contents of the object.
  */
 export function stringify(data: unknown): string {

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2018 Google Inc.
+ * Copyright 2018 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 
 import { Query } from '../../../src/core/query';
 import { Document } from '../../../src/model/document';
-import { doc, filter, orderBy, path } from '../../util/helpers';
+import { doc, filter, orderBy, query } from '../../util/helpers';
 
 import { describeSpec, specTest } from './describe_spec';
 import { spec } from './spec_builder';
@@ -30,7 +30,7 @@ describeSpec(
   ['benchmark'],
   () => {
     specTest('Insert a new document', [], () => {
-      const steps = spec().withGCEnabled(false);
+      const steps = spec().ensureManualLruGC();
       for (let i = 0; i < STEP_COUNT; ++i) {
         steps
           .userSets(`collection/{i}`, { doc: i })
@@ -44,33 +44,30 @@ describeSpec(
       [],
       () => {
         let currentVersion = 1;
-        const steps = spec().withGCEnabled(false);
+        const steps = spec().ensureManualLruGC();
 
         for (let i = 0; i < STEP_COUNT; ++i) {
-          const query = Query.atPath(path(`collection/${i}`));
-          const docLocal = doc(
-            `collection/${i}`,
-            0,
-            { doc: i },
-            { hasLocalMutations: true }
-          );
+          const query1 = query(`collection/${i}`);
+          const docLocal = doc(`collection/${i}`, 0, {
+            doc: i
+          }).setHasLocalMutations();
           const docRemote = doc(`collection/${i}`, ++currentVersion, {
             doc: i
           });
 
           steps
-            .userListens(query)
+            .userListens(query1)
             .userSets(`collection/${i}`, { doc: i })
-            .expectEvents(query, {
+            .expectEvents(query1, {
               added: [docLocal],
               fromCache: true,
               hasPendingWrites: true
             })
             .writeAcks(`collection/${i}`, docRemote.version.toMicroseconds())
-            .watchAcksFull(query, ++currentVersion, docRemote)
-            .expectEvents(query, { metadata: [docRemote] })
-            .userUnlistens(query)
-            .watchRemoves(query);
+            .watchAcksFull(query1, ++currentVersion, docRemote)
+            .expectEvents(query1, { metadata: [docRemote] })
+            .userUnlistens(query1)
+            .watchRemoves(query1);
         }
         return steps;
       }
@@ -78,27 +75,25 @@ describeSpec(
 
     specTest('Write 100 documents and raise a snapshot', [], () => {
       const cachedDocumentCount = 100;
-
-      const query = Query.atPath(path(`collection`)).addOrderBy(orderBy('v'));
-      const steps = spec().withGCEnabled(false);
+      9;
+      const query1 = query(`collection`, orderBy('v'));
+      const steps = spec().ensureManualLruGC();
       const docs: Document[] = [];
 
       for (let i = 0; i < cachedDocumentCount; ++i) {
         steps.userSets(`collection/${i}`, { v: i });
-        docs.push(
-          doc(`collection/${i}`, 0, { v: i }, { hasLocalMutations: true })
-        );
+        docs.push(doc(`collection/${i}`, 0, { v: i }).setHasLocalMutations());
       }
 
       for (let i = 1; i <= STEP_COUNT; ++i) {
         steps
-          .userListens(query)
-          .expectEvents(query, {
+          .userListens(query1)
+          .expectEvents(query1, {
             added: docs,
             fromCache: true,
             hasPendingWrites: true
           })
-          .userUnlistens(query);
+          .userUnlistens(query1);
       }
 
       return steps;
@@ -106,7 +101,7 @@ describeSpec(
 
     specTest('Update a single document', [], () => {
       const steps = spec()
-        .withGCEnabled(false)
+        .ensureManualLruGC()
         .userSets(`collection/doc`, { v: 0 });
 
       for (let i = 1; i <= STEP_COUNT; ++i) {
@@ -121,52 +116,46 @@ describeSpec(
       'Update a document and wait for snapshot with existing listen',
       [],
       () => {
-        const query = Query.atPath(path(`collection/doc`));
+        const query1 = query(`collection/doc`);
 
         let currentVersion = 1;
-        const steps = spec().withGCEnabled(false);
+        const steps = spec().ensureManualLruGC();
 
-        let docLocal = doc(
-          `collection/doc`,
-          0,
-          { v: 0 },
-          { hasLocalMutations: true }
-        );
+        let docLocal = doc(`collection/doc`, 0, {
+          v: 0
+        }).setHasLocalMutations();
         let docRemote = doc(`collection/doc`, ++currentVersion, { v: 0 });
         let lastRemoteVersion = currentVersion;
 
         steps
-          .userListens(query)
+          .userListens(query1)
           .userSets(`collection/doc`, { v: 0 })
-          .expectEvents(query, {
+          .expectEvents(query1, {
             added: [docLocal],
             fromCache: true,
             hasPendingWrites: true
           })
           .writeAcks(`collection/doc`, docRemote.version.toMicroseconds())
-          .watchAcksFull(query, ++currentVersion, docRemote)
-          .expectEvents(query, { metadata: [docRemote] });
+          .watchAcksFull(query1, ++currentVersion, docRemote)
+          .expectEvents(query1, { metadata: [docRemote] });
 
         for (let i = 1; i <= STEP_COUNT; ++i) {
-          docLocal = doc(
-            `collection/doc`,
-            lastRemoteVersion,
-            { v: i },
-            { hasLocalMutations: true }
-          );
+          docLocal = doc(`collection/doc`, lastRemoteVersion, {
+            v: i
+          }).setHasLocalMutations();
           docRemote = doc(`collection/doc`, ++currentVersion, { v: i });
           lastRemoteVersion = currentVersion;
 
           steps
             .userPatches(`collection/doc`, { v: i })
-            .expectEvents(query, {
+            .expectEvents(query1, {
               modified: [docLocal],
               hasPendingWrites: true
             })
             .writeAcks(`collection/doc`, docRemote.version.toMicroseconds())
-            .watchSends({ affects: [query] }, docRemote)
+            .watchSends({ affects: [query1] }, docRemote)
             .watchSnapshots(++currentVersion)
-            .expectEvents(query, { metadata: [docRemote] });
+            .expectEvents(query1, { metadata: [docRemote] });
         }
         return steps;
       }
@@ -178,15 +167,15 @@ describeSpec(
       () => {
         const documentsPerStep = 100;
 
-        const query = Query.atPath(path(`collection`)).addOrderBy(orderBy('v'));
-        const steps = spec().withGCEnabled(false);
+        const query1 = query(`collection`, orderBy('v'));
+        const steps = spec().ensureManualLruGC();
 
         let currentVersion = 1;
 
         steps
-          .userListens(query)
-          .watchAcksFull(query, currentVersion)
-          .expectEvents(query, {});
+          .userListens(query1)
+          .watchAcksFull(query1, currentVersion)
+          .expectEvents(query1, {});
 
         for (let i = 1; i <= STEP_COUNT; ++i) {
           const docs: Document[] = [];
@@ -200,9 +189,9 @@ describeSpec(
           const changeType = i === 1 ? 'added' : 'modified';
 
           steps
-            .watchSends({ affects: [query] }, ...docs)
+            .watchSends({ affects: [query1] }, ...docs)
             .watchSnapshots(++currentVersion)
-            .expectEvents(query, { [changeType]: docs });
+            .expectEvents(query1, { [changeType]: docs });
         }
 
         return steps;
@@ -217,11 +206,11 @@ describeSpec(
         const documentsPerStep = 100;
 
         let currentVersion = 1;
-        const steps = spec().withGCEnabled(false);
+        const steps = spec().ensureManualLruGC();
 
         for (let i = 1; i <= STEP_COUNT; ++i) {
           const collPath = `collection/${i}/coll`;
-          const query = Query.atPath(path(collPath)).addOrderBy(orderBy('v'));
+          const query1 = query(collPath, orderBy('v'));
 
           const docs: Document[] = [];
           for (let j = 0; j < documentsPerStep; ++j) {
@@ -229,17 +218,19 @@ describeSpec(
           }
 
           steps
-            .userListens(query)
-            .watchAcksFull(query, ++currentVersion, ...docs)
-            .expectEvents(query, { added: docs })
-            .userUnlistens(query)
-            .watchRemoves(query)
-            .userListens(query, 'resume-token-' + currentVersion)
-            .expectEvents(query, { added: docs, fromCache: true })
-            .watchAcksFull(query, ++currentVersion)
-            .expectEvents(query, {})
-            .userUnlistens(query)
-            .watchRemoves(query);
+            .userListens(query1)
+            .watchAcksFull(query1, ++currentVersion, ...docs)
+            .expectEvents(query1, { added: docs })
+            .userUnlistens(query1)
+            .watchRemoves(query1)
+            .userListens(query1, {
+              resumeToken: 'resume-token-' + currentVersion
+            })
+            .expectEvents(query1, { added: docs, fromCache: true })
+            .watchAcksFull(query1, ++currentVersion)
+            .expectEvents(query1, {})
+            .userUnlistens(query1)
+            .watchRemoves(query1);
         }
 
         return steps;
@@ -250,7 +241,7 @@ describeSpec(
       const queriesPerStep = 25;
 
       let currentVersion = 1;
-      const steps = spec().withGCEnabled(false);
+      const steps = spec().ensureManualLruGC();
 
       for (let i = 1; i <= STEP_COUNT; ++i) {
         // We use a different subcollection for each iteration to ensure
@@ -265,11 +256,9 @@ describeSpec(
         // Create `queriesPerStep` listens, each against collPath but with a
         // unique query constraint.
         for (let j = 0; j < queriesPerStep; ++j) {
-          const query = Query.atPath(path(collPath)).addFilter(
-            filter('val', '<=', j)
-          );
-          queries.push(query);
-          steps.userListens(query).watchAcks(query);
+          const query1 = query(collPath, filter('val', '<=', j));
+          queries.push(query1);
+          steps.userListens(query1).watchAcks(query1);
         }
 
         steps
@@ -301,11 +290,11 @@ describeSpec(
         const matchingCount = 10;
         const queryCount = 10;
 
-        const steps = spec().withGCEnabled(false);
+        const steps = spec().ensureManualLruGC();
 
         const collPath = `collection`;
-        const query = Query.atPath(path(collPath)).addOrderBy(orderBy('val'));
-        steps.userListens(query).watchAcks(query);
+        const query1 = query(collPath, orderBy('val'));
+        steps.userListens(query1).watchAcks(query1);
 
         const allDocs: Document[] = [];
 
@@ -316,21 +305,23 @@ describeSpec(
             val: j
           });
           allDocs.push(document);
-          steps.watchSends({ affects: [query] }, document);
+          steps.watchSends({ affects: [query1] }, document);
         }
 
-        steps.watchCurrents(query, `current-version-${++currentVersion}`);
+        steps.watchCurrents(query1, `current-version-${++currentVersion}`);
         steps.watchSnapshots(currentVersion);
-        steps.expectEvents(query, { added: allDocs });
-        steps.userUnlistens(query).watchRemoves(query);
+        steps.expectEvents(query1, { added: allDocs });
+        steps.userUnlistens(query1).watchRemoves(query1);
 
         for (let i = 1; i <= STEP_COUNT; ++i) {
           // Create `queryCount` listens, each against collPath but with a
           // unique query constraint.
           for (let j = 0; j < queryCount; ++j) {
-            const partialQuery = Query.atPath(path(collPath))
-              .addFilter(filter('val', '>=', j * matchingCount))
-              .addFilter(filter('val', '<', (j + 1) * matchingCount));
+            const partialQuery = query(
+              collPath,
+              filter('val', '>=', j * matchingCount),
+              filter('val', '<', (j + 1) * matchingCount)
+            );
             steps.userListens(partialQuery);
             steps.expectEvents(partialQuery, {
               added: allDocs.slice(j * matchingCount, (j + 1) * matchingCount),

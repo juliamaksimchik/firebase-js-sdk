@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,11 @@
  */
 
 import { expect } from 'chai';
-import * as EncodedResourcePath from '../../../src/local/encoded_resource_path';
+
+import {
+  decodeResourcePath,
+  encodeResourcePath
+} from '../../../src/local/encoded_resource_path';
 import { PersistencePromise } from '../../../src/local/persistence_promise';
 import {
   SimpleDb,
@@ -50,18 +54,9 @@ describe('EncodedResourcePath', () => {
 
   const dbName = 'resource-path-tests';
 
-  beforeEach(() => {
-    return SimpleDb.delete(dbName)
-      .then(() => {
-        return SimpleDb.openOrCreate(
-          dbName,
-          1,
-          new EncodedResourcePathSchemaConverter()
-        );
-      })
-      .then(simpleDb => {
-        db = simpleDb;
-      });
+  beforeEach(async () => {
+    await SimpleDb.delete(dbName);
+    db = new SimpleDb(dbName, 1, new EncodedResourcePathSchemaConverter());
   });
 
   afterEach(() => {
@@ -71,7 +66,7 @@ describe('EncodedResourcePath', () => {
   after(() => SimpleDb.delete(dbName));
 
   it('encodes resource paths', async () => {
-    await assertEncoded(sep, ResourcePath.EMPTY_PATH);
+    await assertEncoded(sep, ResourcePath.emptyPath());
     await assertEncoded('\u0001\u0010' + sep, path('\0'));
     await assertEncoded('\u0002' + sep, path('\u0002'));
 
@@ -99,7 +94,7 @@ describe('EncodedResourcePath', () => {
 
   it('orders resource paths', async () => {
     await assertOrdered([
-      ResourcePath.EMPTY_PATH,
+      ResourcePath.emptyPath(),
       path('\0'),
       path('\u0001'),
       path('\u0002'),
@@ -114,7 +109,7 @@ describe('EncodedResourcePath', () => {
     ]);
 
     await assertOrdered([
-      ResourcePath.EMPTY_PATH,
+      ResourcePath.emptyPath(),
       path('foo'),
       new ResourcePath(['foo', '']),
       new ResourcePath(['foo', 'bar']),
@@ -124,29 +119,12 @@ describe('EncodedResourcePath', () => {
       path('food')
     ]);
   });
-
-  it('prefixes successors correctly', async () => {
-    assertPrefixSuccessorEquals('\u0001\u0002', ResourcePath.EMPTY_PATH);
-    assertPrefixSuccessorEquals(
-      'foo' + sep + 'bar\u0001\u0002',
-      path('foo/bar')
-    );
-  });
 });
 
-function assertPrefixSuccessorEquals(
-  expected: string,
-  path: ResourcePath
-): void {
-  expect(
-    EncodedResourcePath.prefixSuccessor(EncodedResourcePath.encode(path))
-  ).to.deep.equal(expected);
-}
-
 function assertEncoded(expected: string, path: ResourcePath): Promise<void> {
-  const encoded = EncodedResourcePath.encode(path);
+  const encoded = encodeResourcePath(path);
   expect(encoded).to.deep.equal(expected);
-  const decoded = EncodedResourcePath.decode(encoded);
+  const decoded = decodeResourcePath(encoded);
   expect(decoded.toArray()).to.deep.equal(path.toArray());
 
   let store: SimpleDbStore<string, boolean>;
@@ -168,7 +146,7 @@ async function assertOrdered(paths: ResourcePath[]): Promise<void> {
   // Compute the encoded forms of all the given paths
   const encoded: string[] = [];
   for (const path of paths) {
-    encoded.push(EncodedResourcePath.encode(path));
+    encoded.push(encodeResourcePath(path));
   }
 
   // Insert those all into a table, but backwards
@@ -218,7 +196,12 @@ function runTransaction<T>(
     transaction: SimpleDbTransaction
   ) => PersistencePromise<T>
 ): Promise<T> {
-  return db.runTransaction<T>('readwrite', ['test'], txn => {
-    return fn(txn.store<string, boolean>('test'), txn);
-  });
+  return db.runTransaction<T>(
+    'EncodedResourcePathTests',
+    'readwrite',
+    ['test'],
+    txn => {
+      return fn(txn.store<string, boolean>('test'), txn);
+    }
+  );
 }

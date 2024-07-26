@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,13 @@
  * limitations under the License.
  */
 
-import { use } from 'chai';
-import * as chaiAsPromised from 'chai-as-promised';
+import chaiAsPromised from 'chai-as-promised';
+import sinonChai from 'sinon-chai';
+
+import { dbDelete } from '../internals/idb-manager';
+import { deleteDB } from 'idb';
 import { restore } from 'sinon';
-import * as sinonChai from 'sinon-chai';
-import { dbDelete } from '../helpers/idb-manager';
-import { deleteDb } from 'idb';
+import { use } from 'chai';
 
 use(chaiAsPromised);
 use(sinonChai);
@@ -28,5 +29,5 @@ use(sinonChai);
 afterEach(async () => {
   restore();
   await dbDelete();
-  await deleteDb('fcm_token_details_db');
+  await deleteDB('fcm_token_details_db');
 });

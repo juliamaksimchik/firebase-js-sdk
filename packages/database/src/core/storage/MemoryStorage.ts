@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,8 +20,6 @@ import { contains } from '@firebase/util';
 /**
  * An in-memory storage implementation that matches the API of DOMStorageWrapper
  * (TODO: create interface for both to implement).
- *
- * @constructor
  */
 export class MemoryStorage {
   private cache_: { [k: string]: unknown } = {};

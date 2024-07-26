@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2018 Google Inc.
+ * Copyright 2018 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,11 @@
  */
 
 import { expect } from 'chai';
+
 import { Timestamp } from '../../../src/api/timestamp';
 import { User } from '../../../src/auth/user';
 import { ListenSequence } from '../../../src/core/listen_sequence';
-import { Query } from '../../../src/core/query';
-import { SnapshotVersion } from '../../../src/core/snapshot_version';
+import { queryToTarget } from '../../../src/core/query';
 import { ListenSequenceNumber, TargetId } from '../../../src/core/types';
 import { IndexedDbPersistence } from '../../../src/local/indexeddb_persistence';
 import {
@@ -30,18 +30,14 @@ import {
   LruParams
 } from '../../../src/local/lru_garbage_collector';
 import { MutationQueue } from '../../../src/local/mutation_queue';
-import {
-  Persistence,
-  PersistenceTransaction
-} from '../../../src/local/persistence';
-
+import { Persistence } from '../../../src/local/persistence';
 import { PersistencePromise } from '../../../src/local/persistence_promise';
-import { TargetCache } from '../../../src/local/target_cache';
-import { ReferenceSet } from '../../../src/local/reference_set';
+import { PersistenceTransaction } from '../../../src/local/persistence_transaction';
 import { RemoteDocumentCache } from '../../../src/local/remote_document_cache';
+import { TargetCache } from '../../../src/local/target_cache';
 import { TargetData, TargetPurpose } from '../../../src/local/target_data';
 import { documentKeySet } from '../../../src/model/collections';
-import { Document, MaybeDocument } from '../../../src/model/document';
+import { MutableDocument } from '../../../src/model/document';
 import { DocumentKey } from '../../../src/model/document_key';
 import {
   Mutation,
@@ -49,10 +45,12 @@ import {
   SetMutation
 } from '../../../src/model/mutation';
 import { AsyncQueue } from '../../../src/util/async_queue';
-import { path, wrapObject } from '../../util/helpers';
-import { SortedMap } from '../../../src/util/sorted_map';
-import * as PersistenceTestHelpers from './persistence_test_helpers';
+import { newAsyncQueue } from '../../../src/util/async_queue_impl';
 import { primitiveComparator } from '../../../src/util/misc';
+import { SortedMap } from '../../../src/util/sorted_map';
+import { doc, key, query, wrapObject } from '../../util/helpers';
+
+import * as PersistenceTestHelpers from './persistence_test_helpers';
 
 describe('IndexedDbLruDelegate', () => {
   if (!IndexedDbPersistence.isAvailable()) {
@@ -74,7 +72,7 @@ describe('MemoryLruDelegate', () => {
 function genericLruGarbageCollectorTests(
   newPersistence: (params: LruParams, queue: AsyncQueue) => Promise<Persistence>
 ): void {
-  const queue = new AsyncQueue();
+  const queue = newAsyncQueue();
 
   // We need to initialize a few counters so that we can use them when we
   // auto-generate things like targets and documents. Pick arbitrary values
@@ -106,33 +104,37 @@ function genericLruGarbageCollectorTests(
   async function initializeTestResources(
     params: LruParams = LruParams.DEFAULT
   ): Promise<void> {
-    if (persistence && persistence.started) {
-      await queue.enqueue(async () => {
+    await queue.enqueue(async () => {
+      if (persistence && persistence.started) {
         await persistence.shutdown();
         await PersistenceTestHelpers.clearTestPersistence();
-      });
-    }
+      }
+    });
     lruParams = params;
     persistence = await newPersistence(params, queue);
+    const indexManager = persistence.getIndexManager(new User('user'));
     targetCache = persistence.getTargetCache();
-    mutationQueue = persistence.getMutationQueue(new User('user'));
+    mutationQueue = persistence.getMutationQueue(
+      new User('user'),
+      indexManager
+    );
     documentCache = persistence.getRemoteDocumentCache();
+    documentCache.setIndexManager(indexManager);
     initialSequenceNumber = await persistence.runTransaction(
       'highest sequence number',
       'readwrite',
       txn => PersistencePromise.resolve(txn.currentSequenceNumber)
     );
     const referenceDelegate = persistence.referenceDelegate;
-    referenceDelegate.setInMemoryPins(new ReferenceSet());
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    garbageCollector = ((referenceDelegate as any) as LruDelegate)
+    garbageCollector = (referenceDelegate as any as LruDelegate)
       .garbageCollector;
   }
 
   function nextTargetData(sequenceNumber: ListenSequenceNumber): TargetData {
     const targetId = ++previousTargetId;
     return new TargetData(
-      Query.atPath(path('path' + targetId)).toTarget(),
+      queryToTarget(query('path' + targetId)),
       targetId,
       TargetPurpose.Listen,
       sequenceNumber
@@ -140,7 +142,7 @@ function genericLruGarbageCollectorTests(
   }
 
   function nextTestDocumentKey(): DocumentKey {
-    return DocumentKey.fromPathString('docs/doc_' + ++previousDocNum);
+    return key('docs/doc_' + ++previousDocNum);
   }
 
   function emptyTargetDataMap(): SortedMap<TargetId, TargetData> {
@@ -176,7 +178,7 @@ function genericLruGarbageCollectorTests(
     txn: PersistenceTransaction,
     key: DocumentKey
   ): PersistencePromise<void> {
-    return persistence.referenceDelegate.removeMutationReference(txn, key);
+    return persistence.referenceDelegate.markPotentiallyOrphaned(txn, key);
   }
 
   function markDocumentEligibleForGC(key: DocumentKey): Promise<void> {
@@ -242,23 +244,21 @@ function genericLruGarbageCollectorTests(
     );
   }
 
-  function nextTestDocument(): Document {
+  function nextTestDocument(): MutableDocument {
     const key = nextTestDocumentKey();
-    return new Document(
-      key,
-      SnapshotVersion.fromMicroseconds(1000),
-      {},
-      wrapObject({ foo: 3, bar: false })
-    );
+    return doc(key.toString(), 1000, {
+      foo: 3,
+      bar: false
+    });
   }
 
   function saveDocument(
     txn: PersistenceTransaction,
-    doc: MaybeDocument
+    doc: MutableDocument
   ): PersistencePromise<void> {
     const changeBuffer = documentCache.newChangeBuffer();
     return changeBuffer.getEntry(txn, doc.key).next(() => {
-      changeBuffer.addEntry(doc, doc.version);
+      changeBuffer.addEntry(doc);
       return changeBuffer.apply(txn);
     });
   }
@@ -274,7 +274,7 @@ function genericLruGarbageCollectorTests(
     return new SetMutation(
       key,
       wrapObject({ baz: 'hello', world: 2 }),
-      Precondition.NONE
+      Precondition.none()
     );
   }
 
@@ -529,7 +529,7 @@ function genericLruGarbageCollectorTests(
       toBeRemoved.forEach(docKey => {
         p = p.next(() => {
           return documentCache.getEntry(txn, docKey).next(maybeDoc => {
-            expect(maybeDoc).to.be.null;
+            expect(maybeDoc.isValidDocument()).to.be.false;
           });
         });
       });
@@ -779,13 +779,11 @@ function genericLruGarbageCollectorTests(
       'Update a doc in the middle target',
       'readwrite',
       txn => {
-        const doc = new Document(
-          middleDocToUpdate,
-          SnapshotVersion.fromMicroseconds(2000),
-          {},
-          wrapObject({ foo: 4, bar: true })
-        );
-        return saveDocument(txn, doc).next(() => {
+        const docA = doc(middleDocToUpdate.toString(), 2000, {
+          foo: 4,
+          bar: true
+        });
+        return saveDocument(txn, docA).next(() => {
           return updateTargetInTransaction(txn, middleTarget);
         });
       }
@@ -836,7 +834,7 @@ function genericLruGarbageCollectorTests(
         p = p
           .next(() => documentCache.getEntry(txn, key))
           .next(maybeDoc => {
-            expect(maybeDoc).to.be.null;
+            expect(maybeDoc.isValidDocument()).to.be.false;
           });
       });
       expectedRetained.forEach(key => {

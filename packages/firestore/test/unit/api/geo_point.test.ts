@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
  */
 
 import { expect } from 'chai';
+
 import { GeoPoint } from '../../../src/api/geo_point';
 import {
   expectCorrectComparisons,
@@ -99,5 +100,20 @@ describe('GeoPoint', () => {
     expectNotEqual(new GeoPoint(1, 2), new GeoPoint(2, 2));
     expectNotEqual(new GeoPoint(1, 2), new GeoPoint(1, 1));
     expectNotEqual(new GeoPoint(1, 2), new GeoPoint(2, 1));
+  });
+
+  it('serializes to JSON', () => {
+    expect(new GeoPoint(1, 2).toJSON()).to.deep.equal({
+      latitude: 1,
+      longitude: 2
+    });
+    expect(new GeoPoint(0, 0).toJSON()).to.deep.equal({
+      latitude: 0,
+      longitude: 0
+    });
+    expect(new GeoPoint(90, 180).toJSON()).to.deep.equal({
+      latitude: 90,
+      longitude: 180
+    });
   });
 });

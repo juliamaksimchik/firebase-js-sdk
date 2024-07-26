@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
  */
 import { GTAG_URL } from '../src/constants';
 
-export function removeGtagScript(): void {
+export function removeGtagScripts(): void {
   const scriptTags = window.document.getElementsByTagName('script');
   for (const tag of Object.values(scriptTags)) {
     if (tag.src) {

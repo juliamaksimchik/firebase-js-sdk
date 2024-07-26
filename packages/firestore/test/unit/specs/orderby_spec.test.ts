@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,30 +15,23 @@
  * limitations under the License.
  */
 
-import { Query } from '../../../src/core/query';
-import { doc, orderBy, path } from '../../util/helpers';
+import { doc, orderBy, query } from '../../util/helpers';
 
 import { describeSpec, specTest } from './describe_spec';
 import { spec } from './spec_builder';
 
 describeSpec('OrderBy:', [], () => {
   specTest('orderBy applies filtering based on local state', [], () => {
-    const query1 = Query.atPath(path('collection')).addOrderBy(
-      orderBy('sort', 'asc')
-    );
-    const doc1 = doc(
-      'collection/a',
-      0,
-      { key: 'a', sort: 1 },
-      { hasLocalMutations: true }
-    );
+    const query1 = query('collection', orderBy('sort', 'asc'));
+    const doc1 = doc('collection/a', 0, {
+      key: 'a',
+      sort: 1
+    }).setHasLocalMutations();
     const doc2a = doc('collection/b', 1001, { key: 'b' });
-    const doc2b = doc(
-      'collection/b',
-      1001,
-      { key: 'b', sort: 2 },
-      { hasLocalMutations: true }
-    );
+    const doc2b = doc('collection/b', 1001, {
+      key: 'b',
+      sort: 2
+    }).setHasLocalMutations();
     return (
       spec()
         // user set should show up in results
@@ -59,22 +52,20 @@ describeSpec('OrderBy:', [], () => {
   });
 
   specTest('orderBy applies to existing documents', [], () => {
-    const query = Query.atPath(path('collection')).addOrderBy(
-      orderBy('sort', 'asc')
-    );
+    const query1 = query('collection', orderBy('sort', 'asc'));
     const docA = doc('collection/a', 1000, { key: 'a', sort: 2 });
     const docB = doc('collection/b', 1001, { key: 'b', sort: 1 });
 
     return spec()
-      .withGCEnabled(false)
-      .userListens(query)
-      .watchAcksFull(query, 1002, docA, docB)
-      .expectEvents(query, { added: [docB, docA] })
-      .userUnlistens(query)
-      .watchRemoves(query)
-      .userListens(query, 'resume-token-1002')
-      .expectEvents(query, { added: [docB, docA], fromCache: true })
-      .watchAcksFull(query, 1002)
-      .expectEvents(query, {});
+      .ensureManualLruGC()
+      .userListens(query1)
+      .watchAcksFull(query1, 1002, docA, docB)
+      .expectEvents(query1, { added: [docB, docA] })
+      .userUnlistens(query1)
+      .watchRemoves(query1)
+      .userListens(query1, { resumeToken: 'resume-token-1002' })
+      .expectEvents(query1, { added: [docB, docA], fromCache: true })
+      .watchAcksFull(query1, 1002)
+      .expectEvents(query1, {});
   });
 });

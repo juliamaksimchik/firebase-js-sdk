@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,32 +15,24 @@
  * limitations under the License.
  */
 
-import { RepoInfo } from '../core/RepoInfo';
 import { PersistentConnection } from '../core/PersistentConnection';
-import { RepoManager } from '../core/RepoManager';
+import { RepoInfo } from '../core/RepoInfo';
 import { Connection } from '../realtime/Connection';
-import { Query } from './Query';
+
+import { repoManagerForceRestClient } from './Database';
 
 export const DataConnection = PersistentConnection;
 
-/**
- * @param {!string} pathString
- * @param {function(*)} onComplete
- */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-(PersistentConnection.prototype as any).simpleListen = function(
+(PersistentConnection.prototype as any).simpleListen = function (
   pathString: string,
   onComplete: (a: unknown) => void
 ) {
   this.sendRequest('q', { p: pathString }, onComplete);
 };
 
-/**
- * @param {*} data
- * @param {function(*)} onEcho
- */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-(PersistentConnection.prototype as any).echo = function(
+(PersistentConnection.prototype as any).echo = function (
   data: unknown,
   onEcho: (a: unknown) => void
 ) {
@@ -51,12 +43,11 @@ export const DataConnection = PersistentConnection;
 export const RealTimeConnection = Connection;
 
 /**
- * @param {function(): string} newHash
- * @return {function()}
+ * @internal
  */
-export const hijackHash = function(newHash: () => string) {
+export const hijackHash = function (newHash: () => string) {
   const oldPut = PersistentConnection.prototype.put;
-  PersistentConnection.prototype.put = function(
+  PersistentConnection.prototype.put = function (
     pathString,
     data,
     onComplete,
@@ -67,29 +58,17 @@ export const hijackHash = function(newHash: () => string) {
     }
     oldPut.call(this, pathString, data, onComplete, hash);
   };
-  return function() {
+  return function () {
     PersistentConnection.prototype.put = oldPut;
   };
 };
 
-/**
- * @type {function(new:RepoInfo, !string, boolean, !string, boolean): undefined}
- */
 export const ConnectionTarget = RepoInfo;
 
 /**
- * @param {!Query} query
- * @return {!string}
- */
-export const queryIdentifier = function(query: Query) {
-  return query.queryIdentifier();
-};
-
-/**
  * Forces the RepoManager to create Repos that use ReadonlyRestClient instead of PersistentConnection.
- *
- * @param {boolean} forceRestClient
+ * @internal
  */
-export const forceRestClient = function(forceRestClient: boolean) {
-  RepoManager.getInstance().forceRestClient(forceRestClient);
+export const forceRestClient = function (forceRestClient: boolean) {
+  repoManagerForceRestClient(forceRestClient);
 };

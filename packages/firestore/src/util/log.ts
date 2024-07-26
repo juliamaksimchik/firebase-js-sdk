@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,60 +15,58 @@
  * limitations under the License.
  */
 
-import { Logger, LogLevel as FirebaseLogLevel } from '@firebase/logger';
+import { Logger, LogLevel, LogLevelString } from '@firebase/logger';
+
 import { SDK_VERSION } from '../core/version';
-import { PlatformSupport } from '../platform/platform';
+import { formatJSON } from '../platform/format_json';
+
+export { LogLevel, LogLevelString };
 
 const logClient = new Logger('@firebase/firestore');
 
-export const enum LogLevel {
-  DEBUG,
-  ERROR,
-  SILENT
-}
-
 // Helper methods are needed because variables can't be exported as read/write
 export function getLogLevel(): LogLevel {
-  if (logClient.logLevel === FirebaseLogLevel.DEBUG) {
-    return LogLevel.DEBUG;
-  } else if (logClient.logLevel === FirebaseLogLevel.SILENT) {
-    return LogLevel.SILENT;
-  } else {
-    return LogLevel.ERROR;
-  }
-}
-export function setLogLevel(newLevel: LogLevel): void {
-  /**
-   * Map the new log level to the associated Firebase Log Level
-   */
-  switch (newLevel) {
-    case LogLevel.DEBUG:
-      logClient.logLevel = FirebaseLogLevel.DEBUG;
-      break;
-    case LogLevel.ERROR:
-      logClient.logLevel = FirebaseLogLevel.ERROR;
-      break;
-    case LogLevel.SILENT:
-      logClient.logLevel = FirebaseLogLevel.SILENT;
-      break;
-    default:
-      logClient.error(
-        `Firestore (${SDK_VERSION}): Invalid value passed to \`setLogLevel\``
-      );
-  }
+  return logClient.logLevel;
 }
 
-export function debug(tag: string, msg: string, ...obj: unknown[]): void {
-  if (logClient.logLevel <= FirebaseLogLevel.DEBUG) {
+/**
+ * Sets the verbosity of Cloud Firestore logs (debug, error, or silent).
+ *
+ * @param logLevel - The verbosity you set for activity and error logging. Can
+ *   be any of the following values:
+ *
+ *   <ul>
+ *     <li>`debug` for the most verbose logging level, primarily for
+ *     debugging.</li>
+ *     <li>`error` to log errors only.</li>
+ *     <li><code>`silent` to turn off logging.</li>
+ *   </ul>
+ */
+export function setLogLevel(logLevel: LogLevelString): void {
+  logClient.setLogLevel(logLevel);
+}
+
+export function logDebug(msg: string, ...obj: unknown[]): void {
+  if (logClient.logLevel <= LogLevel.DEBUG) {
     const args = obj.map(argToString);
-    logClient.debug(`Firestore (${SDK_VERSION}) [${tag}]: ${msg}`, ...args);
+    logClient.debug(`Firestore (${SDK_VERSION}): ${msg}`, ...args);
   }
 }
 
-export function error(msg: string, ...obj: unknown[]): void {
-  if (logClient.logLevel <= FirebaseLogLevel.ERROR) {
+export function logError(msg: string, ...obj: unknown[]): void {
+  if (logClient.logLevel <= LogLevel.ERROR) {
     const args = obj.map(argToString);
     logClient.error(`Firestore (${SDK_VERSION}): ${msg}`, ...args);
+  }
+}
+
+/**
+ * @internal
+ */
+export function logWarn(msg: string, ...obj: unknown[]): void {
+  if (logClient.logLevel <= LogLevel.WARN) {
+    const args = obj.map(argToString);
+    logClient.warn(`Firestore (${SDK_VERSION}): ${msg}`, ...args);
   }
 }
 
@@ -79,9 +77,8 @@ function argToString(obj: unknown): string | unknown {
   if (typeof obj === 'string') {
     return obj;
   } else {
-    const platform = PlatformSupport.getPlatform();
     try {
-      return platform.formatJSON(obj);
+      return formatJSON(obj);
     } catch (e) {
       // Converting to JSON failed, just log the object directly
       return obj;

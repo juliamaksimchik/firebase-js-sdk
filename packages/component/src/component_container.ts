@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,12 +66,12 @@ export class ComponentContainer {
    */
   getProvider<T extends Name>(name: T): Provider<T> {
     if (this.providers.has(name)) {
-      return this.providers.get(name) as Provider<T>;
+      return this.providers.get(name) as unknown as Provider<T>;
     }
 
     // create a Provider for a service that hasn't registered with Firebase
     const provider = new Provider<T>(name, this);
-    this.providers.set(name, provider);
+    this.providers.set(name, provider as unknown as Provider<Name>);
 
     return provider as Provider<T>;
   }

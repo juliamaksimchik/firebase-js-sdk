@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@
  */
 
 import { getKey } from '../util/get-key';
-import { AppConfig } from '../interfaces/app-config';
-import { IdChangeCallbackFn } from '../functions';
+import { AppConfig } from '../interfaces/installation-impl';
+import { IdChangeCallbackFn } from '../api';
 
 const fidChangeCallbacks: Map<string, Set<IdChangeCallbackFn>> = new Map();
 

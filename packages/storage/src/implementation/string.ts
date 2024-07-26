@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,42 +14,54 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import * as errorsExports from './error';
+
+import { unknown, invalidFormat } from './error';
+import { decodeBase64 } from '../platform/base64';
 
 /**
- * @enum {string}
+ * An enumeration of the possible string formats for upload.
+ * @public
  */
-export type StringFormat = string;
+export type StringFormat = (typeof StringFormat)[keyof typeof StringFormat];
+/**
+ * An enumeration of the possible string formats for upload.
+ * @public
+ */
 export const StringFormat = {
+  /**
+   * Indicates the string should be interpreted "raw", that is, as normal text.
+   * The string will be interpreted as UTF-16, then uploaded as a UTF-8 byte
+   * sequence.
+   * Example: The string 'Hello! \\ud83d\\ude0a' becomes the byte sequence
+   * 48 65 6c 6c 6f 21 20 f0 9f 98 8a
+   */
   RAW: 'raw',
+  /**
+   * Indicates the string should be interpreted as base64-encoded data.
+   * Padding characters (trailing '='s) are optional.
+   * Example: The string 'rWmO++E6t7/rlw==' becomes the byte sequence
+   * ad 69 8e fb e1 3a b7 bf eb 97
+   */
   BASE64: 'base64',
+  /**
+   * Indicates the string should be interpreted as base64url-encoded data.
+   * Padding characters (trailing '='s) are optional.
+   * Example: The string 'rWmO--E6t7_rlw==' becomes the byte sequence
+   * ad 69 8e fb e1 3a b7 bf eb 97
+   */
   BASE64URL: 'base64url',
+  /**
+   * Indicates the string is a data URL, such as one obtained from
+   * canvas.toDataURL().
+   * Example: the string 'data:application/octet-stream;base64,aaaa'
+   * becomes the byte sequence
+   * 69 a6 9a
+   * (the content-type "application/octet-stream" is also applied, but can
+   * be overridden in the metadata object).
+   */
   DATA_URL: 'data_url'
-};
+} as const;
 
-export function formatValidator(stringFormat: unknown): void {
-  switch (stringFormat) {
-    case StringFormat.RAW:
-    case StringFormat.BASE64:
-    case StringFormat.BASE64URL:
-    case StringFormat.DATA_URL:
-      return;
-    default:
-      throw 'Expected one of the event types: [' +
-        StringFormat.RAW +
-        ', ' +
-        StringFormat.BASE64 +
-        ', ' +
-        StringFormat.BASE64URL +
-        ', ' +
-        StringFormat.DATA_URL +
-        '].';
-  }
-}
-
-/**
- * @struct
- */
 export class StringData {
   contentType: string | null;
 
@@ -58,6 +70,9 @@ export class StringData {
   }
 }
 
+/**
+ * @internal
+ */
 export function dataFromString(
   format: StringFormat,
   stringData: string
@@ -78,7 +93,7 @@ export function dataFromString(
   }
 
   // assert(false);
-  throw errorsExports.unknown();
+  throw unknown();
 }
 
 export function utf8Bytes_(value: string): Uint8Array {
@@ -128,10 +143,7 @@ export function percentEncodedBytes_(value: string): Uint8Array {
   try {
     decoded = decodeURIComponent(value);
   } catch (e) {
-    throw errorsExports.invalidFormat(
-      StringFormat.DATA_URL,
-      'Malformed data URL.'
-    );
+    throw invalidFormat(StringFormat.DATA_URL, 'Malformed data URL.');
   }
   return utf8Bytes_(decoded);
 }
@@ -143,7 +155,7 @@ export function base64Bytes_(format: StringFormat, value: string): Uint8Array {
       const hasUnder = value.indexOf('_') !== -1;
       if (hasMinus || hasUnder) {
         const invalidChar = hasMinus ? '-' : '_';
-        throw errorsExports.invalidFormat(
+        throw invalidFormat(
           format,
           "Invalid character '" +
             invalidChar +
@@ -157,7 +169,7 @@ export function base64Bytes_(format: StringFormat, value: string): Uint8Array {
       const hasSlash = value.indexOf('/') !== -1;
       if (hasPlus || hasSlash) {
         const invalidChar = hasPlus ? '+' : '/';
-        throw errorsExports.invalidFormat(
+        throw invalidFormat(
           format,
           "Invalid character '" + invalidChar + "' found: is it base64 encoded?"
         );
@@ -170,9 +182,12 @@ export function base64Bytes_(format: StringFormat, value: string): Uint8Array {
   }
   let bytes;
   try {
-    bytes = atob(value);
+    bytes = decodeBase64(value);
   } catch (e) {
-    throw errorsExports.invalidFormat(format, 'Invalid character found');
+    if ((e as Error).message.includes('polyfill')) {
+      throw e;
+    }
+    throw invalidFormat(format, 'Invalid character found');
   }
   const array = new Uint8Array(bytes.length);
   for (let i = 0; i < bytes.length; i++) {
@@ -181,9 +196,6 @@ export function base64Bytes_(format: StringFormat, value: string): Uint8Array {
   return array;
 }
 
-/**
- * @struct
- */
 class DataURLParts {
   base64: boolean = false;
   contentType: string | null = null;
@@ -192,7 +204,7 @@ class DataURLParts {
   constructor(dataURL: string) {
     const matches = dataURL.match(/^data:([^,]+)?,/);
     if (matches === null) {
-      throw errorsExports.invalidFormat(
+      throw invalidFormat(
         StringFormat.DATA_URL,
         "Must be formatted 'data:[<mediatype>][;base64],<data>"
       );

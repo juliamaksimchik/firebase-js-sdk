@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ export class User {
   // non-FirebaseAuth providers.
   static readonly GOOGLE_CREDENTIALS = new User('google-credentials-uid');
   static readonly FIRST_PARTY = new User('first-party-uid');
+  static readonly MOCK_USER = new User('mock-user');
 
   constructor(readonly uid: string | null) {}
 

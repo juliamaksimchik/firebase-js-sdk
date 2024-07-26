@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,9 +15,9 @@
  * limitations under the License.
  */
 
-import { TokenDetails } from '../../interfaces/token-details';
 import { FakePushSubscription } from './service-worker';
-import { arrayToBase64 } from '../../helpers/array-to-base64';
+import { TokenDetails } from '../../interfaces/token-details';
+import { arrayToBase64 } from '../../helpers/array-base64-translator';
 
 export function getFakeTokenDetails(): TokenDetails {
   const subscription = new FakePushSubscription();

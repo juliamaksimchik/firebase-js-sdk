@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,29 +15,34 @@
  * limitations under the License.
  */
 
-import { Equatable } from './misc';
-import * as objUtil from './obj';
+import { forEach, isEmpty } from './obj';
 
 type Entry<K, V> = [K, V];
 
 /**
- * A map implementation that uses objects as keys. Objects must implement the
- * Equatable interface and must be immutable. Entries in the map are stored
- * together with the key being produced from the mapKeyFn. This map
+ * A map implementation that uses objects as keys. Objects must have an
+ * associated equals function and must be immutable. Entries in the map are
+ * stored together with the key being produced from the mapKeyFn. This map
  * automatically handles collisions of keys.
  */
-export class ObjectMap<KeyType extends Equatable<KeyType>, ValueType> {
+export class ObjectMap<KeyType, ValueType> {
   /**
-   * The inner map for a key -> value pair. Due to the possibility of
-   * collisions we keep a list of entries that we do a linear search through
-   * to find an actual match. Note that collisions should be rare, so we still
-   * expect near constant time lookups in practice.
+   * The inner map for a key/value pair. Due to the possibility of collisions we
+   * keep a list of entries that we do a linear search through to find an actual
+   * match. Note that collisions should be rare, so we still expect near
+   * constant time lookups in practice.
    */
   private inner: {
     [canonicalId: string]: Array<Entry<KeyType, ValueType>>;
   } = {};
 
-  constructor(private mapKeyFn: (key: KeyType) => string) {}
+  /** The number of entries stored in the map */
+  private innerSize = 0;
+
+  constructor(
+    private mapKeyFn: (key: KeyType) => string,
+    private equalsFn: (l: KeyType, r: KeyType) => boolean
+  ) {}
 
   /** Get a value for this key, or undefined if it does not exist. */
   get(key: KeyType): ValueType | undefined {
@@ -47,7 +52,7 @@ export class ObjectMap<KeyType extends Equatable<KeyType>, ValueType> {
       return undefined;
     }
     for (const [otherKey, value] of matches) {
-      if (otherKey.isEqual(key)) {
+      if (this.equalsFn(otherKey, key)) {
         return value;
       }
     }
@@ -64,15 +69,18 @@ export class ObjectMap<KeyType extends Equatable<KeyType>, ValueType> {
     const matches = this.inner[id];
     if (matches === undefined) {
       this.inner[id] = [[key, value]];
+      this.innerSize++;
       return;
     }
     for (let i = 0; i < matches.length; i++) {
-      if (matches[i][0].isEqual(key)) {
+      if (this.equalsFn(matches[i][0], key)) {
+        // This is updating an existing entry and does not increase `innerSize`.
         matches[i] = [key, value];
         return;
       }
     }
     matches.push([key, value]);
+    this.innerSize++;
   }
 
   /**
@@ -85,12 +93,13 @@ export class ObjectMap<KeyType extends Equatable<KeyType>, ValueType> {
       return false;
     }
     for (let i = 0; i < matches.length; i++) {
-      if (matches[i][0].isEqual(key)) {
+      if (this.equalsFn(matches[i][0], key)) {
         if (matches.length === 1) {
           delete this.inner[id];
         } else {
           matches.splice(i, 1);
         }
+        this.innerSize--;
         return true;
       }
     }
@@ -98,7 +107,7 @@ export class ObjectMap<KeyType extends Equatable<KeyType>, ValueType> {
   }
 
   forEach(fn: (key: KeyType, val: ValueType) => void): void {
-    objUtil.forEach(this.inner, (_, entries) => {
+    forEach(this.inner, (_, entries) => {
       for (const [k, v] of entries) {
         fn(k, v);
       }
@@ -106,6 +115,10 @@ export class ObjectMap<KeyType extends Equatable<KeyType>, ValueType> {
   }
 
   isEmpty(): boolean {
-    return objUtil.isEmpty(this.inner);
+    return isEmpty(this.inner);
+  }
+
+  size(): number {
+    return this.innerSize;
   }
 }

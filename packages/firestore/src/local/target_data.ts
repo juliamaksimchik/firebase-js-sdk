@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,15 +23,22 @@ import { ByteString } from '../util/byte_string';
 /** An enumeration of the different purposes we have for targets. */
 export const enum TargetPurpose {
   /** A regular, normal query target. */
-  Listen,
+  Listen = 'TargetPurposeListen',
 
   /**
-   * The query target was used to refill a query after an existence filter mismatch.
+   * The query target was used to refill a query after an existence filter
+   * mismatch.
    */
-  ExistenceFilterMismatch,
+  ExistenceFilterMismatch = 'TargetPurposeExistenceFilterMismatch',
+
+  /**
+   * The query target was used if the query is the result of a false positive in
+   * the bloom filter.
+   */
+  ExistenceFilterMismatchBloom = 'TargetPurposeExistenceFilterMismatchBloom',
 
   /** The query target was used to resolve a limbo document. */
-  LimboResolution
+  LimboResolution = 'TargetPurposeLimboResolution'
 }
 
 /**
@@ -54,19 +61,25 @@ export class TargetData {
      */
     readonly sequenceNumber: ListenSequenceNumber,
     /** The latest snapshot version seen for this target. */
-    readonly snapshotVersion: SnapshotVersion = SnapshotVersion.MIN,
+    readonly snapshotVersion: SnapshotVersion = SnapshotVersion.min(),
     /**
      * The maximum snapshot version at which the associated view
      * contained no limbo documents.
      */
-    readonly lastLimboFreeSnapshotVersion: SnapshotVersion = SnapshotVersion.MIN,
+    readonly lastLimboFreeSnapshotVersion: SnapshotVersion = SnapshotVersion.min(),
     /**
      * An opaque, server-assigned token that allows watching a target to be
      * resumed after disconnecting without retransmitting all the data that
      * matches the target. The resume token essentially identifies a point in
      * time from which the server should resume sending results.
      */
-    readonly resumeToken: ByteString = ByteString.EMPTY_BYTE_STRING
+    readonly resumeToken: ByteString = ByteString.EMPTY_BYTE_STRING,
+    /**
+     * The number of documents that last matched the query at the resume token or
+     * read time. Documents are counted only when making a listen request with
+     * resume token or read time, otherwise, keep it null.
+     */
+    readonly expectedCount: number | null = null
   ) {}
 
   /** Creates a new target data instance with an updated sequence number. */
@@ -78,7 +91,8 @@ export class TargetData {
       sequenceNumber,
       this.snapshotVersion,
       this.lastLimboFreeSnapshotVersion,
-      this.resumeToken
+      this.resumeToken,
+      this.expectedCount
     );
   }
 
@@ -97,7 +111,24 @@ export class TargetData {
       this.sequenceNumber,
       snapshotVersion,
       this.lastLimboFreeSnapshotVersion,
-      resumeToken
+      resumeToken,
+      /* expectedCount= */ null
+    );
+  }
+
+  /**
+   * Creates a new target data instance with an updated expected count.
+   */
+  withExpectedCount(expectedCount: number): TargetData {
+    return new TargetData(
+      this.target,
+      this.targetId,
+      this.purpose,
+      this.sequenceNumber,
+      this.snapshotVersion,
+      this.lastLimboFreeSnapshotVersion,
+      this.resumeToken,
+      expectedCount
     );
   }
 
@@ -115,21 +146,8 @@ export class TargetData {
       this.sequenceNumber,
       this.snapshotVersion,
       lastLimboFreeSnapshotVersion,
-      this.resumeToken
-    );
-  }
-
-  isEqual(other: TargetData): boolean {
-    return (
-      this.targetId === other.targetId &&
-      this.purpose === other.purpose &&
-      this.sequenceNumber === other.sequenceNumber &&
-      this.snapshotVersion.isEqual(other.snapshotVersion) &&
-      this.lastLimboFreeSnapshotVersion.isEqual(
-        other.lastLimboFreeSnapshotVersion
-      ) &&
-      this.resumeToken.isEqual(other.resumeToken) &&
-      this.target.isEqual(other.target)
+      this.resumeToken,
+      this.expectedCount
     );
   }
 }

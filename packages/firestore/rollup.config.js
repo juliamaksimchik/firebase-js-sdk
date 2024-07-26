@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2018 Google Inc.
+ * Copyright 2020 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,221 +15,216 @@
  * limitations under the License.
  */
 
-import * as path from 'path';
-
-import json from 'rollup-plugin-json';
-import typescriptPlugin from 'rollup-plugin-typescript2';
+import { version as grpcVersion } from '@grpc/grpc-js/package.json';
+import alias from '@rollup/plugin-alias';
+import json from '@rollup/plugin-json';
 import replace from 'rollup-plugin-replace';
-import copy from 'rollup-plugin-copy-assets';
-import sourcemaps from 'rollup-plugin-sourcemaps';
-import typescript from 'typescript';
 import { terser } from 'rollup-plugin-terser';
+import dts from 'rollup-plugin-dts';
+import typescriptPlugin from 'rollup-plugin-typescript2';
+import tmp from 'tmp';
+import typescript from 'typescript';
+
+import { generateBuildTargetReplaceConfig } from '../../scripts/build/rollup_replace_build_target';
 
 import pkg from './package.json';
-import memoryPkg from './memory/package.json';
 
-import {
-  appendPrivatePrefixTransformers,
-  manglePrivatePropertiesOptions
-} from './terser.config';
+const sourcemaps = require('rollup-plugin-sourcemaps');
+const util = require('./rollup.shared');
 
-// This Firestore Rollup configuration provides a number of different builds:
-// - Browser builds that support persistence in ES5 CJS and ES5 ESM formats and
-//   ES2017 in ESM format.
-// - In-memory Browser builds that support persistence in ES5 CJS and ES5 ESM
-//   formats and ES2017 in ESM format.
-// - A NodeJS build that supports persistence (to be used with an IndexedDb
-//   shim)
-// - A in-memory only NodeJS build
-//
-// The in-memory builds are roughly 130 KB smaller, but throw an exception
-// for calls to `enablePersistence()` or `clearPersistence()`.
-//
-// All browser builds rely on Terser's property name mangling to reduce code
-// size.
-//
-// See https://g3doc/firebase/jscore/g3doc/contributing/builds.md
-// for a description of the various JavaScript formats used in our SDKs.
+const nodePlugins = function () {
+  return [
+    typescriptPlugin({
+      typescript,
+      tsconfigOverride: {
+        compilerOptions: {
+          target: 'es2017'
+        }
+      },
+      cacheDir: tmp.dirSync(),
+      abortOnError: true,
+      transformers: [util.removeAssertTransformer]
+    }),
+    json({ preferConst: true }),
+    replace({
+      '__GRPC_VERSION__': grpcVersion
+    })
+  ];
+};
 
-// MARK: Browser builds
+const browserPlugins = function () {
+  return [
+    typescriptPlugin({
+      typescript,
+      tsconfigOverride: {
+        compilerOptions: {
+          target: 'es2017'
+        }
+      },
+      cacheDir: tmp.dirSync(),
+      abortOnError: true,
+      transformers: [util.removeAssertAndPrefixInternalTransformer]
+    }),
+    json({ preferConst: true }),
+    terser(util.manglePrivatePropertiesOptions)
+  ];
+};
 
-const browserDeps = Object.keys(
-  Object.assign({}, pkg.peerDependencies, pkg.dependencies)
-);
-
-const nodeDeps = [...browserDeps, 'util', 'path'];
-
-/** Resolves the external dependencies for the browser build. */
-function resolveBrowserExterns(id) {
-  return browserDeps.some(dep => id === dep || id.startsWith(`${dep}/`));
-}
-
-/** Resolves the external dependencies for the Node build. */
-function resolveNodeExterns(id) {
-  return nodeDeps.some(dep => id === dep || id.startsWith(`${dep}/`));
-}
-
-/**
- * Resolves the external dependencies for the Memory-based Firestore
- * implementation. Verifies that no persistence sources are used by Firestore's
- * memory-only implementation.
- */
-export function resolveMemoryExterns(deps, externsId, referencedBy) {
-  const externalRef = path
-    .resolve(path.dirname(referencedBy), externsId)
-    .replace('.ts', '');
-
-  const persistenceRef = [
-    'local/indexeddb_persistence.ts',
-    'local/indexeddb_index_manager.ts',
-    'local/indexeddb_mutation_queue.ts',
-    'local/indexeddb_remote_document_cache.ts',
-    'local/indexeddb_schema.ts',
-    'local/indexeddb_target_cache.ts',
-    'local/local_serializer.ts',
-    'local/lru_garbage_collector.ts',
-    'local/simple_db.ts',
-    'api/persistence.ts'
-  ].map(p => path.resolve(__dirname, 'src', p));
-
-  if (persistenceRef.indexOf(externalRef) !== -1) {
-    throw new Error('Unexpected reference in Memory-only client on ' + id);
-  }
-
-  return deps.some(dep => externsId === dep || externsId.startsWith(`${dep}/`));
-}
-
-const es5BuildPlugins = [
-  typescriptPlugin({
-    typescript,
-    transformers: appendPrivatePrefixTransformers,
-    cacheRoot: `./.cache/es5.mangled/`
-  }),
-  json(),
-  terser(manglePrivatePropertiesOptions)
-];
-
-const es2017BuildPlugins = [
-  typescriptPlugin({
-    typescript,
-    tsconfigOverride: {
-      compilerOptions: {
-        target: 'es2017'
-      }
-    },
-    cacheRoot: './.cache/es2017.mangled/',
-    transformers: appendPrivatePrefixTransformers
-  }),
-  json({ preferConst: true }),
-  terser(manglePrivatePropertiesOptions)
-];
-
-const browserBuilds = [
-  // ES5 ESM Build (with persistence)
+const allBuilds = [
+  // Intermediate Node ESM build without build target reporting
+  // this is an intermediate build used to generate the actual esm and cjs builds
+  // which add build target reporting
   {
-    input: 'index.ts',
-    output: { file: pkg.module, format: 'es', sourcemap: true },
-    plugins: es5BuildPlugins,
-    external: resolveBrowserExterns
-  },
-  // ES5 ESM Build (memory-only)
-  {
-    input: 'index.memory.ts',
+    input: './src/index.node.ts',
     output: {
-      file: path.resolve('./memory', memoryPkg.module),
+      file: pkg['main-esm'],
       format: 'es',
       sourcemap: true
     },
-    plugins: es5BuildPlugins,
-    external: (id, referencedBy) =>
-      resolveMemoryExterns(browserDeps, id, referencedBy)
-  },
-  // ES2017 ESM build (with persistence)
-  {
-    input: 'index.ts',
-    output: {
-      file: pkg.esm2017,
-      format: 'es',
-      sourcemap: true
+    plugins: [alias(util.generateAliasConfig('node')), ...nodePlugins()],
+    external: util.resolveNodeExterns,
+    treeshake: {
+      moduleSideEffects: false
     },
-    plugins: es5BuildPlugins,
-    external: resolveBrowserExterns
+    onwarn: util.onwarn
   },
-  // ES2017 ESM build (memory-only)
+  // Node CJS build
   {
-    input: 'index.memory.ts',
+    input: pkg['main-esm'],
     output: {
-      file: path.resolve('./memory', memoryPkg.esm2017),
-      format: 'es',
-      sourcemap: true
-    },
-    plugins: es2017BuildPlugins,
-    external: (id, referencedBy) =>
-      resolveMemoryExterns(browserDeps, id, referencedBy)
-  },
-  // ES5 CJS Build (with persistence)
-  //
-  // This build is based on the mangling in the ESM build above, since
-  // Terser's Property name mangling doesn't work well with CJS's syntax.
-  {
-    input: pkg.module,
-    output: { file: pkg.browser, format: 'cjs', sourcemap: true },
-    plugins: [sourcemaps()]
-  },
-  // ES5 CJS Build (memory-only)
-  //
-  // This build is based on the mangling in the ESM build above, since
-  // Terser's Property name mangling doesn't work well with CJS's syntax.
-  {
-    input: path.resolve('./memory', memoryPkg.module),
-    output: {
-      file: path.resolve('./memory', memoryPkg.browser),
+      file: pkg.main,
       format: 'cjs',
       sourcemap: true
     },
-    plugins: [sourcemaps()]
-  }
-];
-
-// MARK: Node builds
-
-const nodeBuildPlugins = [
-  typescriptPlugin({
-    typescript,
-    cacheRoot: `./.cache/node/`
-  }),
-  json(),
-  // Needed as we also use the *.proto files
-  copy({
-    assets: ['./src/protos']
-  }),
-  replace({
-    'process.env.FIRESTORE_PROTO_ROOT': JSON.stringify('src/protos')
-  })
-];
-
-const nodeBuilds = [
-  // ES5 CJS build (with persistence)
-  {
-    input: 'index.node.ts',
-    output: [{ file: pkg.main, format: 'cjs', sourcemap: true }],
-    plugins: nodeBuildPlugins,
-    external: resolveNodeExterns
+    plugins: [
+      ...util.es2017ToEs5Plugins(/* mangled= */ false),
+      replace(generateBuildTargetReplaceConfig('cjs', 2017))
+    ],
+    external: util.resolveNodeExterns,
+    treeshake: {
+      moduleSideEffects: false
+    }
   },
-  // ES5 CJS build (memory-only)
+  // Node ESM build with build target reporting
   {
-    input: 'index.node.memory.ts',
+    input: pkg['main-esm'],
+    output: {
+      file: pkg['main-esm'],
+      format: 'es',
+      sourcemap: true
+    },
+    plugins: [
+      sourcemaps(),
+      replace(generateBuildTargetReplaceConfig('esm', 2017))
+    ],
+    external: util.resolveNodeExterns,
+    treeshake: {
+      moduleSideEffects: false
+    }
+  },
+  // Intermediate browser build without build target reporting
+  // this is an intermediate build used to generate the actual esm and cjs builds
+  // which add build target reporting
+  {
+    input: './src/index.ts',
+    output: {
+      file: pkg.browser,
+      format: 'es',
+      sourcemap: true
+    },
+    plugins: [alias(util.generateAliasConfig('browser')), ...browserPlugins()],
+    external: util.resolveBrowserExterns,
+    treeshake: {
+      moduleSideEffects: false
+    }
+  },
+  // Convert es2017 build to ES5
+  {
+    input: pkg['browser'],
     output: [
       {
-        file: path.resolve('./memory', memoryPkg.main),
+        file: pkg['esm5'],
+        format: 'es',
+        sourcemap: true
+      }
+    ],
+    plugins: [
+      ...util.es2017ToEs5Plugins(/* mangled= */ true),
+      replace(generateBuildTargetReplaceConfig('esm', 5))
+    ],
+    external: util.resolveBrowserExterns,
+    treeshake: {
+      moduleSideEffects: false
+    }
+  },
+  // Convert es2017 build to cjs
+  {
+    input: pkg['browser'],
+    output: [
+      {
+        file: './dist/index.cjs.js',
         format: 'cjs',
         sourcemap: true
       }
     ],
-    plugins: nodeBuildPlugins,
-    external: (id, referencedBy) =>
-      resolveMemoryExterns(nodeDeps, id, referencedBy)
+    plugins: [
+      sourcemaps(),
+      replace(generateBuildTargetReplaceConfig('cjs', 2017))
+    ],
+    external: util.resolveBrowserExterns,
+    treeshake: {
+      moduleSideEffects: false
+    }
+  },
+  // es2017 build with build target reporting
+  {
+    input: pkg['browser'],
+    output: [
+      {
+        file: pkg['browser'],
+        format: 'es',
+        sourcemap: true
+      }
+    ],
+    plugins: [
+      sourcemaps(),
+      replace(generateBuildTargetReplaceConfig('esm', 2017))
+    ],
+    external: util.resolveBrowserExterns,
+    treeshake: {
+      moduleSideEffects: false
+    }
+  },
+  // RN build
+  {
+    input: './src/index.rn.ts',
+    output: {
+      file: pkg['react-native'],
+      format: 'es',
+      sourcemap: true
+    },
+    plugins: [
+      alias(util.generateAliasConfig('rn')),
+      ...browserPlugins(),
+      replace(generateBuildTargetReplaceConfig('esm', 2017))
+    ],
+    external: util.resolveBrowserExterns,
+    treeshake: {
+      moduleSideEffects: false
+    }
+  },
+  {
+    input: 'dist/firestore/src/index.d.ts',
+    output: {
+      file: 'dist/firestore/src/global_index.d.ts',
+      format: 'es'
+    },
+    plugins: [
+      dts({
+        respectExternal: true
+      })
+    ]
   }
 ];
 
-export default [...browserBuilds, ...nodeBuilds];
+export default allBuilds;

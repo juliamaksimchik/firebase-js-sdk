@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,14 +16,19 @@
  */
 
 import { expect } from 'chai';
-import { repoInfoForConnectionTest } from './helpers/util';
+
 import { Connection } from '../src/realtime/Connection';
+
+import { repoInfoForConnectionTest } from './helpers/util';
 
 describe('Connection', () => {
   it('return the session id', done => {
     new Connection(
       '1',
       repoInfoForConnectionTest(),
+      'fake-app-id',
+      'fake-app-check-token',
+      'fake-auth-token',
       message => {},
       (timestamp, sessionId) => {
         expect(sessionId).not.to.be.null;
@@ -43,11 +48,17 @@ describe('Connection', () => {
     new Connection(
       '1',
       info,
+      'fake-app-id',
+      'fake-app-check-token',
+      'fake-auth-token',
       message => {},
       (timestamp, sessionId) => {
         new Connection(
           '2',
           info,
+          'fake-app-id',
+          'fake-app-check-token',
+          'fake-auth-token',
           message => {},
           (timestamp, sessionId) => {},
           () => {},

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,16 +15,16 @@
  * limitations under the License.
  */
 
+import './setup';
+
 import { expect } from 'chai';
-import '../testing/setup';
 
 // Trick TS since it's set to target ES5.
 declare class HeadersWithEntries extends Headers {
   entries?(): Iterable<[string, string]>;
 }
 
-// Chai doesn't check if Headers objects contain the same entries,
-// so we need to do that manually.
+// Chai doesn't check if Headers objects contain the same entries, so we need to do that manually.
 export function compareHeaders(
   expectedHeaders: HeadersWithEntries,
   actualHeaders: HeadersWithEntries

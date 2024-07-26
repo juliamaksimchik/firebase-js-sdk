@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2018 Google Inc.
+ * Copyright 2018 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,19 +15,16 @@
  * limitations under the License.
  */
 
-import { DatabaseId, DatabaseInfo } from '../../src/core/database_info';
-import { Platform } from '../../src/platform/platform';
-import { Connection } from '../../src/remote/connection';
-import { JsonProtoSerializer } from '../../src/remote/serializer';
-import { assert, fail } from '../../src/util/assert';
-import { ConnectivityMonitor } from './../../src/remote/connectivity_monitor';
-import { NoopConnectivityMonitor } from './../../src/remote/connectivity_monitor_noop';
+import { debugAssert, fail } from '../../src/util/assert';
+import { DocumentLike, WindowLike } from '../../src/util/types';
+
+/* eslint-disable no-restricted-globals */
 
 /**
  * `Window` fake that implements the event and storage API that is used by
  * Firestore.
  */
-export class FakeWindow {
+export class FakeWindow implements WindowLike {
   private readonly fakeStorageArea: Storage;
   private readonly fakeIndexedDb: IDBFactory | null;
 
@@ -61,8 +58,10 @@ export class FakeWindow {
       case 'storage':
         this.storageListeners.push(listener);
         break;
-      case 'unload':
-        // The spec tests currently do not rely on 'unload' listeners.
+      case 'pagehide':
+      case 'visibilitychange':
+        // The spec tests currently do not rely on `pagehide`/`visibilitychange`
+        // listeners.
         break;
       default:
         fail(`MockWindow doesn't support events of type '${type}'`);
@@ -76,7 +75,7 @@ export class FakeWindow {
         registeredListener => listener !== registeredListener
       );
       const newCount = this.storageListeners.length;
-      assert(
+      debugAssert(
         newCount === oldCount - 1,
         "Listener passed to 'removeEventListener' doesn't match any registered listener."
       );
@@ -84,19 +83,25 @@ export class FakeWindow {
   }
 }
 
+export function testWindow(
+  sharedWebStorage = new SharedFakeWebStorage()
+): FakeWindow {
+  return new FakeWindow(sharedWebStorage);
+}
+
 /**
  * `Document` fake that implements the `visibilitychange` API used by Firestore.
  */
-export class FakeDocument {
-  private _visibilityState: VisibilityState = 'hidden';
+export class FakeDocument implements DocumentLike {
+  private _visibilityState: DocumentVisibilityState = 'hidden';
   private visibilityListener: EventListener | null = null;
 
-  get visibilityState(): VisibilityState {
+  get visibilityState(): DocumentVisibilityState {
     return this._visibilityState;
   }
 
   addEventListener(type: string, listener: EventListener): void {
-    assert(
+    debugAssert(
       type === 'visibilitychange',
       "FakeDocument only supports events of type 'visibilitychange'"
     );
@@ -109,12 +114,16 @@ export class FakeDocument {
     }
   }
 
-  raiseVisibilityEvent(visibility: VisibilityState): void {
+  raiseVisibilityEvent(visibility: DocumentVisibilityState): void {
     this._visibilityState = visibility;
     if (this.visibilityListener) {
       this.visibilityListener(new Event('visibilitychange'));
     }
   }
+}
+
+export function testDocument(): FakeDocument {
+  return new FakeDocument();
 }
 
 /**
@@ -202,77 +211,4 @@ export class SharedFakeWebStorage {
       } as any); /* eslint-disable-line @typescript-eslint/no-explicit-any*/ // Not mocking entire Event type.
     });
   }
-}
-
-/**
- * Implementation of `Platform` that allows faking of `document` and `window`.
- */
-export class TestPlatform implements Platform {
-  readonly mockDocument: FakeDocument | null = null;
-  readonly mockWindow: FakeWindow | null = null;
-
-  constructor(
-    private readonly basePlatform: Platform,
-    private readonly mockStorage: SharedFakeWebStorage
-  ) {
-    this.mockDocument = new FakeDocument();
-    this.mockWindow = new FakeWindow(this.mockStorage);
-  }
-
-  get document(): Document | null {
-    // FakeWindow doesn't support full Document interface.
-    return this.mockDocument as any; // eslint-disable-line @typescript-eslint/no-explicit-any
-  }
-
-  get window(): Window | null {
-    // FakeWindow doesn't support full Window interface.
-    return this.mockWindow as any; //eslint-disable-line @typescript-eslint/no-explicit-any
-  }
-
-  get base64Available(): boolean {
-    return this.basePlatform.base64Available;
-  }
-
-  raiseVisibilityEvent(visibility: VisibilityState): void {
-    if (this.mockDocument) {
-      this.mockDocument.raiseVisibilityEvent(visibility);
-    }
-  }
-
-  loadConnection(databaseInfo: DatabaseInfo): Promise<Connection> {
-    return this.basePlatform.loadConnection(databaseInfo);
-  }
-
-  newConnectivityMonitor(): ConnectivityMonitor {
-    return new NoopConnectivityMonitor();
-  }
-
-  newSerializer(databaseId: DatabaseId): JsonProtoSerializer {
-    return this.basePlatform.newSerializer(databaseId);
-  }
-
-  formatJSON(value: unknown): string {
-    return this.basePlatform.formatJSON(value);
-  }
-
-  atob(encoded: string): string {
-    return this.basePlatform.atob(encoded);
-  }
-
-  btoa(raw: string): string {
-    return this.basePlatform.btoa(raw);
-  }
-
-  randomBytes(nBytes: number): Uint8Array {
-    return this.basePlatform.randomBytes(nBytes);
-  }
-}
-
-/** Returns true if we are running under Node. */
-export function isNode(): boolean {
-  return (
-    typeof process !== 'undefined' &&
-    process.title !== undefined &&
-    process.title.indexOf('node') !== -1
-  );
 }

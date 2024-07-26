@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,47 +15,46 @@
  * limitations under the License.
  */
 
-import { Blob } from '../api/blob';
-import { GeoPoint } from '../api/geo_point';
-import { Timestamp } from '../api/timestamp';
+import { Aggregate } from '../core/aggregate';
+import { Bound } from '../core/bound';
 import { DatabaseId } from '../core/database_info';
 import {
-  Bound,
-  Direction,
+  CompositeFilter,
+  compositeFilterIsFlatConjunction,
+  CompositeOperator,
   FieldFilter,
   Filter,
+  Operator
+} from '../core/filter';
+import { Direction, OrderBy } from '../core/order_by';
+import {
   LimitType,
-  Operator,
-  OrderBy,
-  Query
+  newQuery,
+  newQueryForPath,
+  Query,
+  queryToTarget
 } from '../core/query';
 import { SnapshotVersion } from '../core/snapshot_version';
-import { Target } from '../core/target';
+import { targetIsDocumentTarget, Target } from '../core/target';
 import { TargetId } from '../core/types';
+import { Timestamp } from '../lite-api/timestamp';
 import { TargetData, TargetPurpose } from '../local/target_data';
-import { Document, MaybeDocument, NoDocument } from '../model/document';
+import { MutableDocument } from '../model/document';
 import { DocumentKey } from '../model/document_key';
-import * as fieldValue from '../model/field_value';
+import { FieldMask } from '../model/field_mask';
 import {
   DeleteMutation,
-  FieldMask,
   FieldTransform,
   Mutation,
   MutationResult,
   PatchMutation,
   Precondition,
   SetMutation,
-  TransformMutation,
   VerifyMutation
 } from '../model/mutation';
+import { normalizeTimestamp } from '../model/normalize';
+import { ObjectValue } from '../model/object_value';
 import { FieldPath, ResourcePath } from '../model/path';
-import * as api from '../protos/firestore_proto_api';
-import { assert, fail } from '../util/assert';
-import { Code, FirestoreError } from '../util/error';
-import * as obj from '../util/obj';
-import { ByteString } from '../util/byte_string';
-import * as typeUtils from '../util/types';
-
 import {
   ArrayRemoveTransformOperation,
   ArrayUnionTransformOperation,
@@ -63,8 +62,41 @@ import {
   ServerTimestampTransform,
   TransformOperation
 } from '../model/transform_operation';
+import { isNanValue, isNullValue } from '../model/values';
+import {
+  ApiClientObjectMap as ProtoApiClientObjectMap,
+  BatchGetDocumentsResponse as ProtoBatchGetDocumentsResponse,
+  CompositeFilterOp as ProtoCompositeFilterOp,
+  Cursor as ProtoCursor,
+  Document as ProtoDocument,
+  DocumentMask as ProtoDocumentMask,
+  DocumentsTarget as ProtoDocumentsTarget,
+  FieldFilterOp as ProtoFieldFilterOp,
+  FieldReference as ProtoFieldReference,
+  FieldTransform as ProtoFieldTransform,
+  Filter as ProtoFilter,
+  ListenResponse as ProtoListenResponse,
+  Order as ProtoOrder,
+  OrderDirection as ProtoOrderDirection,
+  Precondition as ProtoPrecondition,
+  QueryTarget as ProtoQueryTarget,
+  RunAggregationQueryRequest as ProtoRunAggregationQueryRequest,
+  Aggregation as ProtoAggregation,
+  Status as ProtoStatus,
+  Target as ProtoTarget,
+  TargetChangeTargetChangeType as ProtoTargetChangeTargetChangeType,
+  Timestamp as ProtoTimestamp,
+  Write as ProtoWrite,
+  WriteResult as ProtoWriteResult
+} from '../protos/firestore_proto_api';
+import { debugAssert, fail, hardAssert } from '../util/assert';
+import { ByteString } from '../util/byte_string';
+import { Code, FirestoreError } from '../util/error';
+import { isNullOrUndefined } from '../util/types';
+
 import { ExistenceFilter } from './existence_filter';
-import { mapCodeFromRpcCode, mapRpcCodeFromCode } from './rpc_error';
+import { Serializer } from './number_serializer';
+import { mapCodeFromRpcCode } from './rpc_error';
 import {
   DocumentWatchChange,
   ExistenceFilterChange,
@@ -74,1337 +106,1287 @@ import {
 } from './watch_change';
 
 const DIRECTIONS = (() => {
-  const dirs: { [dir: string]: api.OrderDirection } = {};
-  dirs[Direction.ASCENDING.name] = 'ASCENDING';
-  dirs[Direction.DESCENDING.name] = 'DESCENDING';
+  const dirs: { [dir: string]: ProtoOrderDirection } = {};
+  dirs[Direction.ASCENDING] = 'ASCENDING';
+  dirs[Direction.DESCENDING] = 'DESCENDING';
   return dirs;
 })();
 
 const OPERATORS = (() => {
-  const ops: { [op: string]: api.FieldFilterOp } = {};
-  ops[Operator.LESS_THAN.name] = 'LESS_THAN';
-  ops[Operator.LESS_THAN_OR_EQUAL.name] = 'LESS_THAN_OR_EQUAL';
-  ops[Operator.GREATER_THAN.name] = 'GREATER_THAN';
-  ops[Operator.GREATER_THAN_OR_EQUAL.name] = 'GREATER_THAN_OR_EQUAL';
-  ops[Operator.EQUAL.name] = 'EQUAL';
-  ops[Operator.ARRAY_CONTAINS.name] = 'ARRAY_CONTAINS';
-  ops[Operator.IN.name] = 'IN';
-  ops[Operator.ARRAY_CONTAINS_ANY.name] = 'ARRAY_CONTAINS_ANY';
+  const ops: { [op: string]: ProtoFieldFilterOp } = {};
+  ops[Operator.LESS_THAN] = 'LESS_THAN';
+  ops[Operator.LESS_THAN_OR_EQUAL] = 'LESS_THAN_OR_EQUAL';
+  ops[Operator.GREATER_THAN] = 'GREATER_THAN';
+  ops[Operator.GREATER_THAN_OR_EQUAL] = 'GREATER_THAN_OR_EQUAL';
+  ops[Operator.EQUAL] = 'EQUAL';
+  ops[Operator.NOT_EQUAL] = 'NOT_EQUAL';
+  ops[Operator.ARRAY_CONTAINS] = 'ARRAY_CONTAINS';
+  ops[Operator.IN] = 'IN';
+  ops[Operator.NOT_IN] = 'NOT_IN';
+  ops[Operator.ARRAY_CONTAINS_ANY] = 'ARRAY_CONTAINS_ANY';
   return ops;
 })();
 
-// A RegExp matching ISO 8601 UTC timestamps with optional fraction.
-const ISO_REG_EXP = new RegExp(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.(\d+))?Z$/);
+const COMPOSITE_OPERATORS = (() => {
+  const ops: { [op: string]: ProtoCompositeFilterOp } = {};
+  ops[CompositeOperator.AND] = 'AND';
+  ops[CompositeOperator.OR] = 'OR';
+  return ops;
+})();
 
 function assertPresent(value: unknown, description: string): asserts value {
-  assert(!typeUtils.isNullOrUndefined(value), description + ' is missing');
-}
-
-function parseInt64(value: number | string): number {
-  // TODO(bjornick): Handle int64 greater than 53 bits.
-  if (typeof value === 'number') {
-    return value;
-  } else if (typeof value === 'string') {
-    return Number(value);
-  } else {
-    return fail("can't parse " + value);
-  }
-}
-
-// This is a supplement to the generated proto interfaces, which fail to account
-// for the fact that a timestamp may be encoded as either a string OR this.
-interface TimestampProto {
-  seconds?: string;
-  nanos?: number;
-}
-
-export interface SerializerOptions {
-  /**
-   * The serializer supports both Protobuf.js and Proto3 JSON formats. By
-   * setting this flag to true, the serializer will use the Proto3 JSON format.
-   *
-   * For a description of the Proto3 JSON format check
-   * https://developers.google.com/protocol-buffers/docs/proto3#json
-   */
-  useProto3Json: boolean;
+  debugAssert(!isNullOrUndefined(value), description + ' is missing');
 }
 
 /**
- * Generates JsonObject values for the Datastore API suitable for sending to
- * either GRPC stub methods or via the JSON/HTTP REST API.
+ * This class generates JsonObject values for the Datastore API suitable for
+ * sending to either GRPC stub methods or via the JSON/HTTP REST API.
+ *
+ * The serializer supports both Protobuf.js and Proto3 JSON formats. By
+ * setting `useProto3Json` to true, the serializer will use the Proto3 JSON
+ * format.
+ *
+ * For a description of the Proto3 JSON format check
+ * https://developers.google.com/protocol-buffers/docs/proto3#json
+ *
  * TODO(klimt): We can remove the databaseId argument if we keep the full
  * resource name in documents.
  */
-export class JsonProtoSerializer {
+export class JsonProtoSerializer implements Serializer {
   constructor(
-    private databaseId: DatabaseId,
-    private options: SerializerOptions
+    readonly databaseId: DatabaseId,
+    readonly useProto3Json: boolean
   ) {}
+}
 
-  fromRpcStatus(status: api.Status): FirestoreError {
-    const code =
-      status.code === undefined
-        ? Code.UNKNOWN
-        : mapCodeFromRpcCode(status.code);
-    return new FirestoreError(code, status.message || '');
+function fromRpcStatus(status: ProtoStatus): FirestoreError {
+  const code =
+    status.code === undefined ? Code.UNKNOWN : mapCodeFromRpcCode(status.code);
+  return new FirestoreError(code, status.message || '');
+}
+
+/**
+ * Returns a value for a number (or null) that's appropriate to put into
+ * a google.protobuf.Int32Value proto.
+ * DO NOT USE THIS FOR ANYTHING ELSE.
+ * This method cheats. It's typed as returning "number" because that's what
+ * our generated proto interfaces say Int32Value must be. But GRPC actually
+ * expects a { value: <number> } struct.
+ */
+function toInt32Proto(
+  serializer: JsonProtoSerializer,
+  val: number | null
+): number | { value: number } | null {
+  if (serializer.useProto3Json || isNullOrUndefined(val)) {
+    return val;
+  } else {
+    return { value: val };
   }
+}
 
-  /**
-   * Returns a value for a number (or null) that's appropriate to put into
-   * a google.protobuf.Int32Value proto.
-   * DO NOT USE THIS FOR ANYTHING ELSE.
-   * This method cheats. It's typed as returning "number" because that's what
-   * our generated proto interfaces say Int32Value must be. But GRPC actually
-   * expects a { value: <number> } struct.
-   */
-  private toInt32Value(val: number | null): number | null {
-    if (this.options.useProto3Json || typeUtils.isNullOrUndefined(val)) {
-      return val;
-    } else {
-      // ProtobufJS requires that we wrap Int32Values.
-      // Use any because we need to match generated Proto types.
+/**
+ * Returns a number (or null) from a google.protobuf.Int32Value proto.
+ */
+function fromInt32Proto(
+  val: number | { value: number } | undefined
+): number | null {
+  let result;
+  if (typeof val === 'object') {
+    result = val.value;
+  } else {
+    result = val;
+  }
+  return isNullOrUndefined(result) ? null : result;
+}
+
+/**
+ * Returns a value for a Date that's appropriate to put into a proto.
+ */
+export function toTimestamp(
+  serializer: JsonProtoSerializer,
+  timestamp: Timestamp
+): ProtoTimestamp {
+  if (serializer.useProto3Json) {
+    // Serialize to ISO-8601 date format, but with full nano resolution.
+    // Since JS Date has only millis, let's only use it for the seconds and
+    // then manually add the fractions to the end.
+    const jsDateStr = new Date(timestamp.seconds * 1000).toISOString();
+    // Remove .xxx frac part and Z in the end.
+    const strUntilSeconds = jsDateStr.replace(/\.\d*/, '').replace('Z', '');
+    // Pad the fraction out to 9 digits (nanos).
+    const nanoStr = ('000000000' + timestamp.nanoseconds).slice(-9);
+
+    return `${strUntilSeconds}.${nanoStr}Z`;
+  } else {
+    return {
+      seconds: '' + timestamp.seconds,
+      nanos: timestamp.nanoseconds
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return { value: val } as any;
-    }
+    } as any;
   }
+}
 
-  /**
-   * Returns a number (or null) from a google.protobuf.Int32Value proto.
-   * DO NOT USE THIS FOR ANYTHING ELSE.
-   * This method cheats. It's typed as accepting "number" because that's what
-   * our generated proto interfaces say Int32Value must be, but it actually
-   * accepts { value: number } to match our serialization in toInt32Value().
-   */
-  private fromInt32Value(val: number | undefined): number | null {
-    let result;
-    if (typeof val === 'object') {
-      // Use any because we need to match generated Proto types.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      result = (val as any).value;
-    } else {
-      // We accept raw numbers (without the {value: ... } wrapper) for
-      // compatibility with legacy persisted data.
-      result = val;
-    }
-    return typeUtils.isNullOrUndefined(result) ? null : result;
+function fromTimestamp(date: ProtoTimestamp): Timestamp {
+  const timestamp = normalizeTimestamp(date);
+  return new Timestamp(timestamp.seconds, timestamp.nanos);
+}
+
+/**
+ * Returns a value for bytes that's appropriate to put in a proto.
+ *
+ * Visible for testing.
+ */
+export function toBytes(
+  serializer: JsonProtoSerializer,
+  bytes: ByteString
+): string | Uint8Array {
+  if (serializer.useProto3Json) {
+    return bytes.toBase64();
+  } else {
+    return bytes.toUint8Array();
   }
+}
 
-  /**
-   * Returns a value for a Date that's appropriate to put into a proto.
-   * DO NOT USE THIS FOR ANYTHING ELSE.
-   * This method cheats. It's typed as returning "string" because that's what
-   * our generated proto interfaces say dates must be. But it's easier and safer
-   * to actually return a Timestamp proto.
-   */
-  private toTimestamp(timestamp: Timestamp): string {
-    if (this.options.useProto3Json) {
-      // Serialize to ISO-8601 date format, but with full nano resolution.
-      // Since JS Date has only millis, let's only use it for the seconds and
-      // then manually add the fractions to the end.
-      const jsDateStr = new Date(timestamp.seconds * 1000).toISOString();
-      // Remove .xxx frac part and Z in the end.
-      const strUntilSeconds = jsDateStr.replace(/\.\d*/, '').replace('Z', '');
-      // Pad the fraction out to 9 digits (nanos).
-      const nanoStr = ('000000000' + timestamp.nanoseconds).slice(-9);
-
-      return `${strUntilSeconds}.${nanoStr}Z`;
-    } else {
-      return {
-        seconds: '' + timestamp.seconds,
-        nanos: timestamp.nanoseconds
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } as any;
-    }
-  }
-
-  private fromTimestamp(date: string | TimestampProto): Timestamp {
-    // The json interface (for the browser) will return an iso timestamp string,
-    // while the proto js library (for node) will return a
-    // google.protobuf.Timestamp instance.
-    if (typeof date === 'string') {
-      // TODO(b/37282237): Use strings for Proto3 timestamps
-      // assert(this.options.useProto3Json,
-      //   'The timestamp string format requires Proto3.');
-      return this.fromIso8601String(date);
-    } else {
-      assert(!!date, 'Cannot deserialize null or undefined timestamp.');
-      // TODO(b/37282237): Use strings for Proto3 timestamps
-      // assert(!this.options.useProto3Json,
-      //   'The timestamp instance format requires Proto JS.');
-      const seconds = parseInt64(date.seconds || '0');
-      const nanos = date.nanos || 0;
-      return new Timestamp(seconds, nanos);
-    }
-  }
-
-  private fromIso8601String(utc: string): Timestamp {
-    // The date string can have higher precision (nanos) than the Date class
-    // (millis), so we do some custom parsing here.
-
-    // Parse the nanos right out of the string.
-    let nanos = 0;
-    const fraction = ISO_REG_EXP.exec(utc);
-    assert(!!fraction, 'invalid timestamp: ' + utc);
-    if (fraction[1]) {
-      // Pad the fraction out to 9 digits (nanos).
-      let nanoStr = fraction[1];
-      nanoStr = (nanoStr + '000000000').substr(0, 9);
-      nanos = Number(nanoStr);
-    }
-
-    // Parse the date to get the seconds.
-    const date = new Date(utc);
-    const seconds = Math.floor(date.getTime() / 1000);
-
-    return new Timestamp(seconds, nanos);
-  }
-
-  /**
-   * Returns a value for bytes that's appropriate to put in a proto.
-   * DO NOT USE THIS FOR ANYTHING ELSE.
-   * This method cheats. It's typed as returning "string" because that's what
-   * our generated proto interfaces say bytes must be. But it should return
-   * an Uint8Array in Node.
-   *
-   * Visible for testing.
-   */
-  toBytes(bytes: Blob | ByteString): string {
-    if (this.options.useProto3Json) {
-      return bytes.toBase64();
-    } else {
-      return (bytes.toUint8Array() as unknown) as string;
-    }
-  }
-
-  /**
-   * Returns a ByteString based on the proto string value.
-   */
-  fromBytes(value: string | Uint8Array | undefined): ByteString {
-    if (this.options.useProto3Json) {
-      assert(
-        value === undefined || typeof value === 'string',
-        'value must be undefined or a string when using proto3 Json'
-      );
-      return ByteString.fromBase64String(value ? value : '');
-    } else {
-      assert(
-        value === undefined || value instanceof Uint8Array,
-        'value must be undefined or Uint8Array'
-      );
-      return ByteString.fromUint8Array(value ? value : new Uint8Array());
-    }
-  }
-
-  /**
-   * Parse the blob from the protos into the internal Blob class. Note that the
-   * typings assume all blobs are strings, but they are actually Uint8Arrays
-   * on Node.
-   */
-  private fromBlob(blob: string | Uint8Array): Blob {
-    if (typeof blob === 'string') {
-      assert(
-        this.options.useProto3Json,
-        'Expected bytes to be passed in as Uint8Array, but got a string instead.'
-      );
-      return Blob.fromBase64String(blob);
-    } else {
-      assert(
-        !this.options.useProto3Json,
-        'Expected bytes to be passed in as Uint8Array, but got a string instead.'
-      );
-      return Blob.fromUint8Array(blob);
-    }
-  }
-
-  toVersion(version: SnapshotVersion): string {
-    return this.toTimestamp(version.toTimestamp());
-  }
-
-  fromVersion(version: string): SnapshotVersion {
-    assert(!!version, "Trying to deserialize version that isn't set");
-    return SnapshotVersion.fromTimestamp(this.fromTimestamp(version));
-  }
-
-  toResourceName(databaseId: DatabaseId, path: ResourcePath): string {
-    return this.fullyQualifiedPrefixPath(databaseId)
-      .child('documents')
-      .child(path)
-      .canonicalString();
-  }
-
-  fromResourceName(name: string): ResourcePath {
-    const resource = ResourcePath.fromString(name);
-    assert(
-      this.isValidResourceName(resource),
-      'Tried to deserialize invalid key ' + resource.toString()
+/**
+ * Returns a ByteString based on the proto string value.
+ */
+export function fromBytes(
+  serializer: JsonProtoSerializer,
+  value: string | Uint8Array | undefined
+): ByteString {
+  if (serializer.useProto3Json) {
+    hardAssert(
+      value === undefined || typeof value === 'string',
+      'value must be undefined or a string when using proto3 Json'
     );
-    return resource;
+    return ByteString.fromBase64String(value ? value : '');
+  } else {
+    hardAssert(
+      value === undefined ||
+        // Check if the value is an instance of both Buffer and Uint8Array,
+        // despite the fact that Buffer extends Uint8Array. In some
+        // environments, such as jsdom, the prototype chain of Buffer
+        // does not indicate that it extends Uint8Array.
+        value instanceof Buffer ||
+        value instanceof Uint8Array,
+      'value must be undefined, Buffer, or Uint8Array'
+    );
+    return ByteString.fromUint8Array(value ? value : new Uint8Array());
   }
+}
 
-  toName(key: DocumentKey): string {
-    return this.toResourceName(this.databaseId, key.path);
-  }
+export function toVersion(
+  serializer: JsonProtoSerializer,
+  version: SnapshotVersion
+): ProtoTimestamp {
+  return toTimestamp(serializer, version.toTimestamp());
+}
 
-  fromName(name: string): DocumentKey {
-    const resource = this.fromResourceName(name);
-    assert(
-      resource.get(1) === this.databaseId.projectId,
+export function fromVersion(version: ProtoTimestamp): SnapshotVersion {
+  hardAssert(!!version, "Trying to deserialize version that isn't set");
+  return SnapshotVersion.fromTimestamp(fromTimestamp(version));
+}
+
+export function toResourceName(
+  databaseId: DatabaseId,
+  path: ResourcePath
+): string {
+  return toResourcePath(databaseId, path).canonicalString();
+}
+
+export function toResourcePath(
+  databaseId: DatabaseId,
+  path?: ResourcePath
+): ResourcePath {
+  const resourcePath = fullyQualifiedPrefixPath(databaseId).child('documents');
+  return path === undefined ? resourcePath : resourcePath.child(path);
+}
+
+function fromResourceName(name: string): ResourcePath {
+  const resource = ResourcePath.fromString(name);
+  hardAssert(
+    isValidResourceName(resource),
+    'Tried to deserialize invalid key ' + resource.toString()
+  );
+  return resource;
+}
+
+export function toName(
+  serializer: JsonProtoSerializer,
+  key: DocumentKey
+): string {
+  return toResourceName(serializer.databaseId, key.path);
+}
+
+export function fromName(
+  serializer: JsonProtoSerializer,
+  name: string
+): DocumentKey {
+  const resource = fromResourceName(name);
+
+  if (resource.get(1) !== serializer.databaseId.projectId) {
+    throw new FirestoreError(
+      Code.INVALID_ARGUMENT,
       'Tried to deserialize key from different project: ' +
         resource.get(1) +
         ' vs ' +
-        this.databaseId.projectId
+        serializer.databaseId.projectId
     );
-    assert(
-      (!resource.get(3) && !this.databaseId.database) ||
-        resource.get(3) === this.databaseId.database,
+  }
+
+  if (resource.get(3) !== serializer.databaseId.database) {
+    throw new FirestoreError(
+      Code.INVALID_ARGUMENT,
       'Tried to deserialize key from different database: ' +
         resource.get(3) +
         ' vs ' +
-        this.databaseId.database
-    );
-    return new DocumentKey(this.extractLocalPathFromResourceName(resource));
-  }
-
-  toQueryPath(path: ResourcePath): string {
-    return this.toResourceName(this.databaseId, path);
-  }
-
-  fromQueryPath(name: string): ResourcePath {
-    const resourceName = this.fromResourceName(name);
-    // In v1beta1 queries for collections at the root did not have a trailing
-    // "/documents". In v1 all resource paths contain "/documents". Preserve the
-    // ability to read the v1beta1 form for compatibility with queries persisted
-    // in the local target cache.
-    if (resourceName.length === 4) {
-      return ResourcePath.EMPTY_PATH;
-    }
-    return this.extractLocalPathFromResourceName(resourceName);
-  }
-
-  get encodedDatabaseId(): string {
-    const path = new ResourcePath([
-      'projects',
-      this.databaseId.projectId,
-      'databases',
-      this.databaseId.database
-    ]);
-    return path.canonicalString();
-  }
-
-  private fullyQualifiedPrefixPath(databaseId: DatabaseId): ResourcePath {
-    return new ResourcePath([
-      'projects',
-      databaseId.projectId,
-      'databases',
-      databaseId.database
-    ]);
-  }
-
-  private extractLocalPathFromResourceName(
-    resourceName: ResourcePath
-  ): ResourcePath {
-    assert(
-      resourceName.length > 4 && resourceName.get(4) === 'documents',
-      'tried to deserialize invalid key ' + resourceName.toString()
-    );
-    return resourceName.popFirst(5);
-  }
-
-  private isValidResourceName(path: ResourcePath): boolean {
-    // Resource names have at least 4 components (project ID, database ID)
-    return (
-      path.length >= 4 &&
-      path.get(0) === 'projects' &&
-      path.get(2) === 'databases'
+        serializer.databaseId.database
     );
   }
+  return new DocumentKey(extractLocalPathFromResourceName(resource));
+}
 
-  toValue(val: fieldValue.FieldValue): api.Value {
-    if (val instanceof fieldValue.NullValue) {
-      return { nullValue: 'NULL_VALUE' };
-    } else if (val instanceof fieldValue.BooleanValue) {
-      return { booleanValue: val.value() };
-    } else if (val instanceof fieldValue.IntegerValue) {
-      return { integerValue: '' + val.value() };
-    } else if (val instanceof fieldValue.DoubleValue) {
-      const doubleValue = val.value();
-      if (this.options.useProto3Json) {
-        // Proto 3 let's us encode NaN and Infinity as string values as
-        // expected by the backend. This is currently not checked by our unit
-        // tests because they rely on protobuf.js.
-        if (isNaN(doubleValue)) {
-          return { doubleValue: 'NaN' } as {};
-        } else if (doubleValue === Infinity) {
-          return { doubleValue: 'Infinity' } as {};
-        } else if (doubleValue === -Infinity) {
-          return { doubleValue: '-Infinity' } as {};
-        } else if (typeUtils.isNegativeZero(doubleValue)) {
-          return { doubleValue: '-0' } as {};
-        }
-      }
-      return { doubleValue: val.value() };
-    } else if (val instanceof fieldValue.StringValue) {
-      return { stringValue: val.value() };
-    } else if (val instanceof fieldValue.ObjectValue) {
-      return { mapValue: this.toMapValue(val) };
-    } else if (val instanceof fieldValue.ArrayValue) {
-      return { arrayValue: this.toArrayValue(val) };
-    } else if (val instanceof fieldValue.TimestampValue) {
-      return {
-        timestampValue: this.toTimestamp(val.internalValue)
-      };
-    } else if (val instanceof fieldValue.GeoPointValue) {
-      return {
-        geoPointValue: {
-          latitude: val.value().latitude,
-          longitude: val.value().longitude
-        }
-      };
-    } else if (val instanceof fieldValue.BlobValue) {
-      return {
-        bytesValue: this.toBytes(val.value())
-      };
-    } else if (val instanceof fieldValue.RefValue) {
-      return {
-        referenceValue: this.toResourceName(val.databaseId, val.key.path)
-      };
-    } else {
-      return fail('Unknown FieldValue ' + JSON.stringify(val));
-    }
+function toQueryPath(
+  serializer: JsonProtoSerializer,
+  path: ResourcePath
+): string {
+  return toResourceName(serializer.databaseId, path);
+}
+
+function fromQueryPath(name: string): ResourcePath {
+  const resourceName = fromResourceName(name);
+  // In v1beta1 queries for collections at the root did not have a trailing
+  // "/documents". In v1 all resource paths contain "/documents". Preserve the
+  // ability to read the v1beta1 form for compatibility with queries persisted
+  // in the local target cache.
+  if (resourceName.length === 4) {
+    return ResourcePath.emptyPath();
   }
+  return extractLocalPathFromResourceName(resourceName);
+}
 
-  fromValue(obj: api.Value): fieldValue.FieldValue {
-    if ('nullValue' in obj) {
-      return fieldValue.NullValue.INSTANCE;
-    } else if ('booleanValue' in obj) {
-      return fieldValue.BooleanValue.of(obj.booleanValue!);
-    } else if ('integerValue' in obj) {
-      return new fieldValue.IntegerValue(parseInt64(obj.integerValue!));
-    } else if ('doubleValue' in obj) {
-      if (this.options.useProto3Json) {
-        // Proto 3 uses the string values 'NaN' and 'Infinity'.
-        if ((obj.doubleValue as {}) === 'NaN') {
-          return fieldValue.DoubleValue.NAN;
-        } else if ((obj.doubleValue as {}) === 'Infinity') {
-          return fieldValue.DoubleValue.POSITIVE_INFINITY;
-        } else if ((obj.doubleValue as {}) === '-Infinity') {
-          return fieldValue.DoubleValue.NEGATIVE_INFINITY;
-        } else if ((obj.doubleValue as {}) === '-0') {
-          return new fieldValue.DoubleValue(-0);
-        }
-      }
+export function getEncodedDatabaseId(serializer: JsonProtoSerializer): string {
+  const path = new ResourcePath([
+    'projects',
+    serializer.databaseId.projectId,
+    'databases',
+    serializer.databaseId.database
+  ]);
+  return path.canonicalString();
+}
 
-      return new fieldValue.DoubleValue(obj.doubleValue!);
-    } else if ('stringValue' in obj) {
-      return new fieldValue.StringValue(obj.stringValue!);
-    } else if ('mapValue' in obj) {
-      return this.fromFields(obj.mapValue!.fields || {});
-    } else if ('arrayValue' in obj) {
-      // "values" is not present if the array is empty
-      assertPresent(obj.arrayValue, 'arrayValue');
-      const values = obj.arrayValue.values || [];
-      return new fieldValue.ArrayValue(values.map(v => this.fromValue(v)));
-    } else if ('timestampValue' in obj) {
-      assertPresent(obj.timestampValue, 'timestampValue');
-      return new fieldValue.TimestampValue(
-        this.fromTimestamp(obj.timestampValue!)
-      );
-    } else if ('geoPointValue' in obj) {
-      assertPresent(obj.geoPointValue, 'geoPointValue');
-      const latitude = obj.geoPointValue.latitude || 0;
-      const longitude = obj.geoPointValue.longitude || 0;
-      return new fieldValue.GeoPointValue(new GeoPoint(latitude, longitude));
-    } else if ('bytesValue' in obj) {
-      assertPresent(obj.bytesValue, 'bytesValue');
-      const blob = this.fromBlob(obj.bytesValue);
-      return new fieldValue.BlobValue(blob);
-    } else if ('referenceValue' in obj) {
-      assertPresent(obj.referenceValue, 'referenceValue');
-      const resourceName = this.fromResourceName(obj.referenceValue);
-      const dbId = new DatabaseId(resourceName.get(1), resourceName.get(3));
-      const key = new DocumentKey(
-        this.extractLocalPathFromResourceName(resourceName)
-      );
-      return new fieldValue.RefValue(dbId, key);
-    } else {
-      return fail('Unknown Value proto ' + JSON.stringify(obj));
-    }
+function fullyQualifiedPrefixPath(databaseId: DatabaseId): ResourcePath {
+  return new ResourcePath([
+    'projects',
+    databaseId.projectId,
+    'databases',
+    databaseId.database
+  ]);
+}
+
+function extractLocalPathFromResourceName(
+  resourceName: ResourcePath
+): ResourcePath {
+  hardAssert(
+    resourceName.length > 4 && resourceName.get(4) === 'documents',
+    'tried to deserialize invalid key ' + resourceName.toString()
+  );
+  return resourceName.popFirst(5);
+}
+
+/** Creates a Document proto from key and fields (but no create/update time) */
+export function toMutationDocument(
+  serializer: JsonProtoSerializer,
+  key: DocumentKey,
+  fields: ObjectValue
+): ProtoDocument {
+  return {
+    name: toName(serializer, key),
+    fields: fields.value.mapValue.fields
+  };
+}
+
+export function toDocument(
+  serializer: JsonProtoSerializer,
+  document: MutableDocument
+): ProtoDocument {
+  debugAssert(
+    !document.hasLocalMutations,
+    "Can't serialize documents with mutations."
+  );
+  return {
+    name: toName(serializer, document.key),
+    fields: document.data.value.mapValue.fields,
+    updateTime: toTimestamp(serializer, document.version.toTimestamp()),
+    createTime: toTimestamp(serializer, document.createTime.toTimestamp())
+  };
+}
+
+export function fromDocument(
+  serializer: JsonProtoSerializer,
+  document: ProtoDocument,
+  hasCommittedMutations?: boolean
+): MutableDocument {
+  const key = fromName(serializer, document.name!);
+  const version = fromVersion(document.updateTime!);
+  // If we read a document from persistence that is missing createTime, it's due
+  // to older SDK versions not storing this information. In such cases, we'll
+  // set the createTime to zero. This can be removed in the long term.
+  const createTime = document.createTime
+    ? fromVersion(document.createTime)
+    : SnapshotVersion.min();
+  const data = new ObjectValue({ mapValue: { fields: document.fields } });
+  const result = MutableDocument.newFoundDocument(
+    key,
+    version,
+    createTime,
+    data
+  );
+  if (hasCommittedMutations) {
+    result.setHasCommittedMutations();
   }
+  return hasCommittedMutations ? result.setHasCommittedMutations() : result;
+}
 
-  /** Creates an api.Document from key and fields (but no create/update time) */
-  toMutationDocument(
-    key: DocumentKey,
-    fields: fieldValue.ObjectValue
-  ): api.Document {
-    return {
-      name: this.toName(key),
-      fields: this.toFields(fields)
-    };
+function fromFound(
+  serializer: JsonProtoSerializer,
+  doc: ProtoBatchGetDocumentsResponse
+): MutableDocument {
+  hardAssert(
+    !!doc.found,
+    'Tried to deserialize a found document from a missing document.'
+  );
+  assertPresent(doc.found.name, 'doc.found.name');
+  assertPresent(doc.found.updateTime, 'doc.found.updateTime');
+  const key = fromName(serializer, doc.found.name);
+  const version = fromVersion(doc.found.updateTime);
+  const createTime = doc.found.createTime
+    ? fromVersion(doc.found.createTime)
+    : SnapshotVersion.min();
+  const data = new ObjectValue({ mapValue: { fields: doc.found.fields } });
+  return MutableDocument.newFoundDocument(key, version, createTime, data);
+}
+
+function fromMissing(
+  serializer: JsonProtoSerializer,
+  result: ProtoBatchGetDocumentsResponse
+): MutableDocument {
+  hardAssert(
+    !!result.missing,
+    'Tried to deserialize a missing document from a found document.'
+  );
+  hardAssert(
+    !!result.readTime,
+    'Tried to deserialize a missing document without a read time.'
+  );
+  const key = fromName(serializer, result.missing);
+  const version = fromVersion(result.readTime);
+  return MutableDocument.newNoDocument(key, version);
+}
+
+export function fromBatchGetDocumentsResponse(
+  serializer: JsonProtoSerializer,
+  result: ProtoBatchGetDocumentsResponse
+): MutableDocument {
+  if ('found' in result) {
+    return fromFound(serializer, result);
+  } else if ('missing' in result) {
+    return fromMissing(serializer, result);
   }
+  return fail('invalid batch get response: ' + JSON.stringify(result));
+}
 
-  toDocument(document: Document): api.Document {
-    assert(
-      !document.hasLocalMutations,
-      "Can't serialize documents with mutations."
+export function fromWatchChange(
+  serializer: JsonProtoSerializer,
+  change: ProtoListenResponse
+): WatchChange {
+  let watchChange: WatchChange;
+  if ('targetChange' in change) {
+    assertPresent(change.targetChange, 'targetChange');
+    // proto3 default value is unset in JSON (undefined), so use 'NO_CHANGE'
+    // if unset
+    const state = fromWatchTargetChangeState(
+      change.targetChange.targetChangeType || 'NO_CHANGE'
     );
-    return {
-      name: this.toName(document.key),
-      fields: this.toFields(document.data()),
-      updateTime: this.toTimestamp(document.version.toTimestamp())
-    };
-  }
+    const targetIds: TargetId[] = change.targetChange.targetIds || [];
 
-  fromDocument(
-    document: api.Document,
-    hasCommittedMutations?: boolean
-  ): Document {
-    const key = this.fromName(document.name!);
-    const version = this.fromVersion(document.updateTime!);
-    return new Document(
+    const resumeToken = fromBytes(serializer, change.targetChange.resumeToken);
+    const causeProto = change.targetChange!.cause;
+    const cause = causeProto && fromRpcStatus(causeProto);
+    watchChange = new WatchTargetChange(
+      state,
+      targetIds,
+      resumeToken,
+      cause || null
+    );
+  } else if ('documentChange' in change) {
+    assertPresent(change.documentChange, 'documentChange');
+    const entityChange = change.documentChange;
+    assertPresent(entityChange.document, 'documentChange.name');
+    assertPresent(entityChange.document.name, 'documentChange.document.name');
+    assertPresent(
+      entityChange.document.updateTime,
+      'documentChange.document.updateTime'
+    );
+    const key = fromName(serializer, entityChange.document.name);
+    const version = fromVersion(entityChange.document.updateTime);
+    const createTime = entityChange.document.createTime
+      ? fromVersion(entityChange.document.createTime)
+      : SnapshotVersion.min();
+    const data = new ObjectValue({
+      mapValue: { fields: entityChange.document.fields }
+    });
+    const doc = MutableDocument.newFoundDocument(
       key,
       version,
-      { hasCommittedMutations: !!hasCommittedMutations },
-      undefined,
-      document,
-      v => this.fromValue(v)
+      createTime,
+      data
     );
+    const updatedTargetIds = entityChange.targetIds || [];
+    const removedTargetIds = entityChange.removedTargetIds || [];
+    watchChange = new DocumentWatchChange(
+      updatedTargetIds,
+      removedTargetIds,
+      doc.key,
+      doc
+    );
+  } else if ('documentDelete' in change) {
+    assertPresent(change.documentDelete, 'documentDelete');
+    const docDelete = change.documentDelete;
+    assertPresent(docDelete.document, 'documentDelete.document');
+    const key = fromName(serializer, docDelete.document);
+    const version = docDelete.readTime
+      ? fromVersion(docDelete.readTime)
+      : SnapshotVersion.min();
+    const doc = MutableDocument.newNoDocument(key, version);
+    const removedTargetIds = docDelete.removedTargetIds || [];
+    watchChange = new DocumentWatchChange([], removedTargetIds, doc.key, doc);
+  } else if ('documentRemove' in change) {
+    assertPresent(change.documentRemove, 'documentRemove');
+    const docRemove = change.documentRemove;
+    assertPresent(docRemove.document, 'documentRemove');
+    const key = fromName(serializer, docRemove.document);
+    const removedTargetIds = docRemove.removedTargetIds || [];
+    watchChange = new DocumentWatchChange([], removedTargetIds, key, null);
+  } else if ('filter' in change) {
+    // TODO(dimond): implement existence filter parsing with strategy.
+    assertPresent(change.filter, 'filter');
+    const filter = change.filter;
+    assertPresent(filter.targetId, 'filter.targetId');
+    const { count = 0, unchangedNames } = filter;
+    const existenceFilter = new ExistenceFilter(count, unchangedNames);
+    const targetId = filter.targetId;
+    watchChange = new ExistenceFilterChange(targetId, existenceFilter);
+  } else {
+    return fail('Unknown change type ' + JSON.stringify(change));
   }
+  return watchChange;
+}
 
-  toFields(fields: fieldValue.ObjectValue): { [key: string]: api.Value } {
-    const result: { [key: string]: api.Value } = {};
-    fields.forEach((key, value) => {
-      result[key] = this.toValue(value);
-    });
-    return result;
+function fromWatchTargetChangeState(
+  state: ProtoTargetChangeTargetChangeType
+): WatchTargetChangeState {
+  if (state === 'NO_CHANGE') {
+    return WatchTargetChangeState.NoChange;
+  } else if (state === 'ADD') {
+    return WatchTargetChangeState.Added;
+  } else if (state === 'REMOVE') {
+    return WatchTargetChangeState.Removed;
+  } else if (state === 'CURRENT') {
+    return WatchTargetChangeState.Current;
+  } else if (state === 'RESET') {
+    return WatchTargetChangeState.Reset;
+  } else {
+    return fail('Got unexpected TargetChange.state: ' + state);
   }
+}
 
-  fromFields(object: {}): fieldValue.ObjectValue {
-    // Proto map<string, Value> gets mapped to Object, so cast it.
-    const map = object as { [key: string]: api.Value };
-    const result = fieldValue.ObjectValue.newBuilder();
-    obj.forEach(map, (key, value) => {
-      result.set(new FieldPath([key]), this.fromValue(value));
-    });
-    return result.build();
+export function versionFromListenResponse(
+  change: ProtoListenResponse
+): SnapshotVersion {
+  // We have only reached a consistent snapshot for the entire stream if there
+  // is a read_time set and it applies to all targets (i.e. the list of
+  // targets is empty). The backend is guaranteed to send such responses.
+  if (!('targetChange' in change)) {
+    return SnapshotVersion.min();
   }
+  const targetChange = change.targetChange!;
+  if (targetChange.targetIds && targetChange.targetIds.length) {
+    return SnapshotVersion.min();
+  }
+  if (!targetChange.readTime) {
+    return SnapshotVersion.min();
+  }
+  return fromVersion(targetChange.readTime);
+}
 
-  toMapValue(map: fieldValue.ObjectValue): api.MapValue {
-    return {
-      fields: this.toFields(map)
+export function toMutation(
+  serializer: JsonProtoSerializer,
+  mutation: Mutation
+): ProtoWrite {
+  let result: ProtoWrite;
+  if (mutation instanceof SetMutation) {
+    result = {
+      update: toMutationDocument(serializer, mutation.key, mutation.value)
     };
+  } else if (mutation instanceof DeleteMutation) {
+    result = { delete: toName(serializer, mutation.key) };
+  } else if (mutation instanceof PatchMutation) {
+    result = {
+      update: toMutationDocument(serializer, mutation.key, mutation.data),
+      updateMask: toDocumentMask(mutation.fieldMask)
+    };
+  } else if (mutation instanceof VerifyMutation) {
+    result = {
+      verify: toName(serializer, mutation.key)
+    };
+  } else {
+    return fail('Unknown mutation type ' + mutation.type);
   }
 
-  toArrayValue(array: fieldValue.ArrayValue): api.ArrayValue {
-    const result: api.Value[] = [];
-    array.forEach(value => {
-      result.push(this.toValue(value));
+  if (mutation.fieldTransforms.length > 0) {
+    result.updateTransforms = mutation.fieldTransforms.map(transform =>
+      toFieldTransform(serializer, transform)
+    );
+  }
+
+  if (!mutation.precondition.isNone) {
+    result.currentDocument = toPrecondition(serializer, mutation.precondition);
+  }
+
+  return result;
+}
+
+export function fromMutation(
+  serializer: JsonProtoSerializer,
+  proto: ProtoWrite
+): Mutation {
+  const precondition = proto.currentDocument
+    ? fromPrecondition(proto.currentDocument)
+    : Precondition.none();
+
+  const fieldTransforms = proto.updateTransforms
+    ? proto.updateTransforms.map(transform =>
+        fromFieldTransform(serializer, transform)
+      )
+    : [];
+
+  if (proto.update) {
+    assertPresent(proto.update.name, 'name');
+    const key = fromName(serializer, proto.update.name);
+    const value = new ObjectValue({
+      mapValue: { fields: proto.update.fields }
     });
-    return { values: result };
-  }
 
-  private fromFound(doc: api.BatchGetDocumentsResponse): Document {
-    assert(
-      !!doc.found,
-      'Tried to deserialize a found document from a missing document.'
-    );
-    assertPresent(doc.found.name, 'doc.found.name');
-    assertPresent(doc.found.updateTime, 'doc.found.updateTime');
-    const key = this.fromName(doc.found.name);
-    const version = this.fromVersion(doc.found.updateTime);
-    return new Document(key, version, {}, undefined, doc.found, v =>
-      this.fromValue(v)
-    );
-  }
-
-  private fromMissing(result: api.BatchGetDocumentsResponse): NoDocument {
-    assert(
-      !!result.missing,
-      'Tried to deserialize a missing document from a found document.'
-    );
-    assert(
-      !!result.readTime,
-      'Tried to deserialize a missing document without a read time.'
-    );
-    const key = this.fromName(result.missing);
-    const version = this.fromVersion(result.readTime);
-    return new NoDocument(key, version);
-  }
-
-  fromMaybeDocument(result: api.BatchGetDocumentsResponse): MaybeDocument {
-    if ('found' in result) {
-      return this.fromFound(result);
-    } else if ('missing' in result) {
-      return this.fromMissing(result);
-    }
-    return fail('invalid batch get response: ' + JSON.stringify(result));
-  }
-
-  private toWatchTargetChangeState(
-    state: WatchTargetChangeState
-  ): api.TargetChangeTargetChangeType {
-    switch (state) {
-      case WatchTargetChangeState.Added:
-        return 'ADD';
-      case WatchTargetChangeState.Current:
-        return 'CURRENT';
-      case WatchTargetChangeState.NoChange:
-        return 'NO_CHANGE';
-      case WatchTargetChangeState.Removed:
-        return 'REMOVE';
-      case WatchTargetChangeState.Reset:
-        return 'RESET';
-      default:
-        return fail('Unknown WatchTargetChangeState: ' + state);
-    }
-  }
-
-  toTestWatchChange(watchChange: WatchChange): api.ListenResponse {
-    if (watchChange instanceof ExistenceFilterChange) {
-      return {
-        filter: {
-          count: watchChange.existenceFilter.count,
-          targetId: watchChange.targetId
-        }
-      };
-    }
-    if (watchChange instanceof DocumentWatchChange) {
-      if (watchChange.newDoc instanceof Document) {
-        const doc = watchChange.newDoc;
-        return {
-          documentChange: {
-            document: {
-              name: this.toName(doc.key),
-              fields: this.toFields(doc.data()),
-              updateTime: this.toVersion(doc.version)
-            },
-            targetIds: watchChange.updatedTargetIds,
-            removedTargetIds: watchChange.removedTargetIds
-          }
-        };
-      } else if (watchChange.newDoc instanceof NoDocument) {
-        const doc = watchChange.newDoc;
-        return {
-          documentDelete: {
-            document: this.toName(doc.key),
-            readTime: this.toVersion(doc.version),
-            removedTargetIds: watchChange.removedTargetIds
-          }
-        };
-      } else if (watchChange.newDoc === null) {
-        return {
-          documentRemove: {
-            document: this.toName(watchChange.key),
-            removedTargetIds: watchChange.removedTargetIds
-          }
-        };
-      }
-    }
-    if (watchChange instanceof WatchTargetChange) {
-      let cause: api.Status | undefined = undefined;
-      if (watchChange.cause) {
-        cause = {
-          code: mapRpcCodeFromCode(watchChange.cause.code),
-          message: watchChange.cause.message
-        };
-      }
-      return {
-        targetChange: {
-          targetChangeType: this.toWatchTargetChangeState(watchChange.state),
-          targetIds: watchChange.targetIds,
-          resumeToken: this.toBytes(watchChange.resumeToken),
-          cause
-        }
-      };
-    }
-    return fail('Unrecognized watch change: ' + JSON.stringify(watchChange));
-  }
-
-  fromWatchChange(change: api.ListenResponse): WatchChange {
-    let watchChange: WatchChange;
-    if ('targetChange' in change) {
-      assertPresent(change.targetChange, 'targetChange');
-      // proto3 default value is unset in JSON (undefined), so use 'NO_CHANGE'
-      // if unset
-      const state = this.fromWatchTargetChangeState(
-        change.targetChange.targetChangeType || 'NO_CHANGE'
-      );
-      const targetIds: TargetId[] = change.targetChange.targetIds || [];
-
-      const resumeToken = this.fromBytes(change.targetChange.resumeToken);
-      const causeProto = change.targetChange!.cause;
-      const cause = causeProto && this.fromRpcStatus(causeProto);
-      watchChange = new WatchTargetChange(
-        state,
-        targetIds,
-        resumeToken,
-        cause || null
-      );
-    } else if ('documentChange' in change) {
-      assertPresent(change.documentChange, 'documentChange');
-      const entityChange = change.documentChange;
-      assertPresent(entityChange.document, 'documentChange.name');
-      assertPresent(entityChange.document.name, 'documentChange.document.name');
-      assertPresent(
-        entityChange.document.updateTime,
-        'documentChange.document.updateTime'
-      );
-      const key = this.fromName(entityChange.document.name);
-      const version = this.fromVersion(entityChange.document.updateTime);
-      const doc = new Document(
+    if (proto.updateMask) {
+      const fieldMask = fromDocumentMask(proto.updateMask);
+      return new PatchMutation(
         key,
-        version,
-        {},
-        undefined,
-        entityChange.document!,
-        v => this.fromValue(v)
-      );
-      const updatedTargetIds = entityChange.targetIds || [];
-      const removedTargetIds = entityChange.removedTargetIds || [];
-      watchChange = new DocumentWatchChange(
-        updatedTargetIds,
-        removedTargetIds,
-        doc.key,
-        doc
-      );
-    } else if ('documentDelete' in change) {
-      assertPresent(change.documentDelete, 'documentDelete');
-      const docDelete = change.documentDelete;
-      assertPresent(docDelete.document, 'documentDelete.document');
-      const key = this.fromName(docDelete.document);
-      const version = docDelete.readTime
-        ? this.fromVersion(docDelete.readTime)
-        : SnapshotVersion.forDeletedDoc();
-      const doc = new NoDocument(key, version);
-      const removedTargetIds = docDelete.removedTargetIds || [];
-      watchChange = new DocumentWatchChange([], removedTargetIds, doc.key, doc);
-    } else if ('documentRemove' in change) {
-      assertPresent(change.documentRemove, 'documentRemove');
-      const docRemove = change.documentRemove;
-      assertPresent(docRemove.document, 'documentRemove');
-      const key = this.fromName(docRemove.document);
-      const removedTargetIds = docRemove.removedTargetIds || [];
-      watchChange = new DocumentWatchChange([], removedTargetIds, key, null);
-    } else if ('filter' in change) {
-      // TODO(dimond): implement existence filter parsing with strategy.
-      assertPresent(change.filter, 'filter');
-      const filter = change.filter;
-      assertPresent(filter.targetId, 'filter.targetId');
-      const count = filter.count || 0;
-      const existenceFilter = new ExistenceFilter(count);
-      const targetId = filter.targetId;
-      watchChange = new ExistenceFilterChange(targetId, existenceFilter);
-    } else {
-      return fail('Unknown change type ' + JSON.stringify(change));
-    }
-    return watchChange;
-  }
-
-  fromWatchTargetChangeState(
-    state: api.TargetChangeTargetChangeType
-  ): WatchTargetChangeState {
-    if (state === 'NO_CHANGE') {
-      return WatchTargetChangeState.NoChange;
-    } else if (state === 'ADD') {
-      return WatchTargetChangeState.Added;
-    } else if (state === 'REMOVE') {
-      return WatchTargetChangeState.Removed;
-    } else if (state === 'CURRENT') {
-      return WatchTargetChangeState.Current;
-    } else if (state === 'RESET') {
-      return WatchTargetChangeState.Reset;
-    } else {
-      return fail('Got unexpected TargetChange.state: ' + state);
-    }
-  }
-
-  versionFromListenResponse(change: api.ListenResponse): SnapshotVersion {
-    // We have only reached a consistent snapshot for the entire stream if there
-    // is a read_time set and it applies to all targets (i.e. the list of
-    // targets is empty). The backend is guaranteed to send such responses.
-    if (!('targetChange' in change)) {
-      return SnapshotVersion.MIN;
-    }
-    const targetChange = change.targetChange!;
-    if (targetChange.targetIds && targetChange.targetIds.length) {
-      return SnapshotVersion.MIN;
-    }
-    if (!targetChange.readTime) {
-      return SnapshotVersion.MIN;
-    }
-    return this.fromVersion(targetChange.readTime);
-  }
-
-  toMutation(mutation: Mutation): api.Write {
-    let result: api.Write;
-    if (mutation instanceof SetMutation) {
-      result = {
-        update: this.toMutationDocument(mutation.key, mutation.value)
-      };
-    } else if (mutation instanceof DeleteMutation) {
-      result = { delete: this.toName(mutation.key) };
-    } else if (mutation instanceof PatchMutation) {
-      result = {
-        update: this.toMutationDocument(mutation.key, mutation.data),
-        updateMask: this.toDocumentMask(mutation.fieldMask)
-      };
-    } else if (mutation instanceof TransformMutation) {
-      result = {
-        transform: {
-          document: this.toName(mutation.key),
-          fieldTransforms: mutation.fieldTransforms.map(transform =>
-            this.toFieldTransform(transform)
-          )
-        }
-      };
-    } else if (mutation instanceof VerifyMutation) {
-      result = {
-        verify: this.toName(mutation.key)
-      };
-    } else {
-      return fail('Unknown mutation type ' + mutation.type);
-    }
-
-    if (!mutation.precondition.isNone) {
-      result.currentDocument = this.toPrecondition(mutation.precondition);
-    }
-
-    return result;
-  }
-
-  fromMutation(proto: api.Write): Mutation {
-    const precondition = proto.currentDocument
-      ? this.fromPrecondition(proto.currentDocument)
-      : Precondition.NONE;
-
-    if (proto.update) {
-      assertPresent(proto.update.name, 'name');
-      const key = this.fromName(proto.update.name);
-      const value = this.fromFields(proto.update.fields || {});
-      if (proto.updateMask) {
-        const fieldMask = this.fromDocumentMask(proto.updateMask);
-        return new PatchMutation(key, value, fieldMask, precondition);
-      } else {
-        return new SetMutation(key, value, precondition);
-      }
-    } else if (proto.delete) {
-      const key = this.fromName(proto.delete);
-      return new DeleteMutation(key, precondition);
-    } else if (proto.transform) {
-      const key = this.fromName(proto.transform.document!);
-      const fieldTransforms = proto.transform.fieldTransforms!.map(transform =>
-        this.fromFieldTransform(transform)
-      );
-      assert(
-        precondition.exists === true,
-        'Transforms only support precondition "exists == true"'
-      );
-      return new TransformMutation(key, fieldTransforms);
-    } else if (proto.verify) {
-      const key = this.fromName(proto.verify);
-      return new VerifyMutation(key, precondition);
-    } else {
-      return fail('unknown mutation proto: ' + JSON.stringify(proto));
-    }
-  }
-
-  private toPrecondition(precondition: Precondition): api.Precondition {
-    assert(!precondition.isNone, "Can't serialize an empty precondition");
-    if (precondition.updateTime !== undefined) {
-      return {
-        updateTime: this.toVersion(precondition.updateTime)
-      };
-    } else if (precondition.exists !== undefined) {
-      return { exists: precondition.exists };
-    } else {
-      return fail('Unknown precondition');
-    }
-  }
-
-  private fromPrecondition(precondition: api.Precondition): Precondition {
-    if (precondition.updateTime !== undefined) {
-      return Precondition.updateTime(this.fromVersion(precondition.updateTime));
-    } else if (precondition.exists !== undefined) {
-      return Precondition.exists(precondition.exists);
-    } else {
-      return Precondition.NONE;
-    }
-  }
-
-  private fromWriteResult(
-    proto: api.WriteResult,
-    commitTime: string
-  ): MutationResult {
-    // NOTE: Deletes don't have an updateTime.
-    let version = proto.updateTime
-      ? this.fromVersion(proto.updateTime)
-      : this.fromVersion(commitTime);
-
-    if (version.isEqual(SnapshotVersion.MIN)) {
-      // The Firestore Emulator currently returns an update time of 0 for
-      // deletes of non-existing documents (rather than null). This breaks the
-      // test "get deleted doc while offline with source=cache" as NoDocuments
-      // with version 0 are filtered by IndexedDb's RemoteDocumentCache.
-      // TODO(#2149): Remove this when Emulator is fixed
-      version = this.fromVersion(commitTime);
-    }
-
-    let transformResults: fieldValue.FieldValue[] | null = null;
-    if (proto.transformResults && proto.transformResults.length > 0) {
-      transformResults = proto.transformResults.map(result =>
-        this.fromValue(result)
-      );
-    }
-    return new MutationResult(version, transformResults);
-  }
-
-  fromWriteResults(
-    protos: api.WriteResult[] | undefined,
-    commitTime?: string
-  ): MutationResult[] {
-    if (protos && protos.length > 0) {
-      assert(
-        commitTime !== undefined,
-        'Received a write result without a commit time'
-      );
-      return protos.map(proto => this.fromWriteResult(proto, commitTime));
-    } else {
-      return [];
-    }
-  }
-
-  private toFieldTransform(fieldTransform: FieldTransform): api.FieldTransform {
-    const transform = fieldTransform.transform;
-    if (transform instanceof ServerTimestampTransform) {
-      return {
-        fieldPath: fieldTransform.field.canonicalString(),
-        setToServerValue: 'REQUEST_TIME'
-      };
-    } else if (transform instanceof ArrayUnionTransformOperation) {
-      return {
-        fieldPath: fieldTransform.field.canonicalString(),
-        appendMissingElements: {
-          values: transform.elements.map(v => this.toValue(v))
-        }
-      };
-    } else if (transform instanceof ArrayRemoveTransformOperation) {
-      return {
-        fieldPath: fieldTransform.field.canonicalString(),
-        removeAllFromArray: {
-          values: transform.elements.map(v => this.toValue(v))
-        }
-      };
-    } else if (transform instanceof NumericIncrementTransformOperation) {
-      return {
-        fieldPath: fieldTransform.field.canonicalString(),
-        increment: this.toValue(transform.operand)
-      };
-    } else {
-      throw fail('Unknown transform: ' + fieldTransform.transform);
-    }
-  }
-
-  private fromFieldTransform(proto: api.FieldTransform): FieldTransform {
-    let transform: TransformOperation | null = null;
-    if ('setToServerValue' in proto) {
-      assert(
-        proto.setToServerValue === 'REQUEST_TIME',
-        'Unknown server value transform proto: ' + JSON.stringify(proto)
-      );
-      transform = ServerTimestampTransform.instance;
-    } else if ('appendMissingElements' in proto) {
-      const values = proto.appendMissingElements!.values || [];
-      transform = new ArrayUnionTransformOperation(
-        values.map(v => this.fromValue(v))
-      );
-    } else if ('removeAllFromArray' in proto) {
-      const values = proto.removeAllFromArray!.values || [];
-      transform = new ArrayRemoveTransformOperation(
-        values.map(v => this.fromValue(v))
-      );
-    } else if ('increment' in proto) {
-      const operand = this.fromValue(proto.increment!);
-      assert(
-        operand instanceof fieldValue.NumberValue,
-        'NUMERIC_ADD transform requires a NumberValue'
-      );
-      transform = new NumericIncrementTransformOperation(
-        operand as fieldValue.NumberValue
+        value,
+        fieldMask,
+        precondition,
+        fieldTransforms
       );
     } else {
-      fail('Unknown transform proto: ' + JSON.stringify(proto));
+      return new SetMutation(key, value, precondition, fieldTransforms);
     }
-    const fieldPath = FieldPath.fromServerFormat(proto.fieldPath!);
-    return new FieldTransform(fieldPath, transform!);
+  } else if (proto.delete) {
+    const key = fromName(serializer, proto.delete);
+    return new DeleteMutation(key, precondition);
+  } else if (proto.verify) {
+    const key = fromName(serializer, proto.verify);
+    return new VerifyMutation(key, precondition);
+  } else {
+    return fail('unknown mutation proto: ' + JSON.stringify(proto));
+  }
+}
+
+function toPrecondition(
+  serializer: JsonProtoSerializer,
+  precondition: Precondition
+): ProtoPrecondition {
+  debugAssert(!precondition.isNone, "Can't serialize an empty precondition");
+  if (precondition.updateTime !== undefined) {
+    return {
+      updateTime: toVersion(serializer, precondition.updateTime)
+    };
+  } else if (precondition.exists !== undefined) {
+    return { exists: precondition.exists };
+  } else {
+    return fail('Unknown precondition');
+  }
+}
+
+function fromPrecondition(precondition: ProtoPrecondition): Precondition {
+  if (precondition.updateTime !== undefined) {
+    return Precondition.updateTime(fromVersion(precondition.updateTime));
+  } else if (precondition.exists !== undefined) {
+    return Precondition.exists(precondition.exists);
+  } else {
+    return Precondition.none();
+  }
+}
+
+function fromWriteResult(
+  proto: ProtoWriteResult,
+  commitTime: ProtoTimestamp
+): MutationResult {
+  // NOTE: Deletes don't have an updateTime.
+  let version = proto.updateTime
+    ? fromVersion(proto.updateTime)
+    : fromVersion(commitTime);
+
+  if (version.isEqual(SnapshotVersion.min())) {
+    // The Firestore Emulator currently returns an update time of 0 for
+    // deletes of non-existing documents (rather than null). This breaks the
+    // test "get deleted doc while offline with source=cache" as NoDocuments
+    // with version 0 are filtered by IndexedDb's RemoteDocumentCache.
+    // TODO(#2149): Remove this when Emulator is fixed
+    version = fromVersion(commitTime);
   }
 
-  toDocumentsTarget(target: Target): api.DocumentsTarget {
-    return { documents: [this.toQueryPath(target.path)] };
-  }
+  return new MutationResult(version, proto.transformResults || []);
+}
 
-  fromDocumentsTarget(documentsTarget: api.DocumentsTarget): Target {
-    const count = documentsTarget.documents!.length;
-    assert(
-      count === 1,
-      'DocumentsTarget contained other than 1 document: ' + count
+export function fromWriteResults(
+  protos: ProtoWriteResult[] | undefined,
+  commitTime?: ProtoTimestamp
+): MutationResult[] {
+  if (protos && protos.length > 0) {
+    hardAssert(
+      commitTime !== undefined,
+      'Received a write result without a commit time'
     );
-    const name = documentsTarget.documents![0];
-    return Query.atPath(this.fromQueryPath(name)).toTarget();
+    return protos.map(proto => fromWriteResult(proto, commitTime));
+  } else {
+    return [];
   }
+}
 
-  toQueryTarget(target: Target): api.QueryTarget {
-    // Dissect the path into parent, collectionId, and optional key filter.
-    const result: api.QueryTarget = { structuredQuery: {} };
-    const path = target.path;
-    if (target.collectionGroup !== null) {
-      assert(
-        path.length % 2 === 0,
-        'Collection Group queries should be within a document path or root.'
-      );
-      result.parent = this.toQueryPath(path);
-      result.structuredQuery!.from = [
-        {
-          collectionId: target.collectionGroup,
-          allDescendants: true
-        }
-      ];
-    } else {
-      assert(
-        path.length % 2 !== 0,
-        'Document queries with filters are not supported.'
-      );
-      result.parent = this.toQueryPath(path.popLast());
-      result.structuredQuery!.from = [{ collectionId: path.lastSegment() }];
-    }
-
-    const where = this.toFilter(target.filters);
-    if (where) {
-      result.structuredQuery!.where = where;
-    }
-
-    const orderBy = this.toOrder(target.orderBy);
-    if (orderBy) {
-      result.structuredQuery!.orderBy = orderBy;
-    }
-
-    const limit = this.toInt32Value(target.limit);
-    if (limit !== null) {
-      result.structuredQuery!.limit = limit;
-    }
-
-    if (target.startAt) {
-      result.structuredQuery!.startAt = this.toCursor(target.startAt);
-    }
-    if (target.endAt) {
-      result.structuredQuery!.endAt = this.toCursor(target.endAt);
-    }
-
-    return result;
-  }
-
-  fromQueryTarget(target: api.QueryTarget): Target {
-    let path = this.fromQueryPath(target.parent!);
-
-    const query = target.structuredQuery!;
-    const fromCount = query.from ? query.from.length : 0;
-    let collectionGroup: string | null = null;
-    if (fromCount > 0) {
-      assert(
-        fromCount === 1,
-        'StructuredQuery.from with more than one collection is not supported.'
-      );
-      const from = query.from![0];
-      if (from.allDescendants) {
-        collectionGroup = from.collectionId!;
-      } else {
-        path = path.child(from.collectionId!);
+function toFieldTransform(
+  serializer: JsonProtoSerializer,
+  fieldTransform: FieldTransform
+): ProtoFieldTransform {
+  const transform = fieldTransform.transform;
+  if (transform instanceof ServerTimestampTransform) {
+    return {
+      fieldPath: fieldTransform.field.canonicalString(),
+      setToServerValue: 'REQUEST_TIME'
+    };
+  } else if (transform instanceof ArrayUnionTransformOperation) {
+    return {
+      fieldPath: fieldTransform.field.canonicalString(),
+      appendMissingElements: {
+        values: transform.elements
       }
-    }
+    };
+  } else if (transform instanceof ArrayRemoveTransformOperation) {
+    return {
+      fieldPath: fieldTransform.field.canonicalString(),
+      removeAllFromArray: {
+        values: transform.elements
+      }
+    };
+  } else if (transform instanceof NumericIncrementTransformOperation) {
+    return {
+      fieldPath: fieldTransform.field.canonicalString(),
+      increment: transform.operand
+    };
+  } else {
+    throw fail('Unknown transform: ' + fieldTransform.transform);
+  }
+}
 
-    let filterBy: Filter[] = [];
-    if (query.where) {
-      filterBy = this.fromFilter(query.where);
-    }
+function fromFieldTransform(
+  serializer: JsonProtoSerializer,
+  proto: ProtoFieldTransform
+): FieldTransform {
+  let transform: TransformOperation | null = null;
+  if ('setToServerValue' in proto) {
+    hardAssert(
+      proto.setToServerValue === 'REQUEST_TIME',
+      'Unknown server value transform proto: ' + JSON.stringify(proto)
+    );
+    transform = new ServerTimestampTransform();
+  } else if ('appendMissingElements' in proto) {
+    const values = proto.appendMissingElements!.values || [];
+    transform = new ArrayUnionTransformOperation(values);
+  } else if ('removeAllFromArray' in proto) {
+    const values = proto.removeAllFromArray!.values || [];
+    transform = new ArrayRemoveTransformOperation(values);
+  } else if ('increment' in proto) {
+    transform = new NumericIncrementTransformOperation(
+      serializer,
+      proto.increment!
+    );
+  } else {
+    fail('Unknown transform proto: ' + JSON.stringify(proto));
+  }
+  const fieldPath = FieldPath.fromServerFormat(proto.fieldPath!);
+  return new FieldTransform(fieldPath, transform!);
+}
 
-    let orderBy: OrderBy[] = [];
-    if (query.orderBy) {
-      orderBy = this.fromOrder(query.orderBy);
-    }
+export function toDocumentsTarget(
+  serializer: JsonProtoSerializer,
+  target: Target
+): ProtoDocumentsTarget {
+  return { documents: [toQueryPath(serializer, target.path)] };
+}
 
-    let limit: number | null = null;
-    if (query.limit) {
-      limit = this.fromInt32Value(query.limit);
-    }
+export function fromDocumentsTarget(
+  documentsTarget: ProtoDocumentsTarget
+): Target {
+  const count = documentsTarget.documents!.length;
+  hardAssert(
+    count === 1,
+    'DocumentsTarget contained other than 1 document: ' + count
+  );
+  const name = documentsTarget.documents![0];
+  return queryToTarget(newQueryForPath(fromQueryPath(name)));
+}
 
-    let startAt: Bound | null = null;
-    if (query.startAt) {
-      startAt = this.fromCursor(query.startAt);
-    }
+export function toQueryTarget(
+  serializer: JsonProtoSerializer,
+  target: Target
+): { queryTarget: ProtoQueryTarget; parent: ResourcePath } {
+  // Dissect the path into parent, collectionId, and optional key filter.
+  const queryTarget: ProtoQueryTarget = { structuredQuery: {} };
+  const path = target.path;
+  let parent: ResourcePath;
+  if (target.collectionGroup !== null) {
+    debugAssert(
+      path.length % 2 === 0,
+      'Collection Group queries should be within a document path or root.'
+    );
+    parent = path;
+    queryTarget.structuredQuery!.from = [
+      {
+        collectionId: target.collectionGroup,
+        allDescendants: true
+      }
+    ];
+  } else {
+    debugAssert(
+      path.length % 2 !== 0,
+      'Document queries with filters are not supported.'
+    );
+    parent = path.popLast();
+    queryTarget.structuredQuery!.from = [{ collectionId: path.lastSegment() }];
+  }
+  queryTarget.parent = toQueryPath(serializer, parent);
 
-    let endAt: Bound | null = null;
-    if (query.endAt) {
-      endAt = this.fromCursor(query.endAt);
-    }
-
-    return new Query(
-      path,
-      collectionGroup,
-      orderBy,
-      filterBy,
-      limit,
-      LimitType.First,
-      startAt,
-      endAt
-    ).toTarget();
+  const where = toFilters(target.filters);
+  if (where) {
+    queryTarget.structuredQuery!.where = where;
   }
 
-  toListenRequestLabels(
-    targetData: TargetData
-  ): api.ApiClientObjectMap<string> | null {
-    const value = this.toLabel(targetData.purpose);
-    if (value == null) {
+  const orderBy = toOrder(target.orderBy);
+  if (orderBy) {
+    queryTarget.structuredQuery!.orderBy = orderBy;
+  }
+
+  const limit = toInt32Proto(serializer, target.limit);
+  if (limit !== null) {
+    queryTarget.structuredQuery!.limit = limit;
+  }
+
+  if (target.startAt) {
+    queryTarget.structuredQuery!.startAt = toStartAtCursor(target.startAt);
+  }
+  if (target.endAt) {
+    queryTarget.structuredQuery!.endAt = toEndAtCursor(target.endAt);
+  }
+
+  return { queryTarget, parent };
+}
+
+export function toRunAggregationQueryRequest(
+  serializer: JsonProtoSerializer,
+  target: Target,
+  aggregates: Aggregate[],
+  skipAliasing?: boolean
+): {
+  request: ProtoRunAggregationQueryRequest;
+  aliasMap: Record<string, string>;
+  parent: ResourcePath;
+} {
+  const { queryTarget, parent } = toQueryTarget(serializer, target);
+  const aliasMap: Record<string, string> = {};
+
+  const aggregations: ProtoAggregation[] = [];
+  let aggregationNum = 0;
+
+  aggregates.forEach(aggregate => {
+    // Map all client-side aliases to a unique short-form
+    // alias. This avoids issues with client-side aliases that
+    // exceed the 1500-byte string size limit.
+    const serverAlias = skipAliasing
+      ? aggregate.alias
+      : `aggregate_${aggregationNum++}`;
+    aliasMap[serverAlias] = aggregate.alias;
+
+    if (aggregate.aggregateType === 'count') {
+      aggregations.push({
+        alias: serverAlias,
+        count: {}
+      });
+    } else if (aggregate.aggregateType === 'avg') {
+      aggregations.push({
+        alias: serverAlias,
+        avg: {
+          field: toFieldPathReference(aggregate.fieldPath!)
+        }
+      });
+    } else if (aggregate.aggregateType === 'sum') {
+      aggregations.push({
+        alias: serverAlias,
+        sum: {
+          field: toFieldPathReference(aggregate.fieldPath!)
+        }
+      });
+    }
+  });
+
+  return {
+    request: {
+      structuredAggregationQuery: {
+        aggregations,
+        structuredQuery: queryTarget.structuredQuery
+      },
+      parent: queryTarget.parent
+    },
+    aliasMap,
+    parent
+  };
+}
+
+export function convertQueryTargetToQuery(target: ProtoQueryTarget): Query {
+  let path = fromQueryPath(target.parent!);
+
+  const query = target.structuredQuery!;
+  const fromCount = query.from ? query.from.length : 0;
+  let collectionGroup: string | null = null;
+  if (fromCount > 0) {
+    hardAssert(
+      fromCount === 1,
+      'StructuredQuery.from with more than one collection is not supported.'
+    );
+    const from = query.from![0];
+    if (from.allDescendants) {
+      collectionGroup = from.collectionId!;
+    } else {
+      path = path.child(from.collectionId!);
+    }
+  }
+
+  let filterBy: Filter[] = [];
+  if (query.where) {
+    filterBy = fromFilters(query.where);
+  }
+
+  let orderBy: OrderBy[] = [];
+  if (query.orderBy) {
+    orderBy = fromOrder(query.orderBy);
+  }
+
+  let limit: number | null = null;
+  if (query.limit) {
+    limit = fromInt32Proto(query.limit);
+  }
+
+  let startAt: Bound | null = null;
+  if (query.startAt) {
+    startAt = fromStartAtCursor(query.startAt);
+  }
+
+  let endAt: Bound | null = null;
+  if (query.endAt) {
+    endAt = fromEndAtCursor(query.endAt);
+  }
+
+  return newQuery(
+    path,
+    collectionGroup,
+    orderBy,
+    filterBy,
+    limit,
+    LimitType.First,
+    startAt,
+    endAt
+  );
+}
+
+export function fromQueryTarget(target: ProtoQueryTarget): Target {
+  return queryToTarget(convertQueryTargetToQuery(target));
+}
+
+export function toListenRequestLabels(
+  serializer: JsonProtoSerializer,
+  targetData: TargetData
+): ProtoApiClientObjectMap<string> | null {
+  const value = toLabel(targetData.purpose);
+  if (value == null) {
+    return null;
+  } else {
+    return {
+      'goog-listen-tags': value
+    };
+  }
+}
+
+export function toLabel(purpose: TargetPurpose): string | null {
+  switch (purpose) {
+    case TargetPurpose.Listen:
       return null;
-    } else {
+    case TargetPurpose.ExistenceFilterMismatch:
+      return 'existence-filter-mismatch';
+    case TargetPurpose.ExistenceFilterMismatchBloom:
+      return 'existence-filter-mismatch-bloom';
+    case TargetPurpose.LimboResolution:
+      return 'limbo-document';
+    default:
+      return fail('Unrecognized query purpose: ' + purpose);
+  }
+}
+
+export function toTarget(
+  serializer: JsonProtoSerializer,
+  targetData: TargetData
+): ProtoTarget {
+  let result: ProtoTarget;
+  const target = targetData.target;
+
+  if (targetIsDocumentTarget(target)) {
+    result = { documents: toDocumentsTarget(serializer, target) };
+  } else {
+    result = { query: toQueryTarget(serializer, target).queryTarget };
+  }
+
+  result.targetId = targetData.targetId;
+
+  if (targetData.resumeToken.approximateByteSize() > 0) {
+    result.resumeToken = toBytes(serializer, targetData.resumeToken);
+    const expectedCount = toInt32Proto(serializer, targetData.expectedCount);
+    if (expectedCount !== null) {
+      result.expectedCount = expectedCount;
+    }
+  } else if (targetData.snapshotVersion.compareTo(SnapshotVersion.min()) > 0) {
+    // TODO(wuandy): Consider removing above check because it is most likely true.
+    // Right now, many tests depend on this behaviour though (leaving min() out
+    // of serialization).
+    result.readTime = toTimestamp(
+      serializer,
+      targetData.snapshotVersion.toTimestamp()
+    );
+    const expectedCount = toInt32Proto(serializer, targetData.expectedCount);
+    if (expectedCount !== null) {
+      result.expectedCount = expectedCount;
+    }
+  }
+
+  return result;
+}
+
+function toFilters(filters: Filter[]): ProtoFilter | undefined {
+  if (filters.length === 0) {
+    return;
+  }
+
+  return toFilter(CompositeFilter.create(filters, CompositeOperator.AND));
+}
+
+function fromFilters(filter: ProtoFilter): Filter[] {
+  const result = fromFilter(filter);
+
+  if (
+    result instanceof CompositeFilter &&
+    compositeFilterIsFlatConjunction(result)
+  ) {
+    return result.getFilters();
+  }
+
+  return [result];
+}
+
+function fromFilter(filter: ProtoFilter): Filter {
+  if (filter.unaryFilter !== undefined) {
+    return fromUnaryFilter(filter);
+  } else if (filter.fieldFilter !== undefined) {
+    return fromFieldFilter(filter);
+  } else if (filter.compositeFilter !== undefined) {
+    return fromCompositeFilter(filter);
+  } else {
+    return fail('Unknown filter: ' + JSON.stringify(filter));
+  }
+}
+
+function toOrder(orderBys: OrderBy[]): ProtoOrder[] | undefined {
+  if (orderBys.length === 0) {
+    return;
+  }
+  return orderBys.map(order => toPropertyOrder(order));
+}
+
+function fromOrder(orderBys: ProtoOrder[]): OrderBy[] {
+  return orderBys.map(order => fromPropertyOrder(order));
+}
+
+function toStartAtCursor(cursor: Bound): ProtoCursor {
+  return {
+    before: cursor.inclusive,
+    values: cursor.position
+  };
+}
+
+function toEndAtCursor(cursor: Bound): ProtoCursor {
+  return {
+    before: !cursor.inclusive,
+    values: cursor.position
+  };
+}
+
+function fromStartAtCursor(cursor: ProtoCursor): Bound {
+  const inclusive = !!cursor.before;
+  const position = cursor.values || [];
+  return new Bound(position, inclusive);
+}
+
+function fromEndAtCursor(cursor: ProtoCursor): Bound {
+  const inclusive = !cursor.before;
+  const position = cursor.values || [];
+  return new Bound(position, inclusive);
+}
+
+// visible for testing
+export function toDirection(dir: Direction): ProtoOrderDirection {
+  return DIRECTIONS[dir];
+}
+
+// visible for testing
+export function fromDirection(
+  dir: ProtoOrderDirection | undefined
+): Direction | undefined {
+  switch (dir) {
+    case 'ASCENDING':
+      return Direction.ASCENDING;
+    case 'DESCENDING':
+      return Direction.DESCENDING;
+    default:
+      return undefined;
+  }
+}
+
+// visible for testing
+export function toOperatorName(op: Operator): ProtoFieldFilterOp {
+  return OPERATORS[op];
+}
+
+export function toCompositeOperatorName(
+  op: CompositeOperator
+): ProtoCompositeFilterOp {
+  return COMPOSITE_OPERATORS[op];
+}
+
+export function fromOperatorName(op: ProtoFieldFilterOp): Operator {
+  switch (op) {
+    case 'EQUAL':
+      return Operator.EQUAL;
+    case 'NOT_EQUAL':
+      return Operator.NOT_EQUAL;
+    case 'GREATER_THAN':
+      return Operator.GREATER_THAN;
+    case 'GREATER_THAN_OR_EQUAL':
+      return Operator.GREATER_THAN_OR_EQUAL;
+    case 'LESS_THAN':
+      return Operator.LESS_THAN;
+    case 'LESS_THAN_OR_EQUAL':
+      return Operator.LESS_THAN_OR_EQUAL;
+    case 'ARRAY_CONTAINS':
+      return Operator.ARRAY_CONTAINS;
+    case 'IN':
+      return Operator.IN;
+    case 'NOT_IN':
+      return Operator.NOT_IN;
+    case 'ARRAY_CONTAINS_ANY':
+      return Operator.ARRAY_CONTAINS_ANY;
+    case 'OPERATOR_UNSPECIFIED':
+      return fail('Unspecified operator');
+    default:
+      return fail('Unknown operator');
+  }
+}
+
+export function fromCompositeOperatorName(
+  op: ProtoCompositeFilterOp
+): CompositeOperator {
+  switch (op) {
+    case 'AND':
+      return CompositeOperator.AND;
+    case 'OR':
+      return CompositeOperator.OR;
+    default:
+      return fail('Unknown operator');
+  }
+}
+
+export function toFieldPathReference(path: FieldPath): ProtoFieldReference {
+  return { fieldPath: path.canonicalString() };
+}
+
+export function fromFieldPathReference(
+  fieldReference: ProtoFieldReference
+): FieldPath {
+  return FieldPath.fromServerFormat(fieldReference.fieldPath!);
+}
+
+// visible for testing
+export function toPropertyOrder(orderBy: OrderBy): ProtoOrder {
+  return {
+    field: toFieldPathReference(orderBy.field),
+    direction: toDirection(orderBy.dir)
+  };
+}
+
+export function fromPropertyOrder(orderBy: ProtoOrder): OrderBy {
+  return new OrderBy(
+    fromFieldPathReference(orderBy.field!),
+    fromDirection(orderBy.direction)
+  );
+}
+
+// visible for testing
+export function toFilter(filter: Filter): ProtoFilter {
+  if (filter instanceof FieldFilter) {
+    return toUnaryOrFieldFilter(filter);
+  } else if (filter instanceof CompositeFilter) {
+    return toCompositeFilter(filter);
+  } else {
+    return fail('Unrecognized filter type ' + JSON.stringify(filter));
+  }
+}
+
+export function toCompositeFilter(filter: CompositeFilter): ProtoFilter {
+  const protos = filter.getFilters().map(filter => toFilter(filter));
+
+  if (protos.length === 1) {
+    return protos[0];
+  }
+
+  return {
+    compositeFilter: {
+      op: toCompositeOperatorName(filter.op),
+      filters: protos
+    }
+  };
+}
+
+export function toUnaryOrFieldFilter(filter: FieldFilter): ProtoFilter {
+  if (filter.op === Operator.EQUAL) {
+    if (isNanValue(filter.value)) {
       return {
-        'goog-listen-tags': value
+        unaryFilter: {
+          field: toFieldPathReference(filter.field),
+          op: 'IS_NAN'
+        }
+      };
+    } else if (isNullValue(filter.value)) {
+      return {
+        unaryFilter: {
+          field: toFieldPathReference(filter.field),
+          op: 'IS_NULL'
+        }
+      };
+    }
+  } else if (filter.op === Operator.NOT_EQUAL) {
+    if (isNanValue(filter.value)) {
+      return {
+        unaryFilter: {
+          field: toFieldPathReference(filter.field),
+          op: 'IS_NOT_NAN'
+        }
+      };
+    } else if (isNullValue(filter.value)) {
+      return {
+        unaryFilter: {
+          field: toFieldPathReference(filter.field),
+          op: 'IS_NOT_NULL'
+        }
       };
     }
   }
-
-  private toLabel(purpose: TargetPurpose): string | null {
-    switch (purpose) {
-      case TargetPurpose.Listen:
-        return null;
-      case TargetPurpose.ExistenceFilterMismatch:
-        return 'existence-filter-mismatch';
-      case TargetPurpose.LimboResolution:
-        return 'limbo-document';
-      default:
-        return fail('Unrecognized query purpose: ' + purpose);
+  return {
+    fieldFilter: {
+      field: toFieldPathReference(filter.field),
+      op: toOperatorName(filter.op),
+      value: filter.value
     }
+  };
+}
+
+export function fromUnaryFilter(filter: ProtoFilter): Filter {
+  switch (filter.unaryFilter!.op!) {
+    case 'IS_NAN':
+      const nanField = fromFieldPathReference(filter.unaryFilter!.field!);
+      return FieldFilter.create(nanField, Operator.EQUAL, {
+        doubleValue: NaN
+      });
+    case 'IS_NULL':
+      const nullField = fromFieldPathReference(filter.unaryFilter!.field!);
+      return FieldFilter.create(nullField, Operator.EQUAL, {
+        nullValue: 'NULL_VALUE'
+      });
+    case 'IS_NOT_NAN':
+      const notNanField = fromFieldPathReference(filter.unaryFilter!.field!);
+      return FieldFilter.create(notNanField, Operator.NOT_EQUAL, {
+        doubleValue: NaN
+      });
+    case 'IS_NOT_NULL':
+      const notNullField = fromFieldPathReference(filter.unaryFilter!.field!);
+      return FieldFilter.create(notNullField, Operator.NOT_EQUAL, {
+        nullValue: 'NULL_VALUE'
+      });
+    case 'OPERATOR_UNSPECIFIED':
+      return fail('Unspecified filter');
+    default:
+      return fail('Unknown filter');
   }
+}
 
-  toTarget(targetData: TargetData): api.Target {
-    let result: api.Target;
-    const target = targetData.target;
+export function fromFieldFilter(filter: ProtoFilter): FieldFilter {
+  return FieldFilter.create(
+    fromFieldPathReference(filter.fieldFilter!.field!),
+    fromOperatorName(filter.fieldFilter!.op!),
+    filter.fieldFilter!.value!
+  );
+}
 
-    if (target.isDocumentQuery()) {
-      result = { documents: this.toDocumentsTarget(target) };
-    } else {
-      result = { query: this.toQueryTarget(target) };
-    }
+export function fromCompositeFilter(filter: ProtoFilter): CompositeFilter {
+  return CompositeFilter.create(
+    filter.compositeFilter!.filters!.map(filter => fromFilter(filter)),
+    fromCompositeOperatorName(filter.compositeFilter!.op!)
+  );
+}
 
-    result.targetId = targetData.targetId;
+export function toDocumentMask(fieldMask: FieldMask): ProtoDocumentMask {
+  const canonicalFields: string[] = [];
+  fieldMask.fields.forEach(field =>
+    canonicalFields.push(field.canonicalString())
+  );
+  return {
+    fieldPaths: canonicalFields
+  };
+}
 
-    if (targetData.resumeToken.approximateByteSize() > 0) {
-      result.resumeToken = this.toBytes(targetData.resumeToken);
-    }
+export function fromDocumentMask(proto: ProtoDocumentMask): FieldMask {
+  const paths = proto.fieldPaths || [];
+  return new FieldMask(paths.map(path => FieldPath.fromServerFormat(path)));
+}
 
-    return result;
-  }
-
-  private toFilter(filters: Filter[]): api.Filter | undefined {
-    if (filters.length === 0) {
-      return;
-    }
-    const protos = filters.map(filter => {
-      if (filter instanceof FieldFilter) {
-        return this.toUnaryOrFieldFilter(filter);
-      } else {
-        return fail('Unrecognized filter: ' + JSON.stringify(filter));
-      }
-    });
-    if (protos.length === 1) {
-      return protos[0];
-    }
-    return { compositeFilter: { op: 'AND', filters: protos } };
-  }
-
-  private fromFilter(filter: api.Filter | undefined): Filter[] {
-    if (!filter) {
-      return [];
-    } else if (filter.unaryFilter !== undefined) {
-      return [this.fromUnaryFilter(filter)];
-    } else if (filter.fieldFilter !== undefined) {
-      return [this.fromFieldFilter(filter)];
-    } else if (filter.compositeFilter !== undefined) {
-      return filter.compositeFilter
-        .filters!.map(f => this.fromFilter(f))
-        .reduce((accum, current) => accum.concat(current));
-    } else {
-      return fail('Unknown filter: ' + JSON.stringify(filter));
-    }
-  }
-
-  private toOrder(orderBys: OrderBy[]): api.Order[] | undefined {
-    if (orderBys.length === 0) {
-      return;
-    }
-    return orderBys.map(order => this.toPropertyOrder(order));
-  }
-
-  private fromOrder(orderBys: api.Order[]): OrderBy[] {
-    return orderBys.map(order => this.fromPropertyOrder(order));
-  }
-
-  private toCursor(cursor: Bound): api.Cursor {
-    return {
-      before: cursor.before,
-      values: cursor.position.map(component => this.toValue(component))
-    };
-  }
-
-  private fromCursor(cursor: api.Cursor): Bound {
-    const before = !!cursor.before;
-    const position = cursor.values!.map(component => this.fromValue(component));
-    return new Bound(position, before);
-  }
-
-  // visible for testing
-  toDirection(dir: Direction): api.OrderDirection {
-    return DIRECTIONS[dir.name];
-  }
-
-  // visible for testing
-  fromDirection(dir: api.OrderDirection | undefined): Direction | undefined {
-    switch (dir) {
-      case 'ASCENDING':
-        return Direction.ASCENDING;
-      case 'DESCENDING':
-        return Direction.DESCENDING;
-      default:
-        return undefined;
-    }
-  }
-
-  // visible for testing
-  toOperatorName(op: Operator): api.FieldFilterOp {
-    return OPERATORS[op.name];
-  }
-
-  fromOperatorName(op: api.FieldFilterOp): Operator {
-    switch (op) {
-      case 'EQUAL':
-        return Operator.EQUAL;
-      case 'GREATER_THAN':
-        return Operator.GREATER_THAN;
-      case 'GREATER_THAN_OR_EQUAL':
-        return Operator.GREATER_THAN_OR_EQUAL;
-      case 'LESS_THAN':
-        return Operator.LESS_THAN;
-      case 'LESS_THAN_OR_EQUAL':
-        return Operator.LESS_THAN_OR_EQUAL;
-      case 'ARRAY_CONTAINS':
-        return Operator.ARRAY_CONTAINS;
-      case 'IN':
-        return Operator.IN;
-      case 'ARRAY_CONTAINS_ANY':
-        return Operator.ARRAY_CONTAINS_ANY;
-      case 'OPERATOR_UNSPECIFIED':
-        return fail('Unspecified operator');
-      default:
-        return fail('Unknown operator');
-    }
-  }
-
-  toFieldPathReference(path: FieldPath): api.FieldReference {
-    return { fieldPath: path.canonicalString() };
-  }
-
-  fromFieldPathReference(fieldReference: api.FieldReference): FieldPath {
-    return FieldPath.fromServerFormat(fieldReference.fieldPath!);
-  }
-
-  // visible for testing
-  toPropertyOrder(orderBy: OrderBy): api.Order {
-    return {
-      field: this.toFieldPathReference(orderBy.field),
-      direction: this.toDirection(orderBy.dir)
-    };
-  }
-
-  fromPropertyOrder(orderBy: api.Order): OrderBy {
-    return new OrderBy(
-      this.fromFieldPathReference(orderBy.field!),
-      this.fromDirection(orderBy.direction)
-    );
-  }
-
-  fromFieldFilter(filter: api.Filter): Filter {
-    return FieldFilter.create(
-      this.fromFieldPathReference(filter.fieldFilter!.field!),
-      this.fromOperatorName(filter.fieldFilter!.op!),
-      this.fromValue(filter.fieldFilter!.value!)
-    );
-  }
-
-  // visible for testing
-  toUnaryOrFieldFilter(filter: FieldFilter): api.Filter {
-    if (filter.op === Operator.EQUAL) {
-      if (filter.value.isEqual(fieldValue.DoubleValue.NAN)) {
-        return {
-          unaryFilter: {
-            field: this.toFieldPathReference(filter.field),
-            op: 'IS_NAN'
-          }
-        };
-      } else if (filter.value.isEqual(fieldValue.NullValue.INSTANCE)) {
-        return {
-          unaryFilter: {
-            field: this.toFieldPathReference(filter.field),
-            op: 'IS_NULL'
-          }
-        };
-      }
-    }
-    return {
-      fieldFilter: {
-        field: this.toFieldPathReference(filter.field),
-        op: this.toOperatorName(filter.op),
-        value: this.toValue(filter.value)
-      }
-    };
-  }
-
-  fromUnaryFilter(filter: api.Filter): Filter {
-    switch (filter.unaryFilter!.op!) {
-      case 'IS_NAN':
-        const nanField = this.fromFieldPathReference(
-          filter.unaryFilter!.field!
-        );
-        return FieldFilter.create(
-          nanField,
-          Operator.EQUAL,
-          fieldValue.DoubleValue.NAN
-        );
-      case 'IS_NULL':
-        const nullField = this.fromFieldPathReference(
-          filter.unaryFilter!.field!
-        );
-        return FieldFilter.create(
-          nullField,
-          Operator.EQUAL,
-          fieldValue.NullValue.INSTANCE
-        );
-      case 'OPERATOR_UNSPECIFIED':
-        return fail('Unspecified filter');
-      default:
-        return fail('Unknown filter');
-    }
-  }
-
-  toDocumentMask(fieldMask: FieldMask): api.DocumentMask {
-    const canonicalFields: string[] = [];
-    fieldMask.fields.forEach(field =>
-      canonicalFields.push(field.canonicalString())
-    );
-    return {
-      fieldPaths: canonicalFields
-    };
-  }
-
-  fromDocumentMask(proto: api.DocumentMask): FieldMask {
-    const paths = proto.fieldPaths || [];
-    const fields = paths.map(path => FieldPath.fromServerFormat(path));
-    return FieldMask.fromArray(fields);
-  }
+export function isValidResourceName(path: ResourcePath): boolean {
+  // Resource names have at least 4 components (project ID, database ID)
+  return (
+    path.length >= 4 &&
+    path.get(0) === 'projects' &&
+    path.get(2) === 'databases'
+  );
 }

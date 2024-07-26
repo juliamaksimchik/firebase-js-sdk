@@ -7,79 +7,71 @@
 #
 #######################################################################################################
 
-# ===========================================================
-#  @firebase/jssdk-global-approvers
-# ===========================================================
-#  Used for approving minor changes, large-scale refactorings, and emergency situations.
-#  (secret team to avoid review requests)
-#
-#   - @Feiyang1
-#   - @hiranya911
-#   - @bojeil-google
-#   - @depoll
-#   - @hsubox76
-
-
-# ===========================================================
-#  @firebase/firestore-js-team
-# ===========================================================
-#  Used for approving firestore changes.
-#  (secret team to avoid review requests)
-#
-# - @schmidt-sebastian
-# - @wilhuff
-# - @var-const
-# - @zxu123
-
-
 # These owners will be the default owners for everything in the repo.
-*       @Feiyang1 @hiranya911 @hsubox76 @firebase/jssdk-global-approvers
+*       @firebase/jssdk-global-approvers
 
 # Database Code
-packages/database @schmidt-sebastian @jsdt @firebase/jssdk-global-approvers
-packages/database-types @schmidt-sebastian @jsdt @firebase/jssdk-global-approvers
+packages/database @maneesht @aashishpatil-g @firebase/jssdk-global-approvers
+packages/database-compat @maneesht @aashishpatil-g @firebase/jssdk-global-approvers
+packages/database-types @maneesht @aashishpatil-g @firebase/jssdk-global-approvers
 
 # Firestore Code
 packages/firestore  @firebase/firestore-js-team @firebase/jssdk-global-approvers
+packages/firestore-compat  @firebase/firestore-js-team @firebase/jssdk-global-approvers
 packages/webchannel-wrapper  @firebase/firestore-js-team @firebase/jssdk-global-approvers
 packages/firestore-types  @firebase/firestore-js-team @firebase/jssdk-global-approvers
 integration/firestore  @firebase/firestore-js-team @firebase/jssdk-global-approvers
 
 # Storage Code
-packages/storage  @schmidt-sebastian @firebase/jssdk-global-approvers
-packages/storage-types  @schmidt-sebastian @firebase/jssdk-global-approvers
+packages/storage @maneesht @tonyjhuang @firebase/jssdk-global-approvers
+packages/storage-compat @maneesht @tonyjhuang @firebase/jssdk-global-approvers
+packages/storage-types @maneesht @tonyjhuang @firebase/jssdk-global-approvers
 
 # Messaging Code
-packages/messaging  @firebase/jssdk-global-approvers
-packages/messaging-types  @firebase/jssdk-global-approvers
-integration/messaging  @firebase/jssdk-global-approvers
+packages/messaging  @zwu52 @firebase/jssdk-global-approvers
+packages/messaging-compat  @zwu52 @firebase/jssdk-global-approvers
+packages/messaging-interop-types @zwu52 @firebase/jssdk-global-approvers
+integration/messaging @zwu52 @firebase/jssdk-global-approvers
 
 # Auth Code
-packages/auth  @bojeil-google @wti806 @firebase/jssdk-global-approvers
-packages/auth-types  @bojeil-google @wti806 @firebase/jssdk-global-approvers
+packages/auth @lisajian @Xiaoshouzi-gh @sam-gc @firebase/jssdk-global-approvers
+packages/auth-compat @lisajian @Xiaoshouzi-gh @sam-gc @firebase/jssdk-global-approvers
+packages/auth-types @lisajian @Xiaoshouzi-gh @sam-gc @firebase/jssdk-global-approvers
+packages/auth-interop-types @lisajian @Xiaoshouzi-gh @sam-gc @firebase/jssdk-global-approvers
 
 # Testing Code
-packages/testing  @avolkovi @samhorlbeck @scottcrossen @yuchenshi @firebase/jssdk-global-approvers
-
-# RxFire Code
-packages/rxfire @davideast @jamesdaniels @firebase/jssdk-global-approvers
+packages/rules-unit-testing  @avolkovi @sam-gc @yuchenshi @firebase/jssdk-global-approvers
 
 # Installations
-packages/installations @andirayo @firebase/jssdk-global-approvers
-packages/installations-types @andirayo @firebase/jssdk-global-approvers
+packages/installations @avolkovi @yoyomyo @firebase/jssdk-global-approvers
+packages/installations-compat @avolkovi @yoyomyo @firebase/jssdk-global-approvers
+packages/installations-types @avolkovi @yoyomyo @firebase/jssdk-global-approvers
 
 # Performance Code
-packages/performance  @alikn @zijianjoy @firebase/jssdk-global-approvers
-packages/performance-types  @alikn @zijianjoy @firebase/jssdk-global-approvers
+packages/performance @jposuna @firebase/jssdk-global-approvers
+packages/performance-compat @jposuna @firebase/jssdk-global-approvers
+packages/performance-types @jposuna @firebase/jssdk-global-approvers
 
 # Analytics Code
-packages/analytics @hsubox76 @Feiyang1 @firebase/jssdk-global-approvers
-packages/analytics-types @hsubox76 @Feiyang1 @firebase/jssdk-global-approvers
+packages/analytics @hsubox76 @firebase/jssdk-global-approvers
+packages/analytics-compat @hsubox76 @firebase/jssdk-global-approvers
+packages/analytics-types @hsubox76 @firebase/jssdk-global-approvers
 
 # Remote Config Code
 packages/remote-config @erikeldridge @firebase/jssdk-global-approvers
+packages/remote-config-compat  @erikeldridge @firebase/jssdk-global-approvers
 packages/remote-config-types @erikeldridge @firebase/jssdk-global-approvers
+
+# App Check Code
+packages/app-check @hsubox76 @firebase/jssdk-global-approvers
+packages/app-check-compat @hsubox76 @firebase/jssdk-global-approvers
+packages/app-check-types @hsubox76 @firebase/jssdk-global-approvers
+packages/app-check-interop-types @hsubox76 @firebase/jssdk-global-approvers
 
 # Documentation Changes
 packages/firebase/index.d.ts @egilmorez @firebase/jssdk-global-approvers
 scripts/docgen/content-sources/ @egilmorez @firebase/jssdk-global-approvers
+docs-devsite/ @firebase/firebase-techwriters
+
+# Changeset
+.changeset @firebase/jssdk-changeset-approvers @firebase/firestore-js-team @firebase/jssdk-global-approvers

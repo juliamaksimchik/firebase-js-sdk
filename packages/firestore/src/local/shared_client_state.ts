@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2018 Google Inc.
+ * Copyright 2018 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,21 +25,19 @@ import {
   TargetId
 } from '../core/types';
 import { TargetIdSet, targetIdSet } from '../model/collections';
-import { Platform } from '../platform/platform';
-import { assert } from '../util/assert';
+import { hardAssert, debugAssert } from '../util/assert';
 import { AsyncQueue } from '../util/async_queue';
 import { Code, FirestoreError } from '../util/error';
-import { debug, error } from '../util/log';
-import * as objUtils from '../util/obj';
+import { logError, logDebug } from '../util/log';
+import { primitiveComparator } from '../util/misc';
+import { SortedMap } from '../util/sorted_map';
 import { SortedSet } from '../util/sorted_set';
-import { isSafeInteger } from '../util/types';
-import {
-  QueryTargetState,
-  SharedClientStateSyncer
-} from './shared_client_state_syncer';
+import { isSafeInteger, WindowLike } from '../util/types';
+
 import {
   CLIENT_STATE_KEY_PREFIX,
   ClientStateSchema,
+  createBundleLoadedKey,
   createWebStorageClientStateKey,
   createWebStorageMutationBatchKey,
   createWebStorageOnlineStateKey,
@@ -51,6 +49,10 @@ import {
   QueryTargetStateSchema,
   SharedOnlineStateSchema
 } from './shared_client_state_schema';
+import {
+  QueryTargetState,
+  SharedClientStateSyncer
+} from './shared_client_state_syncer';
 
 const LOG_TAG = 'SharedClientState';
 
@@ -75,7 +77,6 @@ export type ClientId = string;
  * assigned before calling `start()`.
  */
 export interface SharedClientState {
-  syncEngine: SharedClientStateSyncer | null;
   onlineStateHandler: ((onlineState: OnlineState) => void) | null;
   sequenceNumberHandler:
     | ((sequenceNumber: ListenSequenceNumber) => void)
@@ -173,6 +174,14 @@ export interface SharedClientState {
   setOnlineState(onlineState: OnlineState): void;
 
   writeSequenceNumber(sequenceNumber: ListenSequenceNumber): void;
+
+  /**
+   * Notifies other clients when remote documents have changed due to loading
+   * a bundle.
+   *
+   * @param collectionGroups The collection groups affected by this bundle.
+   */
+  notifyBundleLoaded(collectionGroups: Set<string>): void;
 }
 
 /**
@@ -187,7 +196,7 @@ export class MutationMetadata {
     readonly state: MutationBatchState,
     readonly error?: FirestoreError
   ) {
-    assert(
+    debugAssert(
       (error !== undefined) === (state === 'rejected'),
       `MutationMetadata must contain an error iff state is 'rejected'`
     );
@@ -233,7 +242,7 @@ export class MutationMetadata {
         firestoreError
       );
     } else {
-      error(
+      logError(
         LOG_TAG,
         `Failed to parse mutation state for ID '${batchId}': ${value}`
       );
@@ -269,7 +278,7 @@ export class QueryTargetMetadata {
     readonly state: QueryTargetState,
     readonly error?: FirestoreError
   ) {
-    assert(
+    debugAssert(
       (error !== undefined) === (state === 'rejected'),
       `QueryTargetMetadata must contain an error iff state is 'rejected'`
     );
@@ -313,7 +322,7 @@ export class QueryTargetMetadata {
         firestoreError
       );
     } else {
-      error(
+      logError(
         LOG_TAG,
         `Failed to parse target state for ID '${targetId}': ${value}`
       );
@@ -340,7 +349,7 @@ export class QueryTargetMetadata {
 
 /**
  * Metadata state of a single client denoting the query targets it is actively
- * listening to.
+ * listening to the watch.
  */
 // Visible for testing.
 export interface ClientState {
@@ -383,7 +392,7 @@ class RemoteClientState implements ClientState {
     if (validData) {
       return new RemoteClientState(clientId, activeTargetIdsSet);
     } else {
-      error(
+      logError(
         LOG_TAG,
         `Failed to parse client data for instance '${clientId}': ${value}`
       );
@@ -419,7 +428,7 @@ export class SharedOnlineState {
         onlineState.onlineState as OnlineState
       );
     } else {
-      error(LOG_TAG, `Failed to parse online state: ${value}`);
+      logError(LOG_TAG, `Failed to parse online state: ${value}`);
       return null;
     }
   }
@@ -475,12 +484,15 @@ export class WebStorageSharedClientState implements SharedClientState {
   private readonly storage: Storage;
   private readonly localClientStorageKey: string;
   private readonly sequenceNumberKey: string;
-  private readonly activeClients: { [key: string]: ClientState } = {};
   private readonly storageListener = this.handleWebStorageEvent.bind(this);
   private readonly onlineStateKey: string;
+  private readonly bundleLoadedKey: string;
   private readonly clientStateKeyRe: RegExp;
   private readonly mutationBatchKeyRe: RegExp;
   private readonly queryTargetKeyRe: RegExp;
+  private activeClients = new SortedMap<string, ClientState>(
+    primitiveComparator
+  );
   private started = false;
   private currentUser: User;
 
@@ -491,18 +503,12 @@ export class WebStorageSharedClientState implements SharedClientState {
   private earlyEvents: StorageEvent[] = [];
 
   constructor(
+    private readonly window: WindowLike,
     private readonly queue: AsyncQueue,
-    private readonly platform: Platform,
     private readonly persistenceKey: string,
     private readonly localClientId: ClientId,
     initialUser: User
   ) {
-    if (!WebStorageSharedClientState.isAvailable(this.platform)) {
-      throw new FirestoreError(
-        Code.UNIMPLEMENTED,
-        'LocalStorage is not available on this platform.'
-      );
-    }
     // Escape the special characters mentioned here:
     // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_Expressions
     const escapedPersistenceKey = persistenceKey.replace(
@@ -510,7 +516,7 @@ export class WebStorageSharedClientState implements SharedClientState {
       '\\$&'
     );
 
-    this.storage = this.platform.window!.localStorage;
+    this.storage = this.window.localStorage;
     this.currentUser = initialUser;
     this.localClientStorageKey = createWebStorageClientStateKey(
       this.persistenceKey,
@@ -519,7 +525,10 @@ export class WebStorageSharedClientState implements SharedClientState {
     this.sequenceNumberKey = createWebStorageSequenceNumberKey(
       this.persistenceKey
     );
-    this.activeClients[this.localClientId] = new LocalClientState();
+    this.activeClients = this.activeClients.insert(
+      this.localClientId,
+      new LocalClientState()
+    );
 
     this.clientStateKeyRe = new RegExp(
       `^${CLIENT_STATE_KEY_PREFIX}_${escapedPersistenceKey}_([^_]*)$`
@@ -533,27 +542,29 @@ export class WebStorageSharedClientState implements SharedClientState {
 
     this.onlineStateKey = createWebStorageOnlineStateKey(this.persistenceKey);
 
+    this.bundleLoadedKey = createBundleLoadedKey(this.persistenceKey);
+
     // Rather than adding the storage observer during start(), we add the
     // storage observer during initialization. This ensures that we collect
     // events before other components populate their initial state (during their
     // respective start() calls). Otherwise, we might for example miss a
     // mutation that is added after LocalStore's start() processed the existing
     // mutations but before we observe WebStorage events.
-    this.platform.window!.addEventListener('storage', this.storageListener);
+    this.window.addEventListener('storage', this.storageListener);
   }
 
   /** Returns 'true' if WebStorage is available in the current environment. */
-  static isAvailable(platform: Platform): boolean {
-    return !!(platform.window && platform.window.localStorage != null);
+  static isAvailable(window: WindowLike | null): window is WindowLike {
+    return !!(window && window.localStorage);
   }
 
   async start(): Promise<void> {
-    assert(!this.started, 'WebStorageSharedClientState already started');
-    assert(
+    debugAssert(!this.started, 'WebStorageSharedClientState already started');
+    debugAssert(
       this.syncEngine !== null,
       'syncEngine property must be set before calling start()'
     );
-    assert(
+    debugAssert(
       this.onlineStateHandler !== null,
       'onlineStateHandler property must be set before calling start()'
     );
@@ -576,7 +587,10 @@ export class WebStorageSharedClientState implements SharedClientState {
           storageItem
         );
         if (clientState) {
-          this.activeClients[clientState.clientId] = clientState;
+          this.activeClients = this.activeClients.insert(
+            clientState.clientId,
+            clientState
+          );
         }
       }
     }
@@ -601,7 +615,7 @@ export class WebStorageSharedClientState implements SharedClientState {
 
     // Register a window unload hook to remove the client metadata entry from
     // WebStorage even if `shutdown()` was not called.
-    this.platform.window!.addEventListener('unload', () => this.shutdown());
+    this.window.addEventListener('pagehide', () => this.shutdown());
 
     this.started = true;
   }
@@ -611,24 +625,17 @@ export class WebStorageSharedClientState implements SharedClientState {
   }
 
   getAllActiveQueryTargets(): TargetIdSet {
-    let activeTargets = targetIdSet();
-    objUtils.forEach(this.activeClients, (key, value) => {
-      activeTargets = activeTargets.unionWith(value.activeTargetIds);
-    });
-    return activeTargets;
+    return this.extractActiveQueryTargets(this.activeClients);
   }
 
   isActiveQueryTarget(targetId: TargetId): boolean {
-    // This is not using `obj.forEach` since `forEach` doesn't support early
-    // return.
-    for (const clientId in this.activeClients) {
-      if (this.activeClients.hasOwnProperty(clientId)) {
-        if (this.activeClients[clientId].activeTargetIds.has(targetId)) {
-          return true;
-        }
+    let found = false;
+    this.activeClients.forEach((key, value) => {
+      if (value.activeTargetIds.has(targetId)) {
+        found = true;
       }
-    }
-    return false;
+    });
+    return found;
   }
 
   addPendingMutation(batchId: BatchId): void {
@@ -716,12 +723,13 @@ export class WebStorageSharedClientState implements SharedClientState {
     this.persistOnlineState(onlineState);
   }
 
+  notifyBundleLoaded(collectionGroups: Set<string>): void {
+    this.persistBundleLoadedState(collectionGroups);
+  }
+
   shutdown(): void {
     if (this.started) {
-      this.platform.window!.removeEventListener(
-        'storage',
-        this.storageListener
-      );
+      this.window.removeEventListener('storage', this.storageListener);
       this.removeItem(this.localClientStorageKey);
       this.started = false;
     }
@@ -729,47 +737,50 @@ export class WebStorageSharedClientState implements SharedClientState {
 
   private getItem(key: string): string | null {
     const value = this.storage.getItem(key);
-    debug(LOG_TAG, 'READ', key, value);
+    logDebug(LOG_TAG, 'READ', key, value);
     return value;
   }
 
   private setItem(key: string, value: string): void {
-    debug(LOG_TAG, 'SET', key, value);
+    logDebug(LOG_TAG, 'SET', key, value);
     this.storage.setItem(key, value);
   }
 
   private removeItem(key: string): void {
-    debug(LOG_TAG, 'REMOVE', key);
+    logDebug(LOG_TAG, 'REMOVE', key);
     this.storage.removeItem(key);
   }
 
-  private handleWebStorageEvent(event: StorageEvent): void {
-    if (event.storageArea === this.storage) {
-      debug(LOG_TAG, 'EVENT', event.key, event.newValue);
+  private handleWebStorageEvent(event: Event): void {
+    // Note: The function is typed to take Event to be interface-compatible with
+    // `Window.addEventListener`.
+    const storageEvent = event as StorageEvent;
+    if (storageEvent.storageArea === this.storage) {
+      logDebug(LOG_TAG, 'EVENT', storageEvent.key, storageEvent.newValue);
 
-      if (event.key === this.localClientStorageKey) {
-        error(
+      if (storageEvent.key === this.localClientStorageKey) {
+        logError(
           'Received WebStorage notification for local change. Another client might have ' +
             'garbage-collected our state'
         );
         return;
       }
 
-      this.queue.enqueueAndForget(async () => {
+      this.queue.enqueueRetryable(async () => {
         if (!this.started) {
-          this.earlyEvents.push(event);
+          this.earlyEvents.push(storageEvent);
           return;
         }
 
-        if (event.key === null) {
+        if (storageEvent.key === null) {
           return;
         }
 
-        if (this.clientStateKeyRe.test(event.key)) {
-          if (event.newValue != null) {
+        if (this.clientStateKeyRe.test(storageEvent.key)) {
+          if (storageEvent.newValue != null) {
             const clientState = this.fromWebStorageClientState(
-              event.key,
-              event.newValue
+              storageEvent.key,
+              storageEvent.newValue
             );
             if (clientState) {
               return this.handleClientStateEvent(
@@ -778,49 +789,67 @@ export class WebStorageSharedClientState implements SharedClientState {
               );
             }
           } else {
-            const clientId = this.fromWebStorageClientStateKey(event.key)!;
+            const clientId = this.fromWebStorageClientStateKey(
+              storageEvent.key
+            )!;
             return this.handleClientStateEvent(clientId, null);
           }
-        } else if (this.mutationBatchKeyRe.test(event.key)) {
-          if (event.newValue !== null) {
+        } else if (this.mutationBatchKeyRe.test(storageEvent.key)) {
+          if (storageEvent.newValue !== null) {
             const mutationMetadata = this.fromWebStorageMutationMetadata(
-              event.key,
-              event.newValue
+              storageEvent.key,
+              storageEvent.newValue
             );
             if (mutationMetadata) {
               return this.handleMutationBatchEvent(mutationMetadata);
             }
           }
-        } else if (this.queryTargetKeyRe.test(event.key)) {
-          if (event.newValue !== null) {
+        } else if (this.queryTargetKeyRe.test(storageEvent.key)) {
+          if (storageEvent.newValue !== null) {
             const queryTargetMetadata = this.fromWebStorageQueryTargetMetadata(
-              event.key,
-              event.newValue
+              storageEvent.key,
+              storageEvent.newValue
             );
             if (queryTargetMetadata) {
               return this.handleQueryTargetEvent(queryTargetMetadata);
             }
           }
-        } else if (event.key === this.onlineStateKey) {
-          if (event.newValue !== null) {
-            const onlineState = this.fromWebStorageOnlineState(event.newValue);
+        } else if (storageEvent.key === this.onlineStateKey) {
+          if (storageEvent.newValue !== null) {
+            const onlineState = this.fromWebStorageOnlineState(
+              storageEvent.newValue
+            );
             if (onlineState) {
               return this.handleOnlineStateEvent(onlineState);
             }
           }
-        } else if (event.key === this.sequenceNumberKey) {
-          assert(!!this.sequenceNumberHandler, 'Missing sequenceNumberHandler');
-          const sequenceNumber = fromWebStorageSequenceNumber(event.newValue);
+        } else if (storageEvent.key === this.sequenceNumberKey) {
+          debugAssert(
+            !!this.sequenceNumberHandler,
+            'Missing sequenceNumberHandler'
+          );
+          const sequenceNumber = fromWebStorageSequenceNumber(
+            storageEvent.newValue
+          );
           if (sequenceNumber !== ListenSequence.INVALID) {
             this.sequenceNumberHandler!(sequenceNumber);
           }
+        } else if (storageEvent.key === this.bundleLoadedKey) {
+          const collectionGroups = this.fromWebStoreBundleLoadedState(
+            storageEvent.newValue!
+          );
+          await Promise.all(
+            collectionGroups.map(cg =>
+              this.syncEngine!.synchronizeWithChangedDocuments(cg)
+            )
+          );
         }
       });
     }
   }
 
   private get localClientState(): LocalClientState {
-    return this.activeClients[this.localClientId] as LocalClientState;
+    return this.activeClients.get(this.localClientId) as LocalClientState;
   }
 
   private persistClientState(): void {
@@ -879,6 +908,11 @@ export class WebStorageSharedClientState implements SharedClientState {
     this.setItem(targetKey, targetMetadata.toWebStorageJSON());
   }
 
+  private persistBundleLoadedState(collectionGroups: Set<string>): void {
+    const json = JSON.stringify(Array.from(collectionGroups));
+    this.setItem(this.bundleLoadedKey, json);
+  }
+
   /**
    * Parses a client state key in WebStorage. Returns null if the key does not
    * match the expected key format.
@@ -897,7 +931,7 @@ export class WebStorageSharedClientState implements SharedClientState {
     value: string
   ): RemoteClientState | null {
     const clientId = this.fromWebStorageClientStateKey(key);
-    assert(clientId !== null, `Cannot parse client state key '${key}'`);
+    debugAssert(clientId !== null, `Cannot parse client state key '${key}'`);
     return RemoteClientState.fromWebStorageEntry(clientId, value);
   }
 
@@ -910,7 +944,7 @@ export class WebStorageSharedClientState implements SharedClientState {
     value: string
   ): MutationMetadata | null {
     const match = this.mutationBatchKeyRe.exec(key);
-    assert(match !== null, `Cannot parse mutation batch key '${key}'`);
+    debugAssert(match !== null, `Cannot parse mutation batch key '${key}'`);
 
     const batchId = Number(match[1]);
     const userId = match[2] !== undefined ? match[2] : null;
@@ -930,7 +964,7 @@ export class WebStorageSharedClientState implements SharedClientState {
     value: string
   ): QueryTargetMetadata | null {
     const match = this.queryTargetKeyRe.exec(key);
-    assert(match !== null, `Cannot parse query target key '${key}'`);
+    debugAssert(match !== null, `Cannot parse query target key '${key}'`);
 
     const targetId = Number(match[1]);
     return QueryTargetMetadata.fromWebStorageEntry(targetId, value);
@@ -944,11 +978,15 @@ export class WebStorageSharedClientState implements SharedClientState {
     return SharedOnlineState.fromWebStorageEntry(value);
   }
 
+  private fromWebStoreBundleLoadedState(value: string): string[] {
+    return JSON.parse(value) as string[];
+  }
+
   private async handleMutationBatchEvent(
     mutationBatch: MutationMetadata
   ): Promise<void> {
     if (mutationBatch.user.uid !== this.currentUser.uid) {
-      debug(
+      logDebug(
         LOG_TAG,
         `Ignoring mutation for non-active user ${mutationBatch.user.uid}`
       );
@@ -976,26 +1014,23 @@ export class WebStorageSharedClientState implements SharedClientState {
     clientId: ClientId,
     clientState: RemoteClientState | null
   ): Promise<void> {
-    const existingTargets = this.getAllActiveQueryTargets();
+    const updatedClients = clientState
+      ? this.activeClients.insert(clientId, clientState)
+      : this.activeClients.remove(clientId);
 
-    if (clientState) {
-      this.activeClients[clientId] = clientState;
-    } else {
-      delete this.activeClients[clientId];
-    }
-
-    const newTargets = this.getAllActiveQueryTargets();
+    const existingTargets = this.extractActiveQueryTargets(this.activeClients);
+    const newTargets = this.extractActiveQueryTargets(updatedClients);
 
     const addedTargets: TargetId[] = [];
     const removedTargets: TargetId[] = [];
 
-    newTargets.forEach(async targetId => {
+    newTargets.forEach(targetId => {
       if (!existingTargets.has(targetId)) {
         addedTargets.push(targetId);
       }
     });
 
-    existingTargets.forEach(async targetId => {
+    existingTargets.forEach(targetId => {
       if (!newTargets.has(targetId)) {
         removedTargets.push(targetId);
       }
@@ -1004,7 +1039,9 @@ export class WebStorageSharedClientState implements SharedClientState {
     return this.syncEngine!.applyActiveTargetsChange(
       addedTargets,
       removedTargets
-    );
+    ).then(() => {
+      this.activeClients = updatedClients;
+    });
   }
 
   private handleOnlineStateEvent(onlineState: SharedOnlineState): void {
@@ -1013,9 +1050,19 @@ export class WebStorageSharedClientState implements SharedClientState {
     // IndexedDb. If a client does not update their IndexedDb client state
     // within 5 seconds, it is considered inactive and we don't emit an online
     // state event.
-    if (this.activeClients[onlineState.clientId]) {
+    if (this.activeClients.get(onlineState.clientId)) {
       this.onlineStateHandler!(onlineState.onlineState);
     }
+  }
+
+  private extractActiveQueryTargets(
+    clients: SortedMap<string, ClientState>
+  ): SortedSet<TargetId> {
+    let activeTargets = targetIdSet();
+    clients.forEach((kev, value) => {
+      activeTargets = activeTargets.unionWith(value.activeTargetIds);
+    });
+    return activeTargets;
   }
 }
 
@@ -1026,10 +1073,13 @@ function fromWebStorageSequenceNumber(
   if (seqString != null) {
     try {
       const parsed = JSON.parse(seqString);
-      assert(typeof parsed === 'number', 'Found non-numeric sequence number');
+      hardAssert(
+        typeof parsed === 'number',
+        'Found non-numeric sequence number'
+      );
       sequenceNumber = parsed;
     } catch (e) {
-      error(LOG_TAG, 'Failed to read sequence number from WebStorage', e);
+      logError(LOG_TAG, 'Failed to read sequence number from WebStorage', e);
     }
   }
   return sequenceNumber;
@@ -1043,8 +1093,6 @@ function fromWebStorageSequenceNumber(
 export class MemorySharedClientState implements SharedClientState {
   private localState = new LocalClientState();
   private queryState: { [targetId: number]: QueryTargetState } = {};
-
-  syncEngine: SharedClientStateSyncer | null = null;
   onlineStateHandler: ((onlineState: OnlineState) => void) | null = null;
   sequenceNumberHandler:
     | ((sequenceNumber: ListenSequenceNumber) => void)
@@ -1115,4 +1163,8 @@ export class MemorySharedClientState implements SharedClientState {
   shutdown(): void {}
 
   writeSequenceNumber(sequenceNumber: ListenSequenceNumber): void {}
+
+  notifyBundleLoaded(collectionGroups: Set<string>): void {
+    // No op.
+  }
 }

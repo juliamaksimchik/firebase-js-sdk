@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2020 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,13 @@
  */
 
 import { ERROR_FACTORY, ErrorCode } from '../utils/errors';
+import { isIndexedDBAvailable, areCookiesEnabled } from '@firebase/util';
+import { consoleLogger } from '../utils/console_logger';
 
 declare global {
   interface Window {
     PerformanceObserver: typeof PerformanceObserver;
-    perfMetrics?: { onFirstInputDelay: Function };
+    perfMetrics?: { onFirstInputDelay(fn: (fid: number) => void): void };
   }
 }
 
@@ -41,10 +43,10 @@ export type EntryType =
  */
 export class Api {
   private readonly performance: Performance;
-  /** PreformanceObserver constructor function. */
+  /** PerformanceObserver constructor function. */
   private readonly PerformanceObserver: typeof PerformanceObserver;
   private readonly windowLocation: Location;
-  readonly onFirstInputDelay?: Function;
+  readonly onFirstInputDelay?: (fn: (fid: number) => void) => void;
   readonly localStorage?: Storage;
   readonly document: Document;
   readonly navigator: Navigator;
@@ -110,10 +112,18 @@ export class Api {
   }
 
   requiredApisAvailable(): boolean {
-    if (fetch && Promise && this.navigator && this.navigator.cookieEnabled) {
-      return true;
+    if (!fetch || !Promise || !areCookiesEnabled()) {
+      consoleLogger.info(
+        'Firebase Performance cannot start if browser does not support fetch and Promise or cookie is disabled.'
+      );
+      return false;
     }
-    return false;
+
+    if (!isIndexedDBAvailable()) {
+      consoleLogger.info('IndexedDB is not supported by current browser');
+      return false;
+    }
+    return true;
   }
 
   setupObserver(

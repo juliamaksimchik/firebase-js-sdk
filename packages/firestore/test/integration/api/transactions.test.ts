@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,18 +15,30 @@
  * limitations under the License.
  */
 
-import * as firestore from '@firebase/firestore-types';
 import { expect } from 'chai';
-import firebase from '../util/firebase_export';
-import * as integrationHelpers from '../util/helpers';
 
-const FieldPath = firebase.firestore!.FieldPath;
+import {
+  DocumentData,
+  FieldPath,
+  QueryDocumentSnapshot,
+  Transaction,
+  collection,
+  deleteDoc,
+  doc,
+  DocumentReference,
+  DocumentSnapshot,
+  Firestore,
+  FirestoreError,
+  getDoc,
+  runTransaction,
+  setDoc
+} from '../util/firebase_export';
+import { apiDescribe, withTestDb } from '../util/helpers';
 
-const apiDescribe = integrationHelpers.apiDescribe;
-apiDescribe('Database transactions', (persistence: boolean) => {
+apiDescribe('Database transactions', persistence => {
   type TransactionStage = (
-    transaction: firestore.Transaction,
-    docRef: firestore.DocumentReference
+    transaction: Transaction,
+    docRef: DocumentReference
   ) => void;
 
   /**
@@ -35,45 +47,55 @@ apiDescribe('Database transactions', (persistence: boolean) => {
    * result in the document being set to the value specified by `set2()`.
    */
   async function delete1(
-    transaction: firestore.Transaction,
-    docRef: firestore.DocumentReference
+    transaction: Transaction,
+    docRef: DocumentReference
   ): Promise<void> {
     transaction.delete(docRef);
   }
 
   async function update1(
-    transaction: firestore.Transaction,
-    docRef: firestore.DocumentReference
+    transaction: Transaction,
+    docRef: DocumentReference
   ): Promise<void> {
     transaction.update(docRef, { foo: 'bar1' });
   }
 
   async function update2(
-    transaction: firestore.Transaction,
-    docRef: firestore.DocumentReference
+    transaction: Transaction,
+    docRef: DocumentReference
   ): Promise<void> {
     transaction.update(docRef, { foo: 'bar2' });
   }
 
   async function set1(
-    transaction: firestore.Transaction,
-    docRef: firestore.DocumentReference
+    transaction: Transaction,
+    docRef: DocumentReference
   ): Promise<void> {
     transaction.set(docRef, { foo: 'bar1' });
   }
 
   async function set2(
-    transaction: firestore.Transaction,
-    docRef: firestore.DocumentReference
+    transaction: Transaction,
+    docRef: DocumentReference
   ): Promise<void> {
     transaction.set(docRef, { foo: 'bar2' });
   }
 
   async function get(
-    transaction: firestore.Transaction,
-    docRef: firestore.DocumentReference
+    transaction: Transaction,
+    docRef: DocumentReference
   ): Promise<void> {
     await transaction.get(docRef);
+  }
+
+  enum FromDocumentType {
+    // The operation will be performed on a document that exists.
+    EXISTING = 'existing',
+    // The operation will be performed on a document that has never existed.
+    NON_EXISTENT = 'non_existent',
+    // The operation will be performed on a document that existed, but was
+    // deleted.
+    DELETED = 'deleted'
   }
 
   /**
@@ -87,19 +109,24 @@ apiDescribe('Database transactions', (persistence: boolean) => {
    * transaction to run and assert that the end result matches the input.
    */
   class TransactionTester {
-    constructor(readonly db: firestore.FirebaseFirestore) {}
+    constructor(readonly db: Firestore) {}
 
-    private docRef!: firestore.DocumentReference;
-    private fromExistingDoc: boolean = false;
+    private docRef!: DocumentReference;
+    private fromDocumentType: FromDocumentType = FromDocumentType.NON_EXISTENT;
     private stages: TransactionStage[] = [];
 
     withExistingDoc(): this {
-      this.fromExistingDoc = true;
+      this.fromDocumentType = FromDocumentType.EXISTING;
       return this;
     }
 
     withNonexistentDoc(): this {
-      this.fromExistingDoc = false;
+      this.fromDocumentType = FromDocumentType.NON_EXISTENT;
+      return this;
+    }
+
+    withDeletedDoc(): this {
+      this.fromDocumentType = FromDocumentType.DELETED;
       return this;
     }
 
@@ -112,8 +139,8 @@ apiDescribe('Database transactions', (persistence: boolean) => {
       try {
         await this.prepareDoc();
         await this.runTransaction();
-        const snapshot = await this.docRef.get();
-        expect(snapshot.exists).to.equal(true);
+        const snapshot = await getDoc(this.docRef);
+        expect(snapshot.exists()).to.equal(true);
         expect(snapshot.data()).to.deep.equal(expected);
       } catch (err) {
         expect.fail(
@@ -130,8 +157,8 @@ apiDescribe('Database transactions', (persistence: boolean) => {
       try {
         await this.prepareDoc();
         await this.runTransaction();
-        const snapshot = await this.docRef.get();
-        expect(snapshot.exists).to.equal(false);
+        const snapshot = await getDoc(this.docRef);
+        expect(snapshot.exists()).to.equal(false);
       } catch (err) {
         expect.fail(
           'Expected the sequence (' +
@@ -150,7 +177,7 @@ apiDescribe('Database transactions', (persistence: boolean) => {
         await this.runTransaction();
         succeeded = true;
       } catch (err) {
-        expect((err as firestore.FirestoreError).code).to.equal(expected);
+        expect((err as FirestoreError).code).to.equal(expected);
       }
       if (succeeded) {
         expect.fail(
@@ -164,16 +191,25 @@ apiDescribe('Database transactions', (persistence: boolean) => {
     }
 
     private async prepareDoc(): Promise<void> {
-      this.docRef = this.db.collection('tester-docref').doc();
-      if (this.fromExistingDoc) {
-        await this.docRef.set({ foo: 'bar0' });
-        const docSnap = await this.docRef.get();
-        expect(docSnap.exists).to.equal(true);
+      this.docRef = doc(collection(this.db, 'tester-docref'));
+      switch (this.fromDocumentType) {
+        case FromDocumentType.EXISTING:
+          await setDoc(this.docRef, { foo: 'bar0' });
+          break;
+        case FromDocumentType.NON_EXISTENT:
+          // Nothing to do; document does not exist.
+          break;
+        case FromDocumentType.DELETED:
+          await setDoc(this.docRef, { foo: 'bar0' });
+          await deleteDoc(this.docRef);
+          break;
+        default:
+          throw new Error(`invalid fromDocumentType: ${this.fromDocumentType}`);
       }
     }
 
     private async runTransaction(): Promise<void> {
-      await this.db.runTransaction(async transaction => {
+      await runTransaction(this.db, async transaction => {
         for (const stage of this.stages) {
           await stage(transaction, this.docRef);
         }
@@ -183,7 +219,7 @@ apiDescribe('Database transactions', (persistence: boolean) => {
     private cleanupTester(): void {
       this.stages = [];
       // Set the docRef to something else to lose the original reference.
-      this.docRef = this.db.collection('reset').doc();
+      this.docRef = doc(collection(this.db, 'reset'));
     }
 
     private listStages(stages: TransactionStage[]): string {
@@ -206,13 +242,10 @@ apiDescribe('Database transactions', (persistence: boolean) => {
   }
 
   it('runs transactions after getting existing document', async () => {
-    return integrationHelpers.withTestDb(persistence, async db => {
+    return withTestDb(persistence, async db => {
       const tt = new TransactionTester(db);
 
-      await tt
-        .withExistingDoc()
-        .run(get, delete1, delete1)
-        .expectNoDoc();
+      await tt.withExistingDoc().run(get, delete1, delete1).expectNoDoc();
       await tt
         .withExistingDoc()
         .run(get, delete1, update2)
@@ -222,10 +255,7 @@ apiDescribe('Database transactions', (persistence: boolean) => {
         .run(get, delete1, set2)
         .expectDoc({ foo: 'bar2' });
 
-      await tt
-        .withExistingDoc()
-        .run(get, update1, delete1)
-        .expectNoDoc();
+      await tt.withExistingDoc().run(get, update1, delete1).expectNoDoc();
       await tt
         .withExistingDoc()
         .run(get, update1, update2)
@@ -235,10 +265,7 @@ apiDescribe('Database transactions', (persistence: boolean) => {
         .run(get, update1, set2)
         .expectDoc({ foo: 'bar2' });
 
-      await tt
-        .withExistingDoc()
-        .run(get, set1, delete1)
-        .expectNoDoc();
+      await tt.withExistingDoc().run(get, set1, delete1).expectNoDoc();
       await tt
         .withExistingDoc()
         .run(get, set1, update2)
@@ -248,16 +275,13 @@ apiDescribe('Database transactions', (persistence: boolean) => {
         .run(get, set1, set2)
         .expectDoc({ foo: 'bar2' });
     });
-  });
+  }).timeout(10000);
 
-  it('runs transactions after getting non-existent document', async () => {
-    return integrationHelpers.withTestDb(persistence, async db => {
+  it('runs transactions after getting nonexistent document', async () => {
+    return withTestDb(persistence, async db => {
       const tt = new TransactionTester(db);
 
-      await tt
-        .withNonexistentDoc()
-        .run(get, delete1, delete1)
-        .expectNoDoc();
+      await tt.withNonexistentDoc().run(get, delete1, delete1).expectNoDoc();
       await tt
         .withNonexistentDoc()
         .run(get, delete1, update2)
@@ -280,10 +304,7 @@ apiDescribe('Database transactions', (persistence: boolean) => {
         .run(get, update1, set1)
         .expectError('invalid-argument');
 
-      await tt
-        .withNonexistentDoc()
-        .run(get, set1, delete1)
-        .expectNoDoc();
+      await tt.withNonexistentDoc().run(get, set1, delete1).expectNoDoc();
       await tt
         .withNonexistentDoc()
         .run(get, set1, update2)
@@ -293,61 +314,78 @@ apiDescribe('Database transactions', (persistence: boolean) => {
         .run(get, set1, set2)
         .expectDoc({ foo: 'bar2' });
     });
-  });
+  }).timeout(10000);
 
-  it('runs transactions on existing document', async () => {
-    return integrationHelpers.withTestDb(persistence, async db => {
+  // This test is identical to the test above, except that withNonexistentDoc()
+  // is replaced by withDeletedDoc(), to guard against regression of
+  // https://github.com/firebase/firebase-js-sdk/issues/5871, where transactions
+  // would incorrectly fail with FAILED_PRECONDITION when operations were
+  // performed on a deleted document (rather than a nonexistent document).
+  it('runs transactions after getting a deleted document', async () => {
+    return withTestDb(persistence, async db => {
       const tt = new TransactionTester(db);
 
+      await tt.withDeletedDoc().run(get, delete1, delete1).expectNoDoc();
       await tt
-        .withExistingDoc()
-        .run(delete1, delete1)
-        .expectNoDoc();
+        .withDeletedDoc()
+        .run(get, delete1, update2)
+        .expectError('invalid-argument');
+      await tt
+        .withDeletedDoc()
+        .run(get, delete1, set2)
+        .expectDoc({ foo: 'bar2' });
+
+      await tt
+        .withDeletedDoc()
+        .run(get, update1, delete1)
+        .expectError('invalid-argument');
+      await tt
+        .withDeletedDoc()
+        .run(get, update1, update2)
+        .expectError('invalid-argument');
+      await tt
+        .withDeletedDoc()
+        .run(get, update1, set1)
+        .expectError('invalid-argument');
+
+      await tt.withDeletedDoc().run(get, set1, delete1).expectNoDoc();
+      await tt
+        .withDeletedDoc()
+        .run(get, set1, update2)
+        .expectDoc({ foo: 'bar2' });
+      await tt.withDeletedDoc().run(get, set1, set2).expectDoc({ foo: 'bar2' });
+    });
+  }).timeout(10000);
+
+  it('runs transactions on existing document', async () => {
+    return withTestDb(persistence, async db => {
+      const tt = new TransactionTester(db);
+
+      await tt.withExistingDoc().run(delete1, delete1).expectNoDoc();
       await tt
         .withExistingDoc()
         .run(delete1, update2)
         .expectError('invalid-argument');
-      await tt
-        .withExistingDoc()
-        .run(delete1, set2)
-        .expectDoc({ foo: 'bar2' });
+      await tt.withExistingDoc().run(delete1, set2).expectDoc({ foo: 'bar2' });
 
-      await tt
-        .withExistingDoc()
-        .run(update1, delete1)
-        .expectNoDoc();
+      await tt.withExistingDoc().run(update1, delete1).expectNoDoc();
       await tt
         .withExistingDoc()
         .run(update1, update2)
         .expectDoc({ foo: 'bar2' });
-      await tt
-        .withExistingDoc()
-        .run(update1, set2)
-        .expectDoc({ foo: 'bar2' });
+      await tt.withExistingDoc().run(update1, set2).expectDoc({ foo: 'bar2' });
 
-      await tt
-        .withExistingDoc()
-        .run(set1, delete1)
-        .expectNoDoc();
-      await tt
-        .withExistingDoc()
-        .run(set1, update2)
-        .expectDoc({ foo: 'bar2' });
-      await tt
-        .withExistingDoc()
-        .run(set1, set2)
-        .expectDoc({ foo: 'bar2' });
+      await tt.withExistingDoc().run(set1, delete1).expectNoDoc();
+      await tt.withExistingDoc().run(set1, update2).expectDoc({ foo: 'bar2' });
+      await tt.withExistingDoc().run(set1, set2).expectDoc({ foo: 'bar2' });
     });
   });
 
-  it('runs transactions on non-existent document', async () => {
-    return integrationHelpers.withTestDb(persistence, async db => {
+  it('runs transactions on nonexistent document', async () => {
+    return withTestDb(persistence, async db => {
       const tt = new TransactionTester(db);
 
-      await tt
-        .withNonexistentDoc()
-        .run(delete1, delete1)
-        .expectNoDoc();
+      await tt.withNonexistentDoc().run(delete1, delete1).expectNoDoc();
       await tt
         .withNonexistentDoc()
         .run(delete1, update2)
@@ -365,44 +403,32 @@ apiDescribe('Database transactions', (persistence: boolean) => {
         .withNonexistentDoc()
         .run(update1, update2)
         .expectError('not-found');
-      await tt
-        .withNonexistentDoc()
-        .run(update1, set1)
-        .expectError('not-found');
+      await tt.withNonexistentDoc().run(update1, set1).expectError('not-found');
 
-      await tt
-        .withNonexistentDoc()
-        .run(set1, delete1)
-        .expectNoDoc();
+      await tt.withNonexistentDoc().run(set1, delete1).expectNoDoc();
       await tt
         .withNonexistentDoc()
         .run(set1, update2)
         .expectDoc({ foo: 'bar2' });
-      await tt
-        .withNonexistentDoc()
-        .run(set1, set2)
-        .expectDoc({ foo: 'bar2' });
+      await tt.withNonexistentDoc().run(set1, set2).expectDoc({ foo: 'bar2' });
     });
   });
 
   it('set document with merge', () => {
-    return integrationHelpers.withTestDb(persistence, db => {
-      const doc = db.collection('towns').doc();
-      return db
-        .runTransaction(async transaction => {
-          transaction.set(doc, { a: 'b', nested: { a: 'b' } }).set(
-            doc,
-            { c: 'd', nested: { c: 'd' } },
-            {
-              merge: true
-            }
-          );
-        })
-        .then(() => {
-          return doc.get();
-        })
+    return withTestDb(persistence, db => {
+      const docRef = doc(collection(db, 'towns'));
+      return runTransaction(db, async transaction => {
+        transaction.set(docRef, { a: 'b', nested: { a: 'b' } }).set(
+          docRef,
+          { c: 'd', nested: { c: 'd' } },
+          {
+            merge: true
+          }
+        );
+      })
+        .then(() => getDoc(docRef))
         .then(snapshot => {
-          expect(snapshot.exists).to.equal(true);
+          expect(snapshot.exists()).to.equal(true);
           expect(snapshot.data()).to.deep.equal({
             a: 'b',
             c: 'd',
@@ -424,20 +450,19 @@ apiDescribe('Database transactions', (persistence: boolean) => {
       'is.admin': true
     };
 
-    return integrationHelpers.withTestDb(persistence, db => {
-      const doc = db.collection('counters').doc();
-      return db
-        .runTransaction(async transaction => {
-          transaction.set(doc, initialData);
-          transaction.update(
-            doc,
-            'owner.name',
-            'Sebastian',
-            new FieldPath('is.admin'),
-            true
-          );
-        })
-        .then(() => doc.get())
+    return withTestDb(persistence, db => {
+      const docRef = doc(collection(db, 'counters'));
+      return runTransaction(db, async transaction => {
+        transaction.set(docRef, initialData);
+        transaction.update(
+          docRef,
+          'owner.name',
+          'Sebastian',
+          new FieldPath('is.admin'),
+          true
+        );
+      })
+        .then(() => getDoc(docRef))
         .then(docSnapshot => {
           expect(docSnapshot.exists).to.be.ok;
           expect(docSnapshot.data()).to.deep.equal(finalData);
@@ -446,16 +471,15 @@ apiDescribe('Database transactions', (persistence: boolean) => {
   });
 
   it('retry when a document that was read without being written changes', () => {
-    return integrationHelpers.withTestDb(persistence, db => {
-      const doc1 = db.collection('counters').doc();
-      const doc2 = db.collection('counters').doc();
+    return withTestDb(persistence, db => {
+      const doc1 = doc(collection(db, 'counters'));
+      const doc2 = doc(collection(db, 'counters'));
       let tries = 0;
-      return doc1
-        .set({
-          count: 15
-        })
+      return setDoc(doc1, {
+        count: 15
+      })
         .then(() => {
-          return db.runTransaction(transaction => {
+          return runTransaction(db, transaction => {
             ++tries;
 
             // Get the first doc.
@@ -466,7 +490,7 @@ apiDescribe('Database transactions', (persistence: boolean) => {
                 // transaction is tried, this will bump the version, which
                 // will cause the write to doc2 to fail. The second time, it
                 // will be a no-op and not bump the version.
-                .then(() => doc1.set({ count: 1234 }))
+                .then(() => setDoc(doc1, { count: 1234 }))
                 // Now try to update the other doc from within the
                 // transaction.
                 // This should fail once, because we read 15 earlier.
@@ -475,56 +499,90 @@ apiDescribe('Database transactions', (persistence: boolean) => {
           });
         })
         .then(async () => {
-          const snapshot = await doc1.get();
+          const snapshot = await getDoc(doc1);
           expect(tries).to.equal(2);
           expect(snapshot.data()!['count']).to.equal(1234);
         });
     });
   });
 
-  it('cannot read after writing', () => {
-    return integrationHelpers.withTestDb(persistence, db => {
-      return db
-        .runTransaction(transaction => {
-          const doc = db.collection('anything').doc();
-          transaction.set(doc, { foo: 'bar' });
-          return transaction.get(doc);
-        })
+  it('cannot read after writing and does not commit', () => {
+    return withTestDb(persistence, async db => {
+      const docRef = doc(collection(db, '00000-anything'));
+      await setDoc(docRef, { foo: 'baz' });
+      await runTransaction(db, async transaction => {
+        transaction.set(docRef, { foo: 'bar' });
+        return transaction.get(docRef);
+      })
         .then(() => {
           expect.fail('transaction should fail');
         })
-        .catch((err: firestore.FirestoreError) => {
+        .catch((err: FirestoreError) => {
           expect(err).to.exist;
           expect(err.code).to.equal('invalid-argument');
           expect(err.message).to.contain(
             'Firestore transactions require all reads to be executed'
           );
         });
+
+      const postSnap = await getDoc(docRef);
+      expect(postSnap.get('foo')).to.equal('baz');
+    });
+  });
+
+  it('cannot read after writing and does not commit, even if the user transaction does not bubble up the error', () => {
+    return withTestDb(persistence, async db => {
+      const docRef = doc(collection(db, '00000-anything'));
+      await setDoc(docRef, { foo: 'baz' });
+      await runTransaction(db, async transaction => {
+        transaction.set(docRef, { foo: 'bar' });
+
+        // The following statement `transaction.get(...)` is problematic because
+        // it occurs after `transaction.set(...)`. In previous versions of the
+        // SDK this un-awaited `transaction.get(...)` failed but the transaction
+        // still committed successfully. This regression test ensures that the
+        // commit will fail even if the code does not await
+        // `transaction.get(...)`.
+        // eslint-disable-next-line
+        transaction.get(docRef);
+      })
+        .then(() => {
+          expect.fail('transaction should fail');
+        })
+        .catch((err: FirestoreError) => {
+          expect(err).to.exist;
+          expect(err.code).to.equal('invalid-argument');
+          expect(err.message).to.contain(
+            'Firestore transactions require all reads to be executed'
+          );
+        });
+
+      const postSnap = await getDoc(docRef);
+      expect(postSnap.get('foo')).to.equal('baz');
     });
   });
 
   it(
-    'cannot read non-existent document then update, even if ' +
+    'cannot read nonexistent document then update, even if ' +
       'document is written after the read',
     () => {
-      return integrationHelpers.withTestDb(persistence, db => {
-        return db
-          .runTransaction(transaction => {
-            const doc = db.collection('nonexistent').doc();
-            return (
-              transaction
-                // Get and update a document that doesn't exist so that the transaction fails.
-                .get(doc)
-                // Do a write outside of the transaction.
-                .then(() => doc.set({ count: 1234 }))
-                // Now try to update the doc from within the transaction. This
-                // should fail, because the document didn't exist at the start
-                // of the transaction.
-                .then(() => transaction.update(doc, { count: 16 }))
-            );
-          })
+      return withTestDb(persistence, db => {
+        return runTransaction(db, transaction => {
+          const docRef = doc(collection(db, 'nonexistent'));
+          return (
+            transaction
+              // Get and update a document that doesn't exist so that the transaction fails.
+              .get(docRef)
+              // Do a write outside of the transaction.
+              .then(() => setDoc(docRef, { count: 1234 }))
+              // Now try to update the doc from within the transaction. This
+              // should fail, because the document didn't exist at the start
+              // of the transaction.
+              .then(() => transaction.update(docRef, { count: 16 }))
+          );
+        })
           .then(() => expect.fail('transaction should fail'))
-          .catch((err: firestore.FirestoreError) => {
+          .catch((err: FirestoreError) => {
             expect(err).to.exist;
             expect(err.code).to.equal('invalid-argument');
             expect(err.message).to.contain(
@@ -552,10 +610,9 @@ apiDescribe('Database transactions', (persistence: boolean) => {
       it(badReturn + ' is rejected', () => {
         // Intentionally returning bad type.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const fn = ((txn: firestore.Transaction) => badReturn) as any;
-        return integrationHelpers.withTestDb(persistence, db => {
-          return db
-            .runTransaction(fn)
+        const fn = ((txn: Transaction) => badReturn) as any;
+        return withTestDb(persistence, db => {
+          return runTransaction(db, fn)
             .then(() => expect.fail('transaction should fail'))
             .catch(err => {
               expect(err).to.exist;
@@ -569,17 +626,16 @@ apiDescribe('Database transactions', (persistence: boolean) => {
   });
 
   it('can have gets without mutations', () => {
-    return integrationHelpers.withTestDb(persistence, db => {
-      const docRef = db.collection('foo').doc();
-      const docRef2 = db.collection('foo').doc();
-      return docRef
-        .set({ foo: 'bar' })
-        .then(() => {
-          return db.runTransaction(async txn => {
+    return withTestDb(persistence, db => {
+      const docRef = doc(collection(db, 'foo'));
+      const docRef2 = doc(collection(db, 'foo'));
+      return setDoc(docRef, { foo: 'bar' })
+        .then(() =>
+          runTransaction(db, async txn => {
             await txn.get(docRef2);
             return txn.get(docRef);
-          });
-        })
+          })
+        )
         .then(snapshot => {
           expect(snapshot).to.exist;
           expect(snapshot.data()!['foo']).to.equal('bar');
@@ -588,88 +644,103 @@ apiDescribe('Database transactions', (persistence: boolean) => {
   });
 
   it('does not retry on permanent errors', () => {
-    return integrationHelpers.withTestDb(persistence, db => {
+    return withTestDb(persistence, db => {
       let counter = 0;
-      return db
-        .runTransaction(transaction => {
-          // Make a transaction that should fail with a permanent error.
-          counter++;
-          const doc = db.collection('nonexistent').doc();
-          return (
-            transaction
-              // Get and update a document that doesn't exist so that the transaction fails.
-              .get(doc)
-              .then(() => transaction.update(doc, { count: 16 }))
-          );
-        })
+      return runTransaction(db, transaction => {
+        // Make a transaction that should fail with a permanent error.
+        counter++;
+        const docRef = doc(collection(db, 'nonexistent'));
+        return (
+          transaction
+            // Get and update a document that doesn't exist so that the transaction fails.
+            .get(docRef)
+            .then(() => transaction.update(docRef, { count: 16 }))
+        );
+      })
         .then(() => expect.fail('transaction should fail'))
-        .catch((err: firestore.FirestoreError) => {
+        .catch((err: FirestoreError) => {
           expect(err.code).to.equal('invalid-argument');
           expect(counter).to.equal(1);
         });
     });
   });
 
-  it('are successful with no transaction operations', () => {
-    return integrationHelpers.withTestDb(persistence, db => {
-      return db.runTransaction(async txn => {});
+  it('retries when document already exists', () => {
+    return withTestDb(persistence, async db => {
+      let retryCounter = 0;
+      const docRef = doc(collection(db, 'nonexistent'));
+
+      await runTransaction(db, async transaction => {
+        ++retryCounter;
+        const snap = await transaction.get(docRef);
+
+        if (retryCounter === 1) {
+          expect(snap.exists()).to.be.false;
+          // On the first attempt, create a doc before transaction.set(), so that
+          // the transaction fails with "already-exists" error, and retries.
+          await setDoc(docRef, { count: 1 });
+        }
+
+        transaction.set(docRef, { count: 2 });
+      });
+      expect(retryCounter).to.equal(2);
+      const snap = await getDoc(docRef);
+      expect(snap.get('count')).to.equal(2);
     });
   });
 
+  it('are successful with no transaction operations', () => {
+    return withTestDb(persistence, db => runTransaction(db, async () => {}));
+  });
+
   it('are cancelled on rejected promise', () => {
-    return integrationHelpers.withTestDb(persistence, db => {
-      const doc = db.collection('towns').doc();
+    return withTestDb(persistence, db => {
+      const docRef = doc(collection(db, 'towns'));
       let counter = 0;
-      return db
-        .runTransaction(transaction => {
-          counter++;
-          transaction.set(doc, { foo: 'bar' });
-          return Promise.reject('no');
-        })
+      return runTransaction(db, transaction => {
+        counter++;
+        transaction.set(docRef, { foo: 'bar' });
+        return Promise.reject('no');
+      })
         .then(() => expect.fail('transaction should fail'))
         .catch(err => {
           expect(err).to.exist;
           expect(err).to.equal('no');
           expect(counter).to.equal(1);
-          return doc.get();
+          return getDoc(docRef);
         })
         .then(snapshot => {
-          expect((snapshot as firestore.DocumentSnapshot).exists).to.equal(
-            false
-          );
+          expect((snapshot as DocumentSnapshot).exists()).to.equal(false);
         });
     });
   });
 
   it('are cancelled on throw', () => {
-    return integrationHelpers.withTestDb(persistence, db => {
-      const doc = db.collection('towns').doc();
+    return withTestDb(persistence, db => {
+      const docRef = doc(collection(db, 'towns'));
       const failure = new Error('no');
       let count = 0;
-      return db
-        .runTransaction(transaction => {
-          count++;
-          transaction.set(doc, { foo: 'bar' });
-          throw failure;
-        })
+      return runTransaction(db, transaction => {
+        count++;
+        transaction.set(docRef, { foo: 'bar' });
+        throw failure;
+      })
         .then(() => expect.fail('transaction should fail'))
         .catch(err => {
           expect(err).to.exist;
           expect(err).to.equal(failure);
           expect(count).to.equal(1);
-          return doc.get();
+          return getDoc(docRef);
         })
         .then(snapshot => {
-          expect((snapshot as firestore.DocumentSnapshot).exists).to.equal(
-            false
-          );
+          expect(snapshot.exists()).to.equal(false);
         });
     });
   });
 
   // PORTING NOTE: These tests are for FirestoreDataConverter support and apply
   // only to web.
-  apiDescribe('withConverter() support', (persistence: boolean) => {
+  apiDescribe('withConverter() support', persistence => {
     class Post {
       constructor(readonly title: string, readonly author: string) {}
       byline(): string {
@@ -678,33 +749,25 @@ apiDescribe('Database transactions', (persistence: boolean) => {
     }
 
     it('for Transaction.set<T>() and Transaction.get<T>()', () => {
-      return integrationHelpers.withTestDb(persistence, db => {
-        const docRef = db
-          .collection('posts')
-          .doc()
-          .withConverter({
-            toFirestore(post: Post): firestore.DocumentData {
-              return { title: post.title, author: post.author };
-            },
-            fromFirestore(
-              snapshot: firestore.QueryDocumentSnapshot,
-              options: firestore.SnapshotOptions
-            ): Post {
-              const data = snapshot.data(options);
-              return new Post(data.title, data.author);
-            }
+      return withTestDb(persistence, db => {
+        const docRef = doc(collection(db, 'posts')).withConverter({
+          toFirestore(post: Post): DocumentData {
+            return { title: post.title, author: post.author };
+          },
+          fromFirestore(snapshot: QueryDocumentSnapshot): Post {
+            const data = snapshot.data();
+            return new Post(data.title, data.author);
+          }
+        });
+        return setDoc(docRef, new Post('post', 'author')).then(() => {
+          return runTransaction(db, async transaction => {
+            const snapshot = await transaction.get(docRef);
+            expect(snapshot.data()!.byline()).to.equal('post, by author');
+            transaction.set(docRef, new Post('new post', 'author'));
+          }).then(async () => {
+            const snapshot = await getDoc(docRef);
+            expect(snapshot.data()!.byline()).to.equal('new post, by author');
           });
-        return docRef.set(new Post('post', 'author')).then(() => {
-          return db
-            .runTransaction(async transaction => {
-              const snapshot = await transaction.get(docRef);
-              expect(snapshot.data()!.byline()).to.equal('post, by author');
-              transaction.set(docRef, new Post('new post', 'author'));
-            })
-            .then(async () => {
-              const snapshot = await docRef.get();
-              expect(snapshot.data()!.byline()).to.equal('new post, by author');
-            });
         });
       });
     });

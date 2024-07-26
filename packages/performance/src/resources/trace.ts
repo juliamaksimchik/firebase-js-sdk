@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2020 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,8 +31,12 @@ import {
   isValidCustomAttributeName,
   isValidCustomAttributeValue
 } from '../utils/attributes_utils';
-import { isValidMetricName } from '../utils/metric_utils';
-import { PerformanceTrace } from '@firebase/performance-types';
+import {
+  isValidMetricName,
+  convertMetricValueToInteger
+} from '../utils/metric_utils';
+import { PerformanceTrace } from '../public_types';
+import { PerformanceController } from '../controllers/perf';
 
 const enum TraceState {
   UNINITIALIZED = 1,
@@ -53,6 +57,7 @@ export class Trace implements PerformanceTrace {
   private traceMeasure!: string;
 
   /**
+   * @param performanceController The performance controller running.
    * @param name The name of the trace.
    * @param isAuto If the trace is auto-instrumented.
    * @param traceMeasureName The name of the measure marker in user timing specification. This field
@@ -60,6 +65,7 @@ export class Trace implements PerformanceTrace {
    * api (performance.mark and performance.measure).
    */
   constructor(
+    readonly performanceController: PerformanceController,
     readonly name: string,
     readonly isAuto = false,
     traceMeasureName?: string
@@ -117,7 +123,7 @@ export class Trace implements PerformanceTrace {
    * Records a trace with predetermined values. If this method is used a trace is created and logged
    * directly. No need to use start and stop methods.
    * @param startTime Trace start time since epoch in millisec
-   * @param duration The duraction of the trace in millisec
+   * @param duration The duration of the trace in millisec
    * @param options An object which can optionally hold maps of custom metrics and custom attributes
    */
   record(
@@ -128,15 +134,28 @@ export class Trace implements PerformanceTrace {
       attributes?: { [key: string]: string };
     }
   ): void {
+    if (startTime <= 0) {
+      throw ERROR_FACTORY.create(ErrorCode.NONPOSITIVE_TRACE_START_TIME, {
+        traceName: this.name
+      });
+    }
+    if (duration <= 0) {
+      throw ERROR_FACTORY.create(ErrorCode.NONPOSITIVE_TRACE_DURATION, {
+        traceName: this.name
+      });
+    }
+
     this.durationUs = Math.floor(duration * 1000);
     this.startTimeUs = Math.floor(startTime * 1000);
     if (options && options.attributes) {
       this.customAttributes = { ...options.attributes };
     }
     if (options && options.metrics) {
-      for (const metric of Object.keys(options.metrics)) {
-        if (!isNaN(Number(options.metrics[metric]))) {
-          this.counters[metric] = Number(Math.floor(options.metrics[metric]));
+      for (const metricName of Object.keys(options.metrics)) {
+        if (!isNaN(Number(options.metrics[metricName]))) {
+          this.counters[metricName] = Math.floor(
+            Number(options.metrics[metricName])
+          );
         }
       }
     }
@@ -145,26 +164,28 @@ export class Trace implements PerformanceTrace {
 
   /**
    * Increments a custom metric by a certain number or 1 if number not specified. Will create a new
-   * custom metric if one with the given name does not exist.
+   * custom metric if one with the given name does not exist. The value will be floored down to an
+   * integer.
    * @param counter Name of the custom metric
-   * @param num Increment by value
+   * @param numAsInteger Increment by value
    */
-  incrementMetric(counter: string, num = 1): void {
+  incrementMetric(counter: string, numAsInteger = 1): void {
     if (this.counters[counter] === undefined) {
-      this.putMetric(counter, 0);
+      this.putMetric(counter, numAsInteger);
+    } else {
+      this.putMetric(counter, this.counters[counter] + numAsInteger);
     }
-    this.counters[counter] += num;
   }
 
   /**
    * Sets a custom metric to a specified value. Will create a new custom metric if one with the
-   * given name does not exist.
+   * given name does not exist. The value will be floored down to an integer.
    * @param counter Name of the custom metric
-   * @param num Set custom metric to this value
+   * @param numAsInteger Set custom metric to this value
    */
-  putMetric(counter: string, num: number): void {
+  putMetric(counter: string, numAsInteger: number): void {
     if (isValidMetricName(counter, this.name)) {
-      this.counters[counter] = num;
+      this.counters[counter] = convertMetricValueToInteger(numAsInteger ?? 0);
     } else {
       throw ERROR_FACTORY.create(ErrorCode.INVALID_CUSTOM_METRIC_NAME, {
         customMetricName: counter
@@ -255,6 +276,7 @@ export class Trace implements PerformanceTrace {
    * @param firstInputDelay First input delay in millisec
    */
   static createOobTrace(
+    performanceController: PerformanceController,
     navigationTimings: PerformanceNavigationTiming[],
     paintTimings: PerformanceEntry[],
     firstInputDelay?: number
@@ -263,7 +285,11 @@ export class Trace implements PerformanceTrace {
     if (!route) {
       return;
     }
-    const trace = new Trace(OOB_TRACE_PAGE_LOAD_PREFIX + route, true);
+    const trace = new Trace(
+      performanceController,
+      OOB_TRACE_PAGE_LOAD_PREFIX + route,
+      true
+    );
     const timeOriginUs = Math.floor(Api.getInstance().getTimeOrigin() * 1000);
     trace.setStartTime(timeOriginUs);
 
@@ -317,8 +343,16 @@ export class Trace implements PerformanceTrace {
     logTrace(trace);
   }
 
-  static createUserTimingTrace(measureName: string): void {
-    const trace = new Trace(measureName, false, measureName);
+  static createUserTimingTrace(
+    performanceController: PerformanceController,
+    measureName: string
+  ): void {
+    const trace = new Trace(
+      performanceController,
+      measureName,
+      false,
+      measureName
+    );
     logTrace(trace);
   }
 }

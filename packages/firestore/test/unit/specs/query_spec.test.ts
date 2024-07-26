@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,31 +15,37 @@
  * limitations under the License.
  */
 
-import { Query } from '../../../src/core/query';
-import { doc, filter, path } from '../../util/helpers';
-
+import {
+  newQueryForCollectionGroup,
+  newQueryForPath,
+  queryWithAddedFilter
+} from '../../../src/core/query';
 import { Document } from '../../../src/model/document';
-import { ResourcePath } from '../../../src/model/path';
+import { doc, filter, query } from '../../util/helpers';
+
 import { describeSpec, specTest } from './describe_spec';
-import { spec, SpecBuilder } from './spec_builder';
+import { client, spec, SpecBuilder } from './spec_builder';
 
 // Helper to seed the cache with the specified docs by listening to each one.
 function specWithCachedDocs(...docs: Document[]): SpecBuilder {
   let builder = spec();
   for (const doc of docs) {
-    const query = Query.atPath(doc.key.path);
+    const query1 = newQueryForPath(doc.key.path);
     builder = builder
-      .userListens(query)
-      .watchAcksFull(query, 1000, doc)
-      .expectEvents(query, { added: [doc] });
+      .userListens(query1)
+      .watchAcksFull(query1, 1000, doc)
+      .expectEvents(query1, { added: [doc] });
   }
   return builder;
 }
 
 describeSpec('Queries:', [], () => {
   specTest('Collection Group query', [], () => {
-    const cgQuery = new Query(ResourcePath.EMPTY_PATH, 'cg');
-    const cgQueryWithFilter = cgQuery.addFilter(filter('val', '==', 1));
+    const cgQuery = newQueryForCollectionGroup('cg');
+    const cgQueryWithFilter = queryWithAddedFilter(
+      cgQuery,
+      filter('val', '==', 1)
+    );
     const docs = [
       doc('cg/1', 1000, { val: 1 }),
       doc('cg/2', 1000, { val: 2 }),
@@ -61,30 +67,25 @@ describeSpec('Queries:', [], () => {
   });
 
   specTest('Collection Group query with mutations', [], () => {
-    const cgQuery = new Query(ResourcePath.EMPTY_PATH, 'cg');
-    const cgQueryWithFilter = cgQuery.addFilter(filter('val', '==', 1));
+    const cgQuery = newQueryForCollectionGroup('cg');
+    const cgQueryWithFilter = queryWithAddedFilter(
+      cgQuery,
+      filter('val', '==', 1)
+    );
     const cachedDocs = [
       doc('cg/1', 1000, { val: 1 }),
       doc('not-cg/nope', 1000, { val: 1 })
     ];
-    const toWrite1 = doc('cg/2', 0, { val: 2 }, { hasLocalMutations: true });
-    const toWrite2 = doc(
-      'not-cg/nope/cg/3',
-      0,
-      { val: 1 },
-      { hasLocalMutations: true }
-    );
-    const toWrite3 = doc(
-      'not-cg2/nope',
-      0,
-      { val: 1 },
-      { hasLocalMutations: true }
-    );
+    const toWrite1 = doc('cg/2', 0, { val: 2 }).setHasLocalMutations();
+    const toWrite2 = doc('not-cg/nope/cg/3', 0, {
+      val: 1
+    }).setHasLocalMutations();
+    const toWrite3 = doc('not-cg2/nope', 0, { val: 1 }).setHasLocalMutations();
 
     return specWithCachedDocs(...cachedDocs)
-      .userSets(toWrite1.key.toString(), toWrite1.data().value())
-      .userSets(toWrite2.key.toString(), toWrite2.data().value())
-      .userSets(toWrite3.key.toString(), toWrite3.data().value())
+      .userSets(toWrite1.key.toString(), { val: 2 })
+      .userSets(toWrite2.key.toString(), { val: 1 })
+      .userSets(toWrite3.key.toString(), { val: 1 })
       .userListens(cgQuery)
       .expectEvents(cgQuery, {
         added: [cachedDocs[0], toWrite1, toWrite2],
@@ -103,15 +104,15 @@ describeSpec('Queries:', [], () => {
     'Latency-compensated updates are included in query results',
     [],
     () => {
-      const fullQuery = Query.atPath(path('collection'));
-      const filteredQuery = fullQuery.addFilter(filter('match', '==', true));
-      const docA = doc('collection/a', 1000, { match: false });
-      const docAv2Local = doc(
-        'collection/a',
-        1000,
-        { match: true },
-        { hasLocalMutations: true }
+      const fullQuery = query('collection');
+      const filteredQuery = queryWithAddedFilter(
+        fullQuery,
+        filter('match', '==', true)
       );
+      const docA = doc('collection/a', 1000, { match: false });
+      const docAv2Local = doc('collection/a', 1000, {
+        match: true
+      }).setHasLocalMutations();
 
       return (
         spec()
@@ -132,6 +133,44 @@ describeSpec('Queries:', [], () => {
             fromCache: true,
             hasPendingWrites: true
           })
+      );
+    }
+  );
+
+  specTest(
+    'Queries in different tabs will not interfere',
+    ['multi-client'],
+    () => {
+      const query1 = query('collection', filter('key', '==', 'a'));
+      const query2 = query('collection', filter('key', '==', 'b'));
+      const docA = doc('collection/a', 1000, { key: 'a' });
+      const docB = doc('collection/b', 1000, { key: 'b' });
+
+      return (
+        client(0)
+          .becomeVisible()
+          // Listen to the first query in the primary client
+          .expectPrimaryState(true)
+          .userListens(query1)
+          .watchAcks(query1)
+          .watchSends({ affects: [query1] }, docA)
+
+          // Listen to different query in the secondary client
+          .client(1)
+          .userListens(query2)
+
+          .client(0)
+          .expectListen(query2)
+          .watchCurrents(query1, 'resume-token-1000')
+          // Receive global snapshot before the second query is acknowledged
+          .watchSnapshots(1000)
+          .expectEvents(query1, { added: [docA] })
+          // This should not trigger empty snapshot for second query(bugged behavior)
+          .client(1)
+          .client(0)
+          .watchAcksFull(query2, 2000, docB)
+          .client(1)
+          .expectEvents(query2, { added: [docB] })
       );
     }
   );

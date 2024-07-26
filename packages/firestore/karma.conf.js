@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,24 +15,43 @@
  * limitations under the License.
  */
 
-const karma = require('karma');
-const path = require('path');
 const karmaBase = require('../../config/karma.base');
 const { argv } = require('yargs');
 
-module.exports = function(config) {
-  const karmaConfig = Object.assign({}, karmaBase, {
+module.exports = function (config) {
+  const karmaConfig = {
+    ...karmaBase,
+    browsers: getTestBrowsers(argv),
     // files to load into karma
     files: getTestFiles(argv),
 
+    preprocessors: {
+      'test/**/*.ts': ['webpack', 'sourcemap']
+    },
+
     // frameworks to use
     // available frameworks: https://npmjs.org/browse/keyword/karma-adapter
-    frameworks: ['mocha'],
+    frameworks: ['mocha']
+  };
 
-    client: Object.assign({}, karmaBase.client, {
-      firestoreSettings: getFirestoreSettings(argv)
-    })
-  });
+  if (argv.targetBackend) {
+    karmaConfig.client = {
+      ...karmaConfig.client,
+      targetBackend: argv.targetBackend
+    };
+  } else if (argv.local) {
+    karmaConfig.client = {
+      ...karmaConfig.client,
+      targetBackend: 'emulator'
+    };
+  }
+
+  if (argv.databaseId) {
+    karmaConfig.client = {
+      ...karmaConfig.client,
+      databaseId: argv.databaseId
+    };
+  }
 
   config.set(karmaConfig);
 };
@@ -43,32 +62,26 @@ module.exports = function(config) {
  */
 function getTestFiles(argv) {
   const unitTests = 'test/unit/bootstrap.ts';
-  const integrationTests = 'test/integration/bootstrap.ts';
+  const legacyIntegrationTests = 'test/integration/bootstrap.ts';
+  const liteIntegrationTests = 'test/lite/bootstrap.ts';
   if (argv.unit) {
     return [unitTests];
   } else if (argv.integration) {
-    return [integrationTests];
+    return [legacyIntegrationTests];
+  } else if (argv.lite) {
+    process.env.TEST_PLATFORM = 'browser_lite';
+    return [liteIntegrationTests];
   } else {
-    return [unitTests, integrationTests];
+    return [unitTests, legacyIntegrationTests];
   }
 }
 
-/**
- * If the --local argument is passed, returns a {host, ssl} FirestoreSettings
- * object that point to localhost instead of production.
- */
-function getFirestoreSettings(argv) {
-  if (argv.local) {
-    return {
-      host: 'localhost:8080',
-      ssl: false
-    };
-  } else {
-    return {
-      host: 'firestore.googleapis.com',
-      ssl: true
-    };
+function getTestBrowsers(argv) {
+  let browsers = ['ChromeHeadless'];
+  if (process.env?.BROWSERS && argv.unit) {
+    browsers = process.env?.BROWSERS?.split(',');
   }
+  return browsers;
 }
 
 module.exports.files = getTestFiles(argv);

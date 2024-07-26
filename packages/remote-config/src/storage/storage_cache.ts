@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,7 +52,8 @@ export class StorageCache {
    */
   async loadFromStorage(): Promise<void> {
     const lastFetchStatusPromise = this.storage.getLastFetchStatus();
-    const lastSuccessfulFetchTimestampMillisPromise = this.storage.getLastSuccessfulFetchTimestampMillis();
+    const lastSuccessfulFetchTimestampMillisPromise =
+      this.storage.getLastSuccessfulFetchTimestampMillis();
     const activeConfigPromise = this.storage.getActiveConfig();
 
     // Note:
@@ -66,9 +67,11 @@ export class StorageCache {
       this.lastFetchStatus = lastFetchStatus;
     }
 
-    const lastSuccessfulFetchTimestampMillis = await lastSuccessfulFetchTimestampMillisPromise;
+    const lastSuccessfulFetchTimestampMillis =
+      await lastSuccessfulFetchTimestampMillisPromise;
     if (lastSuccessfulFetchTimestampMillis) {
-      this.lastSuccessfulFetchTimestampMillis = lastSuccessfulFetchTimestampMillis;
+      this.lastSuccessfulFetchTimestampMillis =
+        lastSuccessfulFetchTimestampMillis;
     }
 
     const activeConfig = await activeConfigPromise;

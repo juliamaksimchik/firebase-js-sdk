@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,10 @@
  * limitations under the License.
  */
 
-import { Query } from '../../../src/core/query';
-import { Document } from '../../../src/model/document';
+import { MutableDocument } from '../../../src/model/document';
 import { TimerId } from '../../../src/util/async_queue';
 import { Code } from '../../../src/util/error';
-import { doc, path } from '../../util/helpers';
+import { doc, query } from '../../util/helpers';
 
 import { describeSpec, specTest } from './describe_spec';
 import { client, spec } from './spec_builder';
@@ -30,48 +29,42 @@ describeSpec('Writes:', [], () => {
     'Two sequential writes to different documents smoke test.',
     [],
     () => {
-      const query = Query.atPath(path('collection'));
+      const query1 = query('collection');
       const docAv1 = doc('collection/a', 1000, { v: 1 });
       const docBv1 = doc('collection/b', 500, { v: 1 });
-      const docAv2Local = doc(
-        'collection/a',
-        1000,
-        { v: 2 },
-        { hasLocalMutations: true }
-      );
-      const docBv2Local = doc(
-        'collection/b',
-        500,
-        { v: 2 },
-        { hasLocalMutations: true }
-      );
+      const docAv2Local = doc('collection/a', 1000, {
+        v: 2
+      }).setHasLocalMutations();
+      const docBv2Local = doc('collection/b', 500, {
+        v: 2
+      }).setHasLocalMutations();
       const docAv2 = doc('collection/a', 2000, { v: 2 });
       const docBv2 = doc('collection/b', 2500, { v: 2 });
 
       return spec()
-        .userListens(query)
-        .watchAcksFull(query, 1000, docAv1, docBv1)
-        .expectEvents(query, { added: [docAv1, docBv1] })
+        .userListens(query1)
+        .watchAcksFull(query1, 1000, docAv1, docBv1)
+        .expectEvents(query1, { added: [docAv1, docBv1] })
         .userSets('collection/a', { v: 2 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           modified: [docAv2Local]
         })
-        .watchSends({ affects: [query] }, docAv2)
+        .watchSends({ affects: [query1] }, docAv2)
         .watchSnapshots(2000)
         .writeAcks('collection/a', 2000)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           metadata: [docAv2]
         })
         .userSets('collection/b', { v: 2 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           modified: [docBv2Local]
         })
-        .watchSends({ affects: [query] }, docBv2)
+        .watchSends({ affects: [query1] }, docBv2)
         .watchSnapshots(3000)
         .writeAcks('collection/b', 2500)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           metadata: [docBv2]
         });
     }
@@ -81,14 +74,11 @@ describeSpec('Writes:', [], () => {
     'Event is raised for a local set before and after the write ack',
     [],
     () => {
-      const query1 = Query.atPath(path('collection/key'));
+      const query1 = query('collection/key');
       const doc1a = doc('collection/key', 1000, { v: 1 });
-      const doc1b = doc(
-        'collection/key',
-        1000,
-        { v: 2 },
-        { hasLocalMutations: true }
-      );
+      const doc1b = doc('collection/key', 1000, {
+        v: 2
+      }).setHasLocalMutations();
       const doc1c = doc('collection/key', 2000, { v: 2 });
       return spec()
         .userListens(query1)
@@ -114,15 +104,12 @@ describeSpec('Writes:', [], () => {
     "Raises snapshot with 'hasPendingWrites' for unacknowledged write",
     [],
     () => {
-      const query1 = Query.atPath(path('collection'));
-      const pendingDoc = doc(
-        'collection/doc',
-        /* remoteVersion= */ 0,
-        { v: 1 },
-        { hasLocalMutations: true }
-      );
+      const query1 = query('collection');
+      const pendingDoc = doc('collection/doc', /* remoteVersion= */ 0, {
+        v: 1
+      }).setHasLocalMutations();
       return spec()
-        .withGCEnabled(false)
+        .ensureManualLruGC()
         .userSets('collection/doc', { v: 1 })
         .userListens(query1)
         .expectEvents(query1, {
@@ -137,15 +124,12 @@ describeSpec('Writes:', [], () => {
     "Doesn't raise 'hasPendingWrites' for committed write and new listen",
     [],
     () => {
-      const query1 = Query.atPath(path('collection'));
-      const modifiedDoc = doc(
-        'collection/doc',
-        1000,
-        { v: 1 },
-        { hasCommittedMutations: true }
-      );
+      const query1 = query('collection');
+      const modifiedDoc = doc('collection/doc', 1000, {
+        v: 1
+      }).setHasCommittedMutations();
       return spec()
-        .withGCEnabled(false)
+        .ensureManualLruGC()
         .userSets('collection/doc', { v: 1 })
         .writeAcks('collection/doc', 1000)
         .userListens(query1)
@@ -157,26 +141,26 @@ describeSpec('Writes:', [], () => {
   );
 
   specTest("Doesn't raise event for document with pending patch", [], () => {
-    const query = Query.atPath(path('collection'));
+    const query1 = query('collection');
     const docV1 = doc('collection/doc', /* remoteVersion= */ 500, { v: 1 });
     const docV2 = doc('collection/doc', /* remoteVersion= */ 1000, { v: 2 });
     return (
       spec()
-        .withGCEnabled(false)
-        .userListens(query)
-        .watchAcksFull(query, 250)
-        .expectEvents(query, {})
+        .ensureManualLruGC()
+        .userListens(query1)
+        .watchAcksFull(query1, 250)
+        .expectEvents(query1, {})
         .userPatches('collection/doc', { v: 2 })
         .writeAcks('collection/doc', 1000)
         // The patch was applied by the backend, but we don't have a base
         // version for the document.
-        .watchSends({ affects: [query] }, docV1)
+        .watchSends({ affects: [query1] }, docV1)
         .watchSnapshots(500)
         // We should not raise a snapshot, since the remote version is behind
-        .watchSends({ affects: [query] }, docV2)
+        .watchSends({ affects: [query1] }, docV2)
         .watchSnapshots(1000)
         // Watch has caught up and we raise a snapshot
-        .expectEvents(query, {
+        .expectEvents(query1, {
           added: [docV2]
         })
     );
@@ -189,14 +173,9 @@ describeSpec('Writes:', [], () => {
     const ackedVersion = 2000;
     const watchVersion = 10000;
 
-    const query1 = Query.atPath(path('collection/key'));
+    const query1 = query('collection/key');
     const doc1a = doc('collection/key', initialVersion, { v: 1 });
-    const doc1b = doc(
-      'collection/key',
-      1000,
-      { v: 2 },
-      { hasLocalMutations: true }
-    );
+    const doc1b = doc('collection/key', 1000, { v: 2 }).setHasLocalMutations();
     const doc1c = doc('collection/key', watchVersion, { v: 3 });
 
     return spec()
@@ -220,31 +199,28 @@ describeSpec('Writes:', [], () => {
     'Cache raises correct event if write is acked before watch delivers it',
     [],
     () => {
-      const query = Query.atPath(path('collection/key'));
+      const query1 = query('collection/key');
       const docV1 = doc('collection/key', 1000, { v: 1 });
-      const docV2Local = doc(
-        'collection/key',
-        1000,
-        { v: 2 },
-        { hasLocalMutations: true }
-      );
+      const docV2Local = doc('collection/key', 1000, {
+        v: 2
+      }).setHasLocalMutations();
       const docV2 = doc('collection/key', 2000, { v: 2 });
 
       return (
         spec()
-          .userListens(query)
-          .watchAcksFull(query, 1000, docV1)
-          .expectEvents(query, { added: [docV1] })
+          .userListens(query1)
+          .watchAcksFull(query1, 1000, docV1)
+          .expectEvents(query1, { added: [docV1] })
           .userSets('collection/key', { v: 2 })
-          .expectEvents(query, {
+          .expectEvents(query1, {
             hasPendingWrites: true,
             modified: [docV2Local]
           })
           // The ack arrives before the watch snapshot; no events yet
           .writeAcks('collection/key', 2000)
-          .watchSends({ affects: [query] }, docV2)
+          .watchSends({ affects: [query1] }, docV2)
           .watchSnapshots(2000)
-          .expectEvents(query, {
+          .expectEvents(query1, {
             metadata: [docV2]
           })
       );
@@ -252,37 +228,34 @@ describeSpec('Writes:', [], () => {
   );
 
   specTest('Cache will hold local write until watch catches up', [], () => {
-    const query = Query.atPath(path('collection'));
+    const query1 = query('collection');
     const docV1 = doc('collection/key', 1000, { v: 1 });
     const docV2 = doc('collection/key', 2000, { v: 2 });
-    const docV3Local = doc(
-      'collection/key',
-      1000,
-      { v: 3 },
-      { hasLocalMutations: true }
-    );
+    const docV3Local = doc('collection/key', 1000, {
+      v: 3
+    }).setHasLocalMutations();
     const docV3 = doc('collection/key', 3000, { v: 3 });
     const docB = doc('collection/b', 3000, { doc: 'b' });
     return (
       spec()
-        .userListens(query)
-        .watchAcksFull(query, 1000, docV1)
-        .expectEvents(query, { added: [docV1] })
+        .userListens(query1)
+        .watchAcksFull(query1, 1000, docV1)
+        .expectEvents(query1, { added: [docV1] })
         .userSets('collection/key', { v: 3 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           modified: [docV3Local]
         })
         // The ack arrives before the watch snapshot; no events yet
         .writeAcks('collection/key', 3000)
         // watch sends some stale data; no events
-        .watchSends({ affects: [query] }, docV2)
+        .watchSends({ affects: [query1] }, docV2)
         .watchSnapshots(2000)
         // watch catches up; should get both the new doc ('b') and the released
         // write ('key')
-        .watchSends({ affects: [query] }, docB, docV3)
+        .watchSends({ affects: [query1] }, docB, docV3)
         .watchSnapshots(3000)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           added: [docB],
           metadata: [docV3]
         })
@@ -290,36 +263,27 @@ describeSpec('Writes:', [], () => {
   });
 
   specTest('Local patch is applied to query until watch catches up', [], () => {
-    const query = Query.atPath(path('collection'));
+    const query1 = query('collection');
 
-    const docV1 = doc(
-      'collection/doc',
-      /* remoteVersion= */ 0,
-      { local: 1 },
-      { hasLocalMutations: true }
-    );
+    const docV1 = doc('collection/doc', /* remoteVersion= */ 0, {
+      local: 1
+    }).setHasLocalMutations();
     const docV2 = doc('collection/doc', /* remoteVersion= */ 2000, {
       local: 1,
       remote: 2
     });
-    const docV2Local = doc(
-      'collection/doc',
-      /* remoteVersion= */ 2000,
-      { local: 5, remote: 2 },
-      { hasLocalMutations: true }
-    );
-    const docV3 = doc(
-      'collection/doc',
-      3000,
-      { local: 1, remote: 3 },
-      { hasCommittedMutations: true }
-    );
-    const docV4 = doc(
-      'collection/doc',
-      4000,
-      { local: 1, remote: 4 },
-      { hasCommittedMutations: true }
-    );
+    const docV2Local = doc('collection/doc', /* remoteVersion= */ 2000, {
+      local: 5,
+      remote: 2
+    }).setHasLocalMutations();
+    const docV3 = doc('collection/doc', 3000, {
+      local: 1,
+      remote: 3
+    }).setHasCommittedMutations();
+    const docV4 = doc('collection/doc', 4000, {
+      local: 1,
+      remote: 4
+    }).setHasCommittedMutations();
     const docV5Acknowledged = doc('collection/doc', /* remoteVersion= */ 5000, {
       local: 5,
       remote: 5
@@ -327,67 +291,66 @@ describeSpec('Writes:', [], () => {
 
     return (
       spec()
-        .withGCEnabled(false)
+        .ensureManualLruGC()
         .userSets('collection/doc', { local: 1 })
-        .userListens(query)
-        .expectEvents(query, {
+        .userListens(query1)
+        .expectEvents(query1, {
           added: [docV1],
           fromCache: true,
           hasPendingWrites: true
         })
         .writeAcks('collection/doc', 1000)
-        .watchAcksFull(query, 2000, docV2)
-        .expectEvents(query, {
+        .watchAcksFull(query1, 2000, docV2)
+        .expectEvents(query1, {
           modified: [docV2]
         })
         .userPatches('collection/doc', { local: 5 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           modified: [docV2Local]
         })
         // The ack arrives before the watch snapshot; no events yet
         .writeAcks('collection/doc', 5000)
         // Watch sends some stale data; no events
-        .watchSends({ affects: [query] }, docV3)
+        .watchSends({ affects: [query1] }, docV3)
         .watchSnapshots(3000)
-        .watchSends({ affects: [query] }, docV4)
+        .watchSends({ affects: [query1] }, docV4)
         .watchSnapshots(4000)
         // Watch catches up
-        .watchSends({ affects: [query] }, docV5Acknowledged)
+        .watchSends({ affects: [query1] }, docV5Acknowledged)
         .watchSnapshots(5000)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           modified: [docV5Acknowledged]
         })
     );
   });
 
   specTest('Writes are pipelined', [], () => {
-    const query = Query.atPath(path('collection'));
-    const docs: Document[] = [];
-    const localDocs: Document[] = [];
+    const query1 = query('collection');
+    const docs: MutableDocument[] = [];
+    const localDocs: MutableDocument[] = [];
     const numWrites = 15;
     for (let i = 0; i < numWrites; i++) {
       const d = doc('collection/a' + i, (i + 1) * 1000, { v: 1 });
-      const dLocal = doc(
-        'collection/a' + i,
-        0,
-        { v: 1 },
-        { hasLocalMutations: true }
-      );
+      const dLocal = doc('collection/a' + i, 0, {
+        v: 1
+      }).setHasLocalMutations();
       docs.push(d);
       localDocs.push(dLocal);
     }
 
     const specification = spec()
-      .userListens(query)
-      .watchAcks(query)
-      .watchCurrents(query, 'resume-token');
+      .userListens(query1)
+      .watchAcks(query1)
+      .watchCurrents(query1, 'resume-token');
     for (let i = 0; i < numWrites; i++) {
-      specification.userSets('collection/a' + i, { v: 1 }).expectEvents(query, {
-        fromCache: true,
-        hasPendingWrites: true,
-        added: [localDocs[i]]
-      });
+      specification
+        .userSets('collection/a' + i, { v: 1 })
+        .expectEvents(query1, {
+          fromCache: true,
+          hasPendingWrites: true,
+          added: [localDocs[i]]
+        });
     }
 
     // We don't expect all the writes to be sent out immediately.  Some
@@ -398,9 +361,9 @@ describeSpec('Writes:', [], () => {
     for (let i = 0; i < numWrites; i++) {
       specification
         .writeAcks('collection/a' + i, (i + 1) * 1000)
-        .watchSends({ affects: [query] }, docs[i])
+        .watchSends({ affects: [query1] }, docs[i])
         .watchSnapshots((i + 1) * 1000)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: i < numWrites - 1,
           metadata: [docs[i]]
         });
@@ -409,24 +372,24 @@ describeSpec('Writes:', [], () => {
   });
 
   specTest('Pipelined writes can fail', [], () => {
-    const query = Query.atPath(path('collection'));
-    const docs: Document[] = [];
+    const query1 = query('collection');
+    const docs: MutableDocument[] = [];
     // Chose a number that is higher than the number of pipelined writes
     const numWrites = 15;
     for (let i = 0; i < numWrites; i++) {
-      docs.push(
-        doc('collection/a' + i, 0, { v: 1 }, { hasLocalMutations: true })
-      );
+      docs.push(doc('collection/a' + i, 0, { v: 1 }).setHasLocalMutations());
     }
 
     // Only listen, no watch events because all writes are local
-    const specification = spec().userListens(query);
+    const specification = spec().userListens(query1);
     for (let i = 0; i < numWrites; i++) {
-      specification.userSets('collection/a' + i, { v: 1 }).expectEvents(query, {
-        fromCache: true,
-        hasPendingWrites: true,
-        added: [docs[i]]
-      });
+      specification
+        .userSets('collection/a' + i, { v: 1 })
+        .expectEvents(query1, {
+          fromCache: true,
+          hasPendingWrites: true,
+          added: [docs[i]]
+        });
     }
 
     // We don't expect all the writes to be sent out immediately.  Some
@@ -440,7 +403,7 @@ describeSpec('Writes:', [], () => {
           'collection/a' + i,
           new RpcError(Code.PERMISSION_DENIED, 'permission denied')
         )
-        .expectEvents(query, {
+        .expectEvents(query1, {
           fromCache: true,
           hasPendingWrites: i < numWrites - 1,
           removed: [docs[i]]
@@ -454,34 +417,26 @@ describeSpec('Writes:', [], () => {
   });
 
   specTest('Failed writes are released immediately.', [], () => {
-    const query = Query.atPath(path('collection'));
+    const query1 = query('collection');
     const docAv1 = doc('collection/a', 1000, { v: 1 });
-    const docAv2Local = doc(
-      'collection/a',
-      1000,
-      { v: 2 },
-      { hasLocalMutations: true }
-    );
+    const docAv2Local = doc('collection/a', 1000, {
+      v: 2
+    }).setHasLocalMutations();
 
-    const docBLocal = doc(
-      'collection/b',
-      0,
-      { v: 1 },
-      { hasLocalMutations: true }
-    );
+    const docBLocal = doc('collection/b', 0, { v: 1 }).setHasLocalMutations();
     const docB = doc('collection/b', 2000, { v: 1 });
 
     return (
       spec()
-        .userListens(query)
-        .watchAcksFull(query, 1000, docAv1)
-        .expectEvents(query, { added: [docAv1] })
+        .userListens(query1)
+        .watchAcksFull(query1, 1000, docAv1)
+        .expectEvents(query1, { added: [docAv1] })
         .userSets('collection/b', { v: 1 })
-        .expectEvents(query, { hasPendingWrites: true, added: [docBLocal] })
+        .expectEvents(query1, { hasPendingWrites: true, added: [docBLocal] })
         // ack write but no watch snapshot so it'll be held.
         .writeAcks('collection/b', 2000)
         .userSets('collection/a', { v: 2 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           modified: [docAv2Local]
         })
@@ -490,39 +445,29 @@ describeSpec('Writes:', [], () => {
           'collection/a',
           new RpcError(Code.PERMISSION_DENIED, 'failure')
         )
-        .expectEvents(query, { hasPendingWrites: true, modified: [docAv1] })
+        .expectEvents(query1, { hasPendingWrites: true, modified: [docAv1] })
         // watch updates, B should be visible
-        .watchSends({ affects: [query] }, docB)
+        .watchSends({ affects: [query1] }, docB)
         .watchSnapshots(2000)
-        .expectEvents(query, { metadata: [docB] })
+        .expectEvents(query1, { metadata: [docB] })
     );
   });
 
   specTest('Writes are not re-sent.', [], () => {
-    const query = Query.atPath(path('collection'));
-    const docALocal = doc(
-      'collection/a',
-      0,
-      { v: 1 },
-      { hasLocalMutations: true }
-    );
+    const query1 = query('collection');
+    const docALocal = doc('collection/a', 0, { v: 1 }).setHasLocalMutations();
     const docA = doc('collection/a', 1000, { v: 1 });
 
-    const docBLocal = doc(
-      'collection/b',
-      0,
-      { v: 1 },
-      { hasLocalMutations: true }
-    );
+    const docBLocal = doc('collection/b', 0, { v: 1 }).setHasLocalMutations();
     const docB = doc('collection/b', 2000, { v: 1 });
 
     return (
       spec()
-        .userListens(query)
-        .watchAcksFull(query, 500)
-        .expectEvents(query, {})
+        .userListens(query1)
+        .watchAcksFull(query1, 500)
+        .expectEvents(query1, {})
         .userSets('collection/a', { v: 1 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           added: [docALocal]
         })
@@ -530,38 +475,33 @@ describeSpec('Writes:', [], () => {
         .writeAcks('collection/a', 1000)
         // Do another write.
         .userSets('collection/b', { v: 1 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           added: [docBLocal]
         })
         // ack second write
         .writeAcks('collection/b', 2000)
         // Finally watcher catches up.
-        .watchSends({ affects: [query] }, docA, docB)
+        .watchSends({ affects: [query1] }, docA, docB)
         .watchSnapshots(2000)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           metadata: [docA, docB]
         })
     );
   });
 
   specTest('Writes are not re-sent after disable/enable network.', [], () => {
-    const query = Query.atPath(path('collection'));
-    const docALocal = doc(
-      'collection/a',
-      0,
-      { v: 1 },
-      { hasLocalMutations: true }
-    );
+    const query1 = query('collection');
+    const docALocal = doc('collection/a', 0, { v: 1 }).setHasLocalMutations();
     const docA = doc('collection/a', 1000, { v: 1 });
 
     return (
       spec()
-        .userListens(query)
-        .watchAcksFull(query, 500)
-        .expectEvents(query, {})
+        .userListens(query1)
+        .watchAcksFull(query1, 500)
+        .expectEvents(query1, {})
         .userSets('collection/a', { v: 1 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           added: [docALocal]
         })
@@ -572,7 +512,7 @@ describeSpec('Writes:', [], () => {
         .expectWriteStreamRequestCount(2)
 
         .disableNetwork()
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           fromCache: true
         })
@@ -581,14 +521,14 @@ describeSpec('Writes:', [], () => {
         .expectWriteStreamRequestCount(3)
 
         .enableNetwork()
-        .expectActiveTargets({ query, resumeToken: 'resume-token-500' })
+        .expectActiveTargets({ query: query1, resumeToken: 'resume-token-500' })
 
         // acked write should /not/ have been resent, so count should still be 3
         .expectWriteStreamRequestCount(3)
 
         // Finally watch catches up.
-        .watchAcksFull(query, 2000, docA)
-        .expectEvents(query, {
+        .watchAcksFull(query1, 2000, docA)
+        .expectEvents(query1, {
           metadata: [docA]
         })
     );
@@ -600,30 +540,25 @@ describeSpec('Writes:', [], () => {
     'This test verifies that committed mutations are eligible for ' +
       'garbage collection on target removal',
     () => {
-      const query = Query.atPath(path('collection'));
-      const docALocal = doc(
-        'collection/a',
-        0,
-        { v: 1 },
-        { hasLocalMutations: true }
-      );
+      const query1 = query('collection');
+      const docALocal = doc('collection/a', 0, { v: 1 }).setHasLocalMutations();
 
       return (
         spec()
-          .userListens(query)
-          .watchAcksFull(query, 500)
-          .expectEvents(query, {})
+          .userListens(query1)
+          .watchAcksFull(query1, 500)
+          .expectEvents(query1, {})
           .userSets('collection/a', { v: 1 })
-          .expectEvents(query, {
+          .expectEvents(query1, {
             hasPendingWrites: true,
             added: [docALocal]
           })
           // ack write but without a watch event.
           .writeAcks('collection/a', 1000)
           // Unlisten before the write is released.
-          .userUnlistens(query)
+          .userUnlistens(query1)
           // Re-add listen and make sure we don't get any events.
-          .userListens(query)
+          .userListens(query1)
       );
     }
   );
@@ -639,14 +574,11 @@ describeSpec('Writes:', [], () => {
     Code.DATA_LOSS
   ]) {
     specTest('Writes that fail with code ' + code + ' are rejected', [], () => {
-      const query1 = Query.atPath(path('collection/key'));
+      const query1 = query('collection/key');
 
-      const doc1a = doc(
-        'collection/key',
-        0,
-        { foo: 'bar' },
-        { hasLocalMutations: true }
-      );
+      const doc1a = doc('collection/key', 0, {
+        foo: 'bar'
+      }).setHasLocalMutations();
       return spec()
         .userListens(query1)
         .userSets('collection/key', { foo: 'bar' })
@@ -670,13 +602,10 @@ describeSpec('Writes:', [], () => {
     'Writes that fail with code resource_exhausted are not rejected',
     [],
     () => {
-      const query1 = Query.atPath(path('collection/key'));
-      const doc1a = doc(
-        'collection/key',
-        0,
-        { foo: 'bar' },
-        { hasLocalMutations: true }
-      );
+      const query1 = query('collection/key');
+      const doc1a = doc('collection/key', 0, {
+        foo: 'bar'
+      }).setHasLocalMutations();
 
       return spec()
         .userListens(query1)
@@ -706,13 +635,10 @@ describeSpec('Writes:', [], () => {
     Code.UNAUTHENTICATED
   ]) {
     specTest('Writes that fail with code ' + code + ' are retried', [], () => {
-      const query1 = Query.atPath(path('collection/key'));
-      const doc1a = doc(
-        'collection/key',
-        0,
-        { foo: 'bar' },
-        { hasLocalMutations: true }
-      );
+      const query1 = query('collection/key');
+      const doc1a = doc('collection/key', 0, {
+        foo: 'bar'
+      }).setHasLocalMutations();
       const doc1b = doc('collection/key', 1000, { foo: 'bar' });
 
       return spec()
@@ -742,31 +668,29 @@ describeSpec('Writes:', [], () => {
       ' getting watcher events.',
     [],
     () => {
-      const query = Query.atPath(path('collection/doc'));
+      const query1 = query('collection/doc');
       const docV1 = doc('collection/doc', 1000, { v: 1, a: { b: 2 } });
-      const docV2Local = doc(
-        'collection/doc',
-        1000,
-        { v: 2, a: { b: 2 } },
-        { hasLocalMutations: true }
-      );
+      const docV2Local = doc('collection/doc', 1000, {
+        v: 2,
+        a: { b: 2 }
+      }).setHasLocalMutations();
       const docV2 = doc('collection/doc', 2000, { v: 2, a: { b: 2 } });
 
       return (
         spec()
-          .userListens(query)
-          .watchAcksFull(query, 500, docV1)
-          .expectEvents(query, { added: [docV1] })
+          .userListens(query1)
+          .watchAcksFull(query1, 500, docV1)
+          .expectEvents(query1, { added: [docV1] })
           // <DELETE> is the sentinel for FieldValue.delete().
           .userPatches('collection/doc', { v: 2, 'a.c': '<DELETE>' })
-          .expectEvents(query, {
+          .expectEvents(query1, {
             hasPendingWrites: true,
             modified: [docV2Local]
           })
-          .watchSends({ affects: [query] }, docV2)
+          .watchSends({ affects: [query1] }, docV2)
           .watchSnapshots(2000)
           .writeAcks('collection/doc', 2000)
-          .expectEvents(query, { metadata: [docV2] })
+          .expectEvents(query1, { metadata: [docV2] })
       );
     }
   );
@@ -840,59 +764,44 @@ describeSpec('Writes:', [], () => {
     'Pending writes are shared between clients',
     ['multi-client'],
     () => {
-      const query = Query.atPath(path('collection'));
-      const docV1 = doc(
-        'collection/a',
-        0,
-        { v: 1 },
-        { hasLocalMutations: true }
-      );
-      const docV2 = doc(
-        'collection/a',
-        0,
-        { v: 2 },
-        { hasLocalMutations: true }
-      );
-      const docV3 = doc(
-        'collection/a',
-        0,
-        { v: 3 },
-        { hasLocalMutations: true }
-      );
+      const query1 = query('collection');
+      const docV1 = doc('collection/a', 0, { v: 1 }).setHasLocalMutations();
+      const docV2 = doc('collection/a', 0, { v: 2 }).setHasLocalMutations();
+      const docV3 = doc('collection/a', 0, { v: 3 }).setHasLocalMutations();
 
       return client(0)
-        .userListens(query)
-        .watchAcksFull(query, 500)
-        .expectEvents(query, {})
+        .userListens(query1)
+        .watchAcksFull(query1, 500)
+        .expectEvents(query1, {})
         .userSets('collection/a', { v: 1 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           added: [docV1]
         })
         .client(1)
-        .userListens(query)
-        .expectEvents(query, {
+        .userListens(query1)
+        .expectEvents(query1, {
           hasPendingWrites: true,
           added: [docV1]
         })
         .client(0)
         .userSets('collection/a', { v: 2 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           modified: [docV2]
         })
         .client(1)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           modified: [docV2]
         })
         .userSets('collection/a', { v: 3 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           modified: [docV3]
         })
         .client(0)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           modified: [docV3]
         });
@@ -903,43 +812,38 @@ describeSpec('Writes:', [], () => {
     'Pending write is acknowledged by primary client',
     ['multi-client'],
     () => {
-      const query = Query.atPath(path('collection'));
-      const localDoc = doc(
-        'collection/a',
-        0,
-        { v: 1 },
-        { hasLocalMutations: true }
-      );
+      const query1 = query('collection');
+      const localDoc = doc('collection/a', 0, { v: 1 }).setHasLocalMutations();
       const remoteDoc = doc('collection/a', 1000, { v: 1 });
       return client(0)
         .becomeVisible()
-        .userListens(query)
-        .watchAcksFull(query, 500)
-        .expectEvents(query, {})
+        .userListens(query1)
+        .watchAcksFull(query1, 500)
+        .expectEvents(query1, {})
         .client(1)
-        .userListens(query)
-        .expectEvents(query, {})
+        .userListens(query1)
+        .expectEvents(query1, {})
         .userSets('collection/a', { v: 1 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           added: [localDoc]
         })
         .client(0)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           added: [localDoc]
         })
         .writeAcks('collection/a', 1000, { expectUserCallback: false })
-        .watchSends({ affects: [query] }, remoteDoc)
+        .watchSends({ affects: [query1] }, remoteDoc)
         .watchSnapshots(1000)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           metadata: [remoteDoc]
         })
         .client(1)
         .expectUserCallbacks({
           acknowledged: ['collection/a']
         })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           metadata: [remoteDoc]
         });
     }
@@ -949,28 +853,23 @@ describeSpec('Writes:', [], () => {
     'Pending write is rejected by primary client',
     ['multi-client'],
     () => {
-      const query = Query.atPath(path('collection'));
-      const localDoc = doc(
-        'collection/a',
-        0,
-        { v: 1 },
-        { hasLocalMutations: true }
-      );
+      const query1 = query('collection');
+      const localDoc = doc('collection/a', 0, { v: 1 }).setHasLocalMutations();
 
       return client(0)
-        .userListens(query)
-        .watchAcksFull(query, 500)
-        .expectEvents(query, {})
+        .userListens(query1)
+        .watchAcksFull(query1, 500)
+        .expectEvents(query1, {})
         .client(1)
-        .userListens(query)
-        .expectEvents(query, {})
+        .userListens(query1)
+        .expectEvents(query1, {})
         .userSets('collection/a', { v: 1 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           added: [localDoc]
         })
         .client(0)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           added: [localDoc]
         })
@@ -981,38 +880,33 @@ describeSpec('Writes:', [], () => {
             expectUserCallback: false
           }
         )
-        .expectEvents(query, {
+        .expectEvents(query1, {
           removed: [localDoc]
         })
         .client(1)
         .expectUserCallbacks({
           rejected: ['collection/a']
         })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           removed: [localDoc]
         });
     }
   );
 
   specTest('Writes are released by primary client', ['multi-client'], () => {
-    const query = Query.atPath(path('collection'));
-    const docALocal = doc(
-      'collection/a',
-      0,
-      { v: 1 },
-      { hasLocalMutations: true }
-    );
+    const query1 = query('collection');
+    const docALocal = doc('collection/a', 0, { v: 1 }).setHasLocalMutations();
     const docA = doc('collection/a', 1000, { v: 1 });
 
     return (
       client(0)
-        .userListens(query)
-        .watchAcksFull(query, 500)
-        .expectEvents(query, {})
+        .userListens(query1)
+        .watchAcksFull(query1, 500)
+        .expectEvents(query1, {})
         .client(1)
         .userSets('collection/a', { v: 1 })
         .client(0)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           hasPendingWrites: true,
           added: [docALocal]
         })
@@ -1024,29 +918,21 @@ describeSpec('Writes:', [], () => {
         })
         .client(0)
         // Watcher catches up.
-        .watchSends({ affects: [query] }, docA)
+        .watchSends({ affects: [query1] }, docA)
         .watchSnapshots(2000)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           metadata: [docA]
         })
     );
   });
 
   specTest('Writes are held during primary failover', ['multi-client'], () => {
-    const query1 = Query.atPath(path('collection'));
-    const query2 = Query.atPath(path('collection/doc'));
-    const docV1 = doc(
-      'collection/doc',
-      0,
-      { v: 1 },
-      { hasLocalMutations: true }
-    );
-    const docV1Committed = doc(
-      'collection/doc',
-      2000,
-      { v: 1 },
-      { hasCommittedMutations: true }
-    );
+    const query1 = query('collection');
+    const query2 = query('collection/doc');
+    const docV1 = doc('collection/doc', 0, { v: 1 }).setHasLocalMutations();
+    const docV1Committed = doc('collection/doc', 2000, {
+      v: 1
+    }).setHasCommittedMutations();
     const docV1Acknowledged = doc('collection/doc', 2000, { v: 1 });
     return (
       client(0)
@@ -1065,7 +951,7 @@ describeSpec('Writes:', [], () => {
         // Start a new client. DocV1 still has pending writes.
         .client(1)
         .stealPrimaryLease()
-        .expectListen(query1, 'resume-token-1000')
+        .expectListen(query1, { resumeToken: 'resume-token-1000' })
         .userListens(query2)
         .expectEvents(query2, {
           added: [docV1Committed],
@@ -1201,83 +1087,68 @@ describeSpec('Writes:', [], () => {
   );
 
   specTest('Secondary tabs handle user change', ['multi-client'], () => {
-    const query = Query.atPath(path('collection'));
-    const docALocal = doc(
-      'collection/a',
-      0,
-      { v: 1 },
-      { hasLocalMutations: true }
-    );
-    const docBLocal = doc(
-      'collection/b',
-      0,
-      { v: 1 },
-      { hasLocalMutations: true }
-    );
-    const docCLocal = doc(
-      'collection/c',
-      0,
-      { v: 1 },
-      { hasLocalMutations: true }
-    );
+    const query1 = query('collection');
+    const docALocal = doc('collection/a', 0, { v: 1 }).setHasLocalMutations();
+    const docBLocal = doc('collection/b', 0, { v: 1 }).setHasLocalMutations();
+    const docCLocal = doc('collection/c', 0, { v: 1 }).setHasLocalMutations();
 
     // Firebase Auth attempts to rapidly synchronize user changes across tabs.
     // We emulate this behavior in this spec tests by calling `changeUser`
     // manually for all clients.
     return (
       client(0)
-        .userListens(query)
+        .userListens(query1)
         .changeUser('user1')
         // User 1 writes `docA`
         .userSets('collection/a', { v: 1 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           added: [docALocal],
           fromCache: true,
           hasPendingWrites: true
         })
         .client(1)
         .changeUser('user1')
-        .userListens(query)
-        .expectEvents(query, {
+        .userListens(query1)
+        .expectEvents(query1, {
           added: [docALocal],
           fromCache: true,
           hasPendingWrites: true
         })
         // User 1 sets `docB` from a different tab
         .userSets('collection/b', { v: 1 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           added: [docBLocal],
           fromCache: true,
           hasPendingWrites: true
         })
         .client(0)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           added: [docBLocal],
           fromCache: true,
           hasPendingWrites: true
         })
         .changeUser('user2')
-        .expectEvents(query, {
+        .expectEvents(query1, {
           removed: [docALocal, docBLocal],
           fromCache: true
         })
         // User 2 adds `docC`
         .userSets('collection/c', { v: 1 })
-        .expectEvents(query, {
+        .expectEvents(query1, {
           added: [docCLocal],
           fromCache: true,
           hasPendingWrites: true
         })
         .client(1)
         .changeUser('user2')
-        .expectEvents(query, {
+        .expectEvents(query1, {
           removed: [docALocal, docBLocal],
           added: [docCLocal],
           fromCache: true,
           hasPendingWrites: true
         })
         .changeUser('user1')
-        .expectEvents(query, {
+        .expectEvents(query1, {
           added: [docALocal, docBLocal],
           removed: [docCLocal],
           fromCache: true,
@@ -1285,7 +1156,7 @@ describeSpec('Writes:', [], () => {
         })
         .client(0)
         .changeUser('user1')
-        .expectEvents(query, {
+        .expectEvents(query1, {
           added: [docALocal, docBLocal],
           removed: [docCLocal],
           fromCache: true,
@@ -1295,19 +1166,9 @@ describeSpec('Writes:', [], () => {
   });
 
   specTest('Mutations are scoped by user', ['multi-client'], () => {
-    const query = Query.atPath(path('collection'));
-    const docALocal = doc(
-      'collection/a',
-      0,
-      { v: 1 },
-      { hasLocalMutations: true }
-    );
-    const docBLocal = doc(
-      'collection/b',
-      0,
-      { v: 1 },
-      { hasLocalMutations: true }
-    );
+    const query1 = query('collection');
+    const docALocal = doc('collection/a', 0, { v: 1 }).setHasLocalMutations();
+    const docBLocal = doc('collection/b', 0, { v: 1 }).setHasLocalMutations();
 
     return client(0)
       .changeUser('user1')
@@ -1316,15 +1177,15 @@ describeSpec('Writes:', [], () => {
       .changeUser('user2')
       .userSets('collection/b', { v: 1 })
       .client(0)
-      .userListens(query)
-      .expectEvents(query, {
+      .userListens(query1)
+      .expectEvents(query1, {
         added: [docALocal],
         fromCache: true,
         hasPendingWrites: true
       })
       .client(1)
-      .userListens(query)
-      .expectEvents(query, {
+      .userListens(query1)
+      .expectEvents(query1, {
         added: [docBLocal],
         fromCache: true,
         hasPendingWrites: true
@@ -1332,31 +1193,26 @@ describeSpec('Writes:', [], () => {
   });
 
   specTest('Mutation recovers after primary takeover', ['multi-client'], () => {
-    const query = Query.atPath(path('collection'));
-    const docALocal = doc(
-      'collection/a',
-      0,
-      { k: 'a' },
-      { hasLocalMutations: true }
-    );
+    const query1 = query('collection');
+    const docALocal = doc('collection/a', 0, { k: 'a' }).setHasLocalMutations();
     const docA = doc('collection/a', 1000, { k: 'a' });
     return client(0)
       .expectPrimaryState(true)
       .userSets('collection/a', { k: 'a' })
       .client(1)
-      .userListens(query)
-      .expectEvents(query, {
+      .userListens(query1)
+      .expectEvents(query1, {
         added: [docALocal],
         hasPendingWrites: true,
         fromCache: true
       })
       .client(0)
-      .expectListen(query)
+      .expectListen(query1)
       .client(1)
       .stealPrimaryLease()
       .writeAcks('collection/a', 1000, { expectUserCallback: false })
-      .watchAcksFull(query, 1000, docA)
-      .expectEvents(query, { metadata: [docA] })
+      .watchAcksFull(query1, 1000, docA)
+      .expectEvents(query1, { metadata: [docA] })
       .client(0)
       .expectUserCallbacks({
         acknowledged: ['collection/a']
@@ -1455,19 +1311,13 @@ describeSpec('Writes:', [], () => {
     'Mutation are not sent twice after primary failover',
     ['multi-client'],
     () => {
-      const query = Query.atPath(path('collection'));
-      const docA = doc(
-        'collection/a',
-        1000,
-        { k: 'a' },
-        { hasCommittedMutations: true }
-      );
-      const docB = doc(
-        'collection/b',
-        2000,
-        { k: 'b' },
-        { hasCommittedMutations: true }
-      );
+      const query1 = query('collection');
+      const docA = doc('collection/a', 1000, {
+        k: 'a'
+      }).setHasCommittedMutations();
+      const docB = doc('collection/b', 2000, {
+        k: 'b'
+      }).setHasCommittedMutations();
 
       return client(0)
         .expectPrimaryState(true)
@@ -1483,8 +1333,121 @@ describeSpec('Writes:', [], () => {
         .stealPrimaryLease()
         .expectPrimaryState(true)
         .writeAcks('collection/b', 2000)
-        .userListens(query)
-        .expectEvents(query, { added: [docA, docB], fromCache: true });
+        .userListens(query1)
+        .expectEvents(query1, { added: [docA, docB], fromCache: true });
+    }
+  );
+
+  specTest(
+    'Wait for pending writes resolves after write acknowledgment',
+    [],
+    () => {
+      return spec()
+        .userSets('collection/a', { k: 'a' })
+        .userSets('collection/b', { k: 'b' })
+        .waitForPendingWrites()
+        .writeAcks('collection/a', 1001)
+        .failWrite(
+          'collection/b',
+          new RpcError(Code.FAILED_PRECONDITION, 'Write error')
+        )
+        .expectWaitForPendingWritesEvent();
+    }
+  );
+
+  specTest('Wait for pending writes resolves with no writes', [], () => {
+    return spec().waitForPendingWrites().expectWaitForPendingWritesEvent();
+  });
+
+  specTest('Wait for pending writes resolves multiple times', [], () => {
+    return spec()
+      .userSets('collection/a', { k: 'a' })
+      .waitForPendingWrites()
+      .waitForPendingWrites()
+      .writeAcks('collection/a', 1001)
+      .expectWaitForPendingWritesEvent(2);
+  });
+
+  specTest(
+    'Wait for pending writes resolves if another write is issued',
+    [],
+    () => {
+      return spec()
+        .userSets('collection/a', { k: 'a' })
+        .waitForPendingWrites()
+        .userSets('collection/b', { k: 'b' })
+        .writeAcks('collection/a', 1001)
+        .expectWaitForPendingWritesEvent()
+        .writeAcks('collection/b', 1002);
+    }
+  );
+
+  specTest(
+    'Wait for pending writes waits after restart',
+    ['durable-persistence'],
+    () => {
+      return spec()
+        .userSets('collection/a', { k: 'a' })
+        .restart()
+        .waitForPendingWrites()
+        .writeAcks('collection/a', 1001, { expectUserCallback: false })
+        .expectWaitForPendingWritesEvent();
+    }
+  );
+
+  specTest(
+    'Wait for pending writes resolves for write in secondary tab',
+    ['multi-client'],
+    () => {
+      return client(0)
+        .expectPrimaryState(true)
+        .client(1)
+        .userSets('collection/a', { k: 'a' })
+        .waitForPendingWrites()
+        .client(0)
+        .writeAcks('collection/a', 1001, { expectUserCallback: false })
+        .client(1)
+        .expectUserCallbacks({ acknowledged: ['collection/a'] })
+        .expectWaitForPendingWritesEvent();
+    }
+  );
+
+  specTest(
+    'Wait for pending writes resolves independently for different tabs',
+    ['multi-client'],
+    () => {
+      return client(0)
+        .userSets('collection/a', { k: 'a' })
+        .waitForPendingWrites()
+        .client(1)
+        .userSets('collection/b', { k: 'b' })
+        .waitForPendingWrites()
+        .client(2)
+        .userSets('collection/c', { k: 'c' })
+        .waitForPendingWrites()
+        .client(0)
+        .writeAcks('collection/a', 1001)
+        .expectWaitForPendingWritesEvent(/* count= */ 1)
+        .client(1)
+        .expectWaitForPendingWritesEvent(/* count= */ 0)
+        .client(2)
+        .expectWaitForPendingWritesEvent(/* count= */ 0)
+        .client(0)
+        .writeAcks('collection/b', 1002, { expectUserCallback: false })
+        .expectWaitForPendingWritesEvent(/* count= */ 0)
+        .client(1)
+        .expectUserCallbacks({ acknowledged: ['collection/b'] })
+        .expectWaitForPendingWritesEvent(/* count= */ 1)
+        .client(2)
+        .expectWaitForPendingWritesEvent(/* count= */ 0)
+        .client(0)
+        .writeAcks('collection/c', 1003, { expectUserCallback: false })
+        .expectWaitForPendingWritesEvent(/* count= */ 0)
+        .client(1)
+        .expectWaitForPendingWritesEvent(/* count= */ 0)
+        .client(2)
+        .expectUserCallbacks({ acknowledged: ['collection/c'] })
+        .expectWaitForPendingWritesEvent(/* count= */ 1);
     }
   );
 });

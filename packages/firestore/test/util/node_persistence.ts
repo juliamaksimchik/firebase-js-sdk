@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2018 Google Inc.
+ * Copyright 2018 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,10 @@
  */
 
 import * as fs from 'fs';
-// @ts-ignore: There are no types for indexeddbshim.
-import * as registerIndexedDBShim from 'indexeddbshim';
 import * as os from 'os';
+
+// @ts-ignore: There are no types for indexeddbshim.
+import registerIndexedDBShim from 'indexeddbshim';
 
 import { FakeWindow, SharedFakeWebStorage } from './test_platform';
 
@@ -30,7 +31,7 @@ import { FakeWindow, SharedFakeWebStorage } from './test_platform';
 // To use this code to run persistence-based tests in Node, include this module
 // and set the environment variable `USE_MOCK_PERSISTENCE` to `YES`.
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any,
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 const globalAny = global as any;
 
 const dbDir = fs.mkdtempSync(os.tmpdir() + '/firestore_tests');
@@ -42,6 +43,8 @@ if (process.env.USE_MOCK_PERSISTENCE === 'YES') {
     deleteDatabaseFiles: true
   });
 
+  // 'indexeddbshim' installs IndexedDB onto `globalAny`, which means we don't
+  // have to register it ourselves.
   const fakeWindow = new FakeWindow(
     new SharedFakeWebStorage(),
     globalAny.indexedDB

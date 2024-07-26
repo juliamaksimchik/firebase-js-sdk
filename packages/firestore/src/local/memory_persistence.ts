@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,57 +16,48 @@
  */
 
 import { User } from '../auth/user';
-import { Document, MaybeDocument } from '../model/document';
+import { ListenSequence } from '../core/listen_sequence';
+import { SnapshotVersion } from '../core/snapshot_version';
+import { ListenSequenceNumber, TargetId } from '../core/types';
+import { Document } from '../model/document';
 import { DocumentKey } from '../model/document_key';
-import { assert, fail } from '../util/assert';
-import { Code, FirestoreError } from '../util/error';
-import { debug } from '../util/log';
-import * as obj from '../util/obj';
+import { estimateByteSize } from '../model/values';
+import { JsonProtoSerializer } from '../remote/serializer';
+import { fail } from '../util/assert';
+import { logDebug } from '../util/log';
 import { ObjectMap } from '../util/obj_map';
-import { encode } from './encoded_resource_path';
+
+import { DocumentOverlayCache } from './document_overlay_cache';
+import { encodeResourcePath } from './encoded_resource_path';
+import { IndexManager } from './index_manager';
+import { LocalSerializer } from './local_serializer';
 import {
   ActiveTargets,
   LruDelegate,
   LruGarbageCollector,
   LruParams
 } from './lru_garbage_collector';
-
-import { DatabaseInfo } from '../core/database_info';
-import { PersistenceSettings } from '../core/firestore_client';
-import { ListenSequence } from '../core/listen_sequence';
-import { ListenSequenceNumber } from '../core/types';
-import { AsyncQueue } from '../util/async_queue';
+import { newLruGarbageCollector } from './lru_garbage_collector_impl';
+import { MemoryBundleCache } from './memory_bundle_cache';
+import { MemoryDocumentOverlayCache } from './memory_document_overlay_cache';
 import { MemoryIndexManager } from './memory_index_manager';
 import { MemoryMutationQueue } from './memory_mutation_queue';
-import { MemoryRemoteDocumentCache } from './memory_remote_document_cache';
+import {
+  MemoryRemoteDocumentCache,
+  newMemoryRemoteDocumentCache
+} from './memory_remote_document_cache';
 import { MemoryTargetCache } from './memory_target_cache';
 import { MutationQueue } from './mutation_queue';
-import {
-  GarbageCollectionScheduler,
-  Persistence,
-  PersistenceProvider,
-  PersistenceTransaction,
-  PersistenceTransactionMode,
-  PrimaryStateListener,
-  ReferenceDelegate
-} from './persistence';
+import { Persistence, ReferenceDelegate } from './persistence';
 import { PersistencePromise } from './persistence_promise';
-import { Platform } from '../platform/platform';
-import { ReferenceSet } from './reference_set';
 import {
-  ClientId,
-  MemorySharedClientState,
-  SharedClientState
-} from './shared_client_state';
+  PersistenceTransaction,
+  PersistenceTransactionMode
+} from './persistence_transaction';
+import { ReferenceSet } from './reference_set';
 import { TargetData } from './target_data';
 
 const LOG_TAG = 'MemoryPersistence';
-
-const MEMORY_ONLY_PERSISTENCE_ERROR_MESSAGE =
-  'You are using the memory-only build of Firestore. Persistence support is ' +
-  'only available via the @firebase/firestore bundle or the ' +
-  'firebase-firestore.js build.';
-
 /**
  * A memory-backed instance of Persistence. Data is stored only in RAM and
  * not persisted across sessions.
@@ -81,14 +72,17 @@ export class MemoryPersistence implements Persistence {
    */
   private readonly indexManager: MemoryIndexManager;
   private mutationQueues: { [user: string]: MemoryMutationQueue } = {};
+  private overlays: { [user: string]: MemoryDocumentOverlayCache } = {};
   private readonly remoteDocumentCache: MemoryRemoteDocumentCache;
   private readonly targetCache: MemoryTargetCache;
+  private readonly bundleCache: MemoryBundleCache;
   private readonly listenSequence = new ListenSequence(0);
+  private serializer: LocalSerializer;
 
   private _started = false;
 
   readonly referenceDelegate: MemoryReferenceDelegate;
-  
+
   /**
    * The constructor accepts a factory for creating a reference delegate. This
    * allows both the delegate and this instance to have strong references to
@@ -96,19 +90,22 @@ export class MemoryPersistence implements Persistence {
    * checked or asserted on every access.
    */
   constructor(
-    private readonly clientId: ClientId,
-    referenceDelegateFactory: (p: MemoryPersistence) => MemoryReferenceDelegate
+    referenceDelegateFactory: (p: MemoryPersistence) => MemoryReferenceDelegate,
+    serializer: JsonProtoSerializer
   ) {
     this._started = true;
     this.referenceDelegate = referenceDelegateFactory(this);
     this.targetCache = new MemoryTargetCache(this);
-    const sizer = (doc: MaybeDocument): number =>
+    const sizer = (doc: Document): number =>
       this.referenceDelegate.documentSize(doc);
     this.indexManager = new MemoryIndexManager();
-    this.remoteDocumentCache = new MemoryRemoteDocumentCache(
-      this.indexManager,
-      sizer
-    );
+    this.remoteDocumentCache = newMemoryRemoteDocumentCache(sizer);
+    this.serializer = new LocalSerializer(serializer);
+    this.bundleCache = new MemoryBundleCache(this.serializer);
+  }
+
+  start(): Promise<void> {
+    return Promise.resolve();
   }
 
   shutdown(): Promise<void> {
@@ -121,36 +118,33 @@ export class MemoryPersistence implements Persistence {
     return this._started;
   }
 
-  async getActiveClients(): Promise<ClientId[]> {
-    return [this.clientId];
-  }
-
-  setPrimaryStateListener(
-    primaryStateListener: PrimaryStateListener
-  ): Promise<void> {
-    // All clients using memory persistence act as primary.
-    return primaryStateListener(true);
-  }
-
   setDatabaseDeletedListener(): void {
     // No op.
   }
 
-  setNetworkEnabled(networkEnabled: boolean): void {
+  setNetworkEnabled(): void {
     // No op.
   }
 
-  getIndexManager(): MemoryIndexManager {
+  getIndexManager(user: User): MemoryIndexManager {
+    // We do not currently support indices for memory persistence, so we can
+    // return the same shared instance of the memory index manager.
     return this.indexManager;
   }
 
-  getMutationQueue(user: User): MutationQueue {
+  getDocumentOverlayCache(user: User): DocumentOverlayCache {
+    let overlay = this.overlays[user.toKey()];
+    if (!overlay) {
+      overlay = new MemoryDocumentOverlayCache();
+      this.overlays[user.toKey()] = overlay;
+    }
+    return overlay;
+  }
+
+  getMutationQueue(user: User, indexManager: IndexManager): MutationQueue {
     let queue = this.mutationQueues[user.toKey()];
     if (!queue) {
-      queue = new MemoryMutationQueue(
-        this.indexManager,
-        this.referenceDelegate
-      );
+      queue = new MemoryMutationQueue(indexManager, this.referenceDelegate);
       this.mutationQueues[user.toKey()] = queue;
     }
     return queue;
@@ -164,6 +158,10 @@ export class MemoryPersistence implements Persistence {
     return this.remoteDocumentCache;
   }
 
+  getBundleCache(): MemoryBundleCache {
+    return this.bundleCache;
+  }
+
   runTransaction<T>(
     action: string,
     mode: PersistenceTransactionMode,
@@ -171,7 +169,7 @@ export class MemoryPersistence implements Persistence {
       transaction: PersistenceTransaction
     ) => PersistencePromise<T>
   ): Promise<T> {
-    debug(LOG_TAG, 'Starting transaction:', action);
+    logDebug(LOG_TAG, 'Starting transaction:', action);
     const txn = new MemoryTransaction(this.listenSequence.next());
     this.referenceDelegate.onTransactionStarted();
     return transactionOperation(txn)
@@ -192,9 +190,9 @@ export class MemoryPersistence implements Persistence {
     key: DocumentKey
   ): PersistencePromise<boolean> {
     return PersistencePromise.or(
-      obj
-        .values(this.mutationQueues)
-        .map(queue => () => queue.containsKey(transaction, key))
+      Object.values(this.mutationQueues).map(
+        queue => () => queue.containsKey(transaction, key)
+      )
     );
   }
 }
@@ -210,18 +208,24 @@ export class MemoryTransaction extends PersistenceTransaction {
 }
 
 export interface MemoryReferenceDelegate extends ReferenceDelegate {
-  documentSize(doc: MaybeDocument): number;
+  documentSize(doc: Document): number;
   onTransactionStarted(): void;
   onTransactionCommitted(txn: PersistenceTransaction): PersistencePromise<void>;
 }
 
 export class MemoryEagerDelegate implements MemoryReferenceDelegate {
-  private inMemoryPins: ReferenceSet | null = null;
-  private _orphanedDocuments: Set<DocumentKey> | null = null;
+  /** Tracks all documents that are active in Query views. */
+  private localViewReferences: ReferenceSet = new ReferenceSet();
+  /** The list of documents that are potentially GCed after each transaction. */
+  private _orphanedDocuments: Set</* path= */ string> | null = null;
 
-  constructor(private readonly persistence: MemoryPersistence) {}
+  private constructor(private readonly persistence: MemoryPersistence) {}
 
-  private get orphanedDocuments(): Set<DocumentKey> {
+  static factory(persistence: MemoryPersistence): MemoryEagerDelegate {
+    return new MemoryEagerDelegate(persistence);
+  }
+
+  private get orphanedDocuments(): Set<string> {
     if (!this._orphanedDocuments) {
       throw fail('orphanedDocuments is only valid during a transaction.');
     } else {
@@ -229,31 +233,31 @@ export class MemoryEagerDelegate implements MemoryReferenceDelegate {
     }
   }
 
-  setInMemoryPins(inMemoryPins: ReferenceSet): void {
-    this.inMemoryPins = inMemoryPins;
-  }
-
   addReference(
     txn: PersistenceTransaction,
+    targetId: TargetId,
     key: DocumentKey
   ): PersistencePromise<void> {
-    this.orphanedDocuments.delete(key);
+    this.localViewReferences.addReference(key, targetId);
+    this.orphanedDocuments.delete(key.toString());
     return PersistencePromise.resolve();
   }
 
   removeReference(
     txn: PersistenceTransaction,
+    targetId: TargetId,
     key: DocumentKey
   ): PersistencePromise<void> {
-    this.orphanedDocuments.add(key);
+    this.localViewReferences.removeReference(key, targetId);
+    this.orphanedDocuments.add(key.toString());
     return PersistencePromise.resolve();
   }
 
-  removeMutationReference(
+  markPotentiallyOrphaned(
     txn: PersistenceTransaction,
     key: DocumentKey
   ): PersistencePromise<void> {
-    this.orphanedDocuments.add(key);
+    this.orphanedDocuments.add(key.toString());
     return PersistencePromise.resolve();
   }
 
@@ -261,17 +265,21 @@ export class MemoryEagerDelegate implements MemoryReferenceDelegate {
     txn: PersistenceTransaction,
     targetData: TargetData
   ): PersistencePromise<void> {
+    const orphaned = this.localViewReferences.removeReferencesForId(
+      targetData.targetId
+    );
+    orphaned.forEach(key => this.orphanedDocuments.add(key.toString()));
     const cache = this.persistence.getTargetCache();
     return cache
       .getMatchingKeysForTargetId(txn, targetData.targetId)
       .next(keys => {
-        keys.forEach(key => this.orphanedDocuments.add(key));
+        keys.forEach(key => this.orphanedDocuments.add(key.toString()));
       })
       .next(() => cache.removeTargetData(txn, targetData));
   }
 
   onTransactionStarted(): void {
-    this._orphanedDocuments = new Set<DocumentKey>();
+    this._orphanedDocuments = new Set<string>();
   }
 
   onTransactionCommitted(
@@ -282,10 +290,11 @@ export class MemoryEagerDelegate implements MemoryReferenceDelegate {
     const changeBuffer = cache.newChangeBuffer();
     return PersistencePromise.forEach(
       this.orphanedDocuments,
-      (key: DocumentKey) => {
+      (path: string) => {
+        const key = DocumentKey.fromPath(path);
         return this.isReferenced(txn, key).next(isReferenced => {
           if (!isReferenced) {
-            changeBuffer.removeEntry(key);
+            changeBuffer.removeEntry(key, SnapshotVersion.min());
           }
         });
       }
@@ -301,14 +310,14 @@ export class MemoryEagerDelegate implements MemoryReferenceDelegate {
   ): PersistencePromise<void> {
     return this.isReferenced(txn, key).next(isReferenced => {
       if (isReferenced) {
-        this.orphanedDocuments.delete(key);
+        this.orphanedDocuments.delete(key.toString());
       } else {
-        this.orphanedDocuments.add(key);
+        this.orphanedDocuments.add(key.toString());
       }
     });
   }
 
-  documentSize(doc: MaybeDocument): number {
+  documentSize(doc: Document): number {
     // For eager GC, we don't care about the document size, there are no size thresholds.
     return 0;
   }
@@ -318,19 +327,22 @@ export class MemoryEagerDelegate implements MemoryReferenceDelegate {
     key: DocumentKey
   ): PersistencePromise<boolean> {
     return PersistencePromise.or([
+      () =>
+        PersistencePromise.resolve(this.localViewReferences.containsKey(key)),
       () => this.persistence.getTargetCache().containsKey(txn, key),
-      () => this.persistence.mutationQueuesContainKey(txn, key),
-      () => PersistencePromise.resolve(this.inMemoryPins!.containsKey(key))
+      () => this.persistence.mutationQueuesContainKey(txn, key)
     ]);
   }
 }
 
 export class MemoryLruDelegate implements ReferenceDelegate, LruDelegate {
-  private inMemoryPins: ReferenceSet | null = null;
   private orphanedSequenceNumbers: ObjectMap<
     DocumentKey,
     ListenSequenceNumber
-  > = new ObjectMap(k => encode(k.path));
+  > = new ObjectMap(
+    k => encodeResourcePath(k.path),
+    (l, r) => l.isEqual(r)
+  );
 
   readonly garbageCollector: LruGarbageCollector;
 
@@ -338,7 +350,14 @@ export class MemoryLruDelegate implements ReferenceDelegate, LruDelegate {
     private readonly persistence: MemoryPersistence,
     lruParams: LruParams
   ) {
-    this.garbageCollector = new LruGarbageCollector(this, lruParams);
+    this.garbageCollector = newLruGarbageCollector(this, lruParams);
+  }
+
+  static factory(
+    persistence: MemoryPersistence,
+    lruParams: LruParams
+  ): MemoryLruDelegate {
+    return new MemoryLruDelegate(persistence, lruParams);
   }
 
   // No-ops, present so memory persistence doesn't have to care which delegate
@@ -399,10 +418,6 @@ export class MemoryLruDelegate implements ReferenceDelegate, LruDelegate {
     );
   }
 
-  setInMemoryPins(inMemoryPins: ReferenceSet): void {
-    this.inMemoryPins = inMemoryPins;
-  }
-
   removeTargets(
     txn: PersistenceTransaction,
     upperBound: ListenSequenceNumber,
@@ -424,14 +439,14 @@ export class MemoryLruDelegate implements ReferenceDelegate, LruDelegate {
       return this.isPinned(txn, key, upperBound).next(isPinned => {
         if (!isPinned) {
           count++;
-          changeBuffer.removeEntry(key);
+          changeBuffer.removeEntry(key, SnapshotVersion.min());
         }
       });
     });
     return p.next(() => changeBuffer.apply(txn)).next(() => count);
   }
 
-  removeMutationReference(
+  markPotentiallyOrphaned(
     txn: PersistenceTransaction,
     key: DocumentKey
   ): PersistencePromise<void> {
@@ -449,6 +464,7 @@ export class MemoryLruDelegate implements ReferenceDelegate, LruDelegate {
 
   addReference(
     txn: PersistenceTransaction,
+    targetId: TargetId,
     key: DocumentKey
   ): PersistencePromise<void> {
     this.orphanedSequenceNumbers.set(key, txn.currentSequenceNumber);
@@ -457,6 +473,7 @@ export class MemoryLruDelegate implements ReferenceDelegate, LruDelegate {
 
   removeReference(
     txn: PersistenceTransaction,
+    targetId: TargetId,
     key: DocumentKey
   ): PersistencePromise<void> {
     this.orphanedSequenceNumbers.set(key, txn.currentSequenceNumber);
@@ -471,10 +488,10 @@ export class MemoryLruDelegate implements ReferenceDelegate, LruDelegate {
     return PersistencePromise.resolve();
   }
 
-  documentSize(maybeDoc: MaybeDocument): number {
-    let documentSize = maybeDoc.key.toString().length;
-    if (maybeDoc instanceof Document) {
-      documentSize += maybeDoc.data().approximateByteSize();
+  documentSize(document: Document): number {
+    let documentSize = document.key.toString().length;
+    if (document.isFoundDocument()) {
+      documentSize += estimateByteSize(document.data.value);
     }
     return documentSize;
   }
@@ -486,7 +503,6 @@ export class MemoryLruDelegate implements ReferenceDelegate, LruDelegate {
   ): PersistencePromise<boolean> {
     return PersistencePromise.or([
       () => this.persistence.mutationQueuesContainKey(txn, key),
-      () => PersistencePromise.resolve(this.inMemoryPins!.containsKey(key)),
       () => this.persistence.getTargetCache().containsKey(txn, key),
       () => {
         const orphanedAt = this.orphanedSequenceNumbers.get(key);
@@ -499,55 +515,5 @@ export class MemoryLruDelegate implements ReferenceDelegate, LruDelegate {
 
   getCacheSize(txn: PersistenceTransaction): PersistencePromise<number> {
     return this.persistence.getRemoteDocumentCache().getSize(txn);
-  }
-}
-
-export class MemoryPersistenceProvider implements PersistenceProvider {
-  private clientId: ClientId | undefined;
-
-  initialize(
-    asyncQueue: AsyncQueue,
-    databaseInfo: DatabaseInfo,
-    platform: Platform,
-    clientId: ClientId,
-    initialUser: User,
-    settings: PersistenceSettings
-  ): Promise<void> {
-    if (settings.durable) {
-      throw new FirestoreError(
-        Code.FAILED_PRECONDITION,
-        MEMORY_ONLY_PERSISTENCE_ERROR_MESSAGE
-      );
-    }
-    this.clientId = clientId;
-    return Promise.resolve();
-  }
-
-  getGarbageCollectionScheduler(): GarbageCollectionScheduler {
-    let started = false;
-    return {
-      started,
-      start: () => (started = true),
-      stop: () => (started = false)
-    };
-  }
-
-  getPersistence(): Persistence {
-    assert(!!this.clientId, 'initialize() not called');
-    return new MemoryPersistence(
-      this.clientId,
-      p => new MemoryEagerDelegate(p)
-    );
-  }
-
-  getSharedClientState(): SharedClientState {
-    return new MemorySharedClientState();
-  }
-
-  clearPersistence(): never {
-    throw new FirestoreError(
-      Code.FAILED_PRECONDITION,
-      MEMORY_ONLY_PERSISTENCE_ERROR_MESSAGE
-    );
   }
 }

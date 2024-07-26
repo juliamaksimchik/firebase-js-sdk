@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,24 +20,14 @@
  * abstract representations.
  */
 
-import firebase from '@firebase/app';
-import * as backoff from './backoff';
-import {
-  FirebaseStorageError,
-  unknown,
-  appDeleted,
-  canceled,
-  retryLimitExceeded
-} from './error';
-import { RequestInfo } from './requestinfo';
-import * as type from './type';
-import * as UrlUtils from './url';
-import { Headers, XhrIo, ErrorCode } from './xhrio';
-import { XhrIoPool } from './xhriopool';
+import { id as backoffId, start, stop } from './backoff';
+import { appDeleted, canceled, retryLimitExceeded, unknown } from './error';
+import { ErrorHandler, RequestHandler, RequestInfo } from './requestinfo';
+import { isJustDef } from './type';
+import { makeQueryString } from './url';
+import { Connection, ErrorCode, Headers, ConnectionType } from './connection';
+import { isRetryStatusCode } from './utils';
 
-/**
- * @template T
- */
 export interface Request<T> {
   getPromise(): Promise<T>;
 
@@ -46,65 +36,45 @@ export interface Request<T> {
    * appropriate value (if the request is finished before you call this method,
    * but the promise has not yet been resolved), so don't just assume it will be
    * rejected if you call this function.
-   * @param appDelete True if the cancelation came from the app being deleted.
+   * @param appDelete - True if the cancelation came from the app being deleted.
    */
   cancel(appDelete?: boolean): void;
 }
 
 /**
- * @struct
- * @template T
+ * Handles network logic for all Storage Requests, including error reporting and
+ * retries with backoff.
+ *
+ * @param I - the type of the backend's network response.
+ * @param - O the output type used by the rest of the SDK. The conversion
+ * happens in the specified `callback_`.
  */
-class NetworkRequest<T> implements Request<T> {
-  private url_: string;
-  private method_: string;
-  private headers_: Headers;
-  private body_: string | Blob | Uint8Array | null;
-  private successCodes_: number[];
-  private additionalRetryCodes_: number[];
-  private pendingXhr_: XhrIo | null = null;
-  private backoffId_: backoff.id | null = null;
-  private resolve_: Function | null = null;
-  private reject_: Function | null = null;
+class NetworkRequest<I extends ConnectionType, O> implements Request<O> {
+  private pendingConnection_: Connection<I> | null = null;
+  private backoffId_: backoffId | null = null;
+  private resolve_!: (value?: O | PromiseLike<O>) => void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private reject_!: (reason?: any) => void;
   private canceled_: boolean = false;
   private appDelete_: boolean = false;
-  private callback_: (p1: XhrIo, p2: string) => T;
-  private errorCallback_:
-    | ((p1: XhrIo, p2: FirebaseStorageError) => FirebaseStorageError)
-    | null;
-  private progressCallback_: ((p1: number, p2: number) => void) | null;
-  private timeout_: number;
-  private pool_: XhrIoPool;
-  promise_: Promise<T>;
+  private promise_: Promise<O>;
 
   constructor(
-    url: string,
-    method: string,
-    headers: Headers,
-    body: string | Blob | Uint8Array | null,
-    successCodes: number[],
-    additionalRetryCodes: number[],
-    callback: (p1: XhrIo, p2: string) => T,
-    errorCallback:
-      | ((p1: XhrIo, p2: FirebaseStorageError) => FirebaseStorageError)
-      | null,
-    timeout: number,
-    progressCallback: ((p1: number, p2: number) => void) | null,
-    pool: XhrIoPool
+    private url_: string,
+    private method_: string,
+    private headers_: Headers,
+    private body_: string | Blob | Uint8Array | null,
+    private successCodes_: number[],
+    private additionalRetryCodes_: number[],
+    private callback_: RequestHandler<I, O>,
+    private errorCallback_: ErrorHandler | null,
+    private timeout_: number,
+    private progressCallback_: ((p1: number, p2: number) => void) | null,
+    private connectionFactory_: () => Connection<I>,
+    private retry = true
   ) {
-    this.url_ = url;
-    this.method_ = method;
-    this.headers_ = headers;
-    this.body_ = body;
-    this.successCodes_ = successCodes.slice();
-    this.additionalRetryCodes_ = additionalRetryCodes.slice();
-    this.callback_ = callback;
-    this.errorCallback_ = errorCallback;
-    this.progressCallback_ = progressCallback;
-    this.timeout_ = timeout;
-    this.pool_ = pool;
     this.promise_ = new Promise((resolve, reject) => {
-      this.resolve_ = resolve;
+      this.resolve_ = resolve as (value?: O | PromiseLike<O>) => void;
       this.reject_ = reject;
       this.start_();
     });
@@ -114,69 +84,73 @@ class NetworkRequest<T> implements Request<T> {
    * Actually starts the retry loop.
    */
   private start_(): void {
-    const self = this;
-
-    function doTheRequest(
-      backoffCallback: (p1: boolean, ...p2: unknown[]) => void,
+    const doTheRequest: (
+      backoffCallback: (success: boolean, ...p2: unknown[]) => void,
       canceled: boolean
-    ): void {
+    ) => void = (backoffCallback, canceled) => {
       if (canceled) {
         backoffCallback(false, new RequestEndStatus(false, null, true));
         return;
       }
-      const xhr = self.pool_.createXhrIo();
-      self.pendingXhr_ = xhr;
+      const connection = this.connectionFactory_();
+      this.pendingConnection_ = connection;
 
-      function progressListener(progressEvent: ProgressEvent): void {
+      const progressListener: (
+        progressEvent: ProgressEvent
+      ) => void = progressEvent => {
         const loaded = progressEvent.loaded;
         const total = progressEvent.lengthComputable ? progressEvent.total : -1;
-        if (self.progressCallback_ !== null) {
-          self.progressCallback_(loaded, total);
+        if (this.progressCallback_ !== null) {
+          this.progressCallback_(loaded, total);
         }
-      }
-      if (self.progressCallback_ !== null) {
-        xhr.addUploadProgressListener(progressListener);
+      };
+      if (this.progressCallback_ !== null) {
+        connection.addUploadProgressListener(progressListener);
       }
 
+      // connection.send() never rejects, so we don't need to have a error handler or use catch on the returned promise.
       // eslint-disable-next-line @typescript-eslint/no-floating-promises
-      xhr
-        .send(self.url_, self.method_, self.body_, self.headers_)
-        .then((xhr: XhrIo) => {
-          if (self.progressCallback_ !== null) {
-            xhr.removeUploadProgressListener(progressListener);
+      connection
+        .send(this.url_, this.method_, this.body_, this.headers_)
+        .then(() => {
+          if (this.progressCallback_ !== null) {
+            connection.removeUploadProgressListener(progressListener);
           }
-          self.pendingXhr_ = null;
-          xhr = xhr as XhrIo;
-          const hitServer = xhr.getErrorCode() === ErrorCode.NO_ERROR;
-          const status = xhr.getStatus();
-          if (!hitServer || self.isRetryStatusCode_(status)) {
-            const wasCanceled = xhr.getErrorCode() === ErrorCode.ABORT;
+          this.pendingConnection_ = null;
+          const hitServer = connection.getErrorCode() === ErrorCode.NO_ERROR;
+          const status = connection.getStatus();
+          if (
+            !hitServer ||
+            (isRetryStatusCode(status, this.additionalRetryCodes_) &&
+              this.retry)
+          ) {
+            const wasCanceled = connection.getErrorCode() === ErrorCode.ABORT;
             backoffCallback(
               false,
               new RequestEndStatus(false, null, wasCanceled)
             );
             return;
           }
-          const successCode = self.successCodes_.indexOf(status) !== -1;
-          backoffCallback(true, new RequestEndStatus(successCode, xhr));
+          const successCode = this.successCodes_.indexOf(status) !== -1;
+          backoffCallback(true, new RequestEndStatus(successCode, connection));
         });
-    }
+    };
 
     /**
-     * @param requestWentThrough True if the request eventually went
+     * @param requestWentThrough - True if the request eventually went
      *     through, false if it hit the retry limit or was canceled.
      */
-    function backoffDone(
+    const backoffDone: (
       requestWentThrough: boolean,
-      status: RequestEndStatus
-    ): void {
-      const resolve = self.resolve_ as Function;
-      const reject = self.reject_ as Function;
-      const xhr = status.xhr as XhrIo;
+      status: RequestEndStatus<I>
+    ) => void = (requestWentThrough, status) => {
+      const resolve = this.resolve_;
+      const reject = this.reject_;
+      const connection = status.connection as Connection<I>;
       if (status.wasSuccessCode) {
         try {
-          const result = self.callback_(xhr, xhr.getResponseText());
-          if (type.isJustDef(result)) {
+          const result = this.callback_(connection, connection.getResponse());
+          if (isJustDef(result)) {
             resolve(result);
           } else {
             resolve();
@@ -185,17 +159,17 @@ class NetworkRequest<T> implements Request<T> {
           reject(e);
         }
       } else {
-        if (xhr !== null) {
+        if (connection !== null) {
           const err = unknown();
-          err.setServerResponseProp(xhr.getResponseText());
-          if (self.errorCallback_) {
-            reject(self.errorCallback_(xhr, err));
+          err.serverResponse = connection.getErrorText();
+          if (this.errorCallback_) {
+            reject(this.errorCallback_(connection, err));
           } else {
             reject(err);
           }
         } else {
           if (status.canceled) {
-            const err = self.appDelete_ ? appDeleted() : canceled();
+            const err = this.appDelete_ ? appDeleted() : canceled();
             reject(err);
           } else {
             const err = retryLimitExceeded();
@@ -203,16 +177,16 @@ class NetworkRequest<T> implements Request<T> {
           }
         }
       }
-    }
+    };
     if (this.canceled_) {
       backoffDone(false, new RequestEndStatus(false, null, true));
     } else {
-      this.backoffId_ = backoff.start(doTheRequest, backoffDone, this.timeout_);
+      this.backoffId_ = start(doTheRequest, backoffDone, this.timeout_);
     }
   }
 
   /** @inheritDoc */
-  getPromise(): Promise<T> {
+  getPromise(): Promise<O> {
     return this.promise_;
   }
 
@@ -221,36 +195,19 @@ class NetworkRequest<T> implements Request<T> {
     this.canceled_ = true;
     this.appDelete_ = appDelete || false;
     if (this.backoffId_ !== null) {
-      backoff.stop(this.backoffId_);
+      stop(this.backoffId_);
     }
-    if (this.pendingXhr_ !== null) {
-      this.pendingXhr_.abort();
+    if (this.pendingConnection_ !== null) {
+      this.pendingConnection_.abort();
     }
-  }
-
-  private isRetryStatusCode_(status: number): boolean {
-    // The codes for which to retry came from this page:
-    // https://cloud.google.com/storage/docs/exponential-backoff
-    const isFiveHundredCode = status >= 500 && status < 600;
-    const extraRetryCodes = [
-      // Request Timeout: web server didn't receive full request in time.
-      408,
-      // Too Many Requests: you're getting rate-limited, basically.
-      429
-    ];
-    const isExtraRetryCode = extraRetryCodes.indexOf(status) !== -1;
-    const isRequestSpecificRetryCode =
-      this.additionalRetryCodes_.indexOf(status) !== -1;
-    return isFiveHundredCode || isExtraRetryCode || isRequestSpecificRetryCode;
   }
 }
 
 /**
  * A collection of information about the result of a network request.
- * @param opt_canceled Defaults to false.
- * @struct
+ * @param opt_canceled - Defaults to false.
  */
-export class RequestEndStatus {
+export class RequestEndStatus<I extends ConnectionType> {
   /**
    * True if the request was canceled.
    */
@@ -258,7 +215,7 @@ export class RequestEndStatus {
 
   constructor(
     public wasSuccessCode: boolean,
-    public xhr: XhrIo | null,
+    public connection: Connection<I> | null,
     canceled?: boolean
   ) {
     this.canceled = !!canceled;
@@ -274,10 +231,12 @@ export function addAuthHeader_(
   }
 }
 
-export function addVersionHeader_(headers: Headers): void {
-  const version =
-    typeof firebase !== 'undefined' ? firebase.SDK_VERSION : 'AppManager';
-  headers['X-Firebase-Storage-Version'] = 'webjs/' + version;
+export function addVersionHeader_(
+  headers: Headers,
+  firebaseVersion?: string
+): void {
+  headers['X-Firebase-Storage-Version'] =
+    'webjs/' + (firebaseVersion ?? 'AppManager');
 }
 
 export function addGmpidHeader_(headers: Headers, appId: string | null): void {
@@ -286,22 +245,32 @@ export function addGmpidHeader_(headers: Headers, appId: string | null): void {
   }
 }
 
-/**
- * @template T
- */
-export function makeRequest<T>(
-  requestInfo: RequestInfo<T>,
+export function addAppCheckHeader_(
+  headers: Headers,
+  appCheckToken: string | null
+): void {
+  if (appCheckToken !== null) {
+    headers['X-Firebase-AppCheck'] = appCheckToken;
+  }
+}
+
+export function makeRequest<I extends ConnectionType, O>(
+  requestInfo: RequestInfo<I, O>,
   appId: string | null,
   authToken: string | null,
-  pool: XhrIoPool
-): Request<T> {
-  const queryPart = UrlUtils.makeQueryString(requestInfo.urlParams);
+  appCheckToken: string | null,
+  requestFactory: () => Connection<I>,
+  firebaseVersion?: string,
+  retry = true
+): Request<O> {
+  const queryPart = makeQueryString(requestInfo.urlParams);
   const url = requestInfo.url + queryPart;
   const headers = Object.assign({}, requestInfo.headers);
   addGmpidHeader_(headers, appId);
   addAuthHeader_(headers, authToken);
-  addVersionHeader_(headers);
-  return new NetworkRequest<T>(
+  addVersionHeader_(headers, firebaseVersion);
+  addAppCheckHeader_(headers, appCheckToken);
+  return new NetworkRequest<I, O>(
     url,
     requestInfo.method,
     headers,
@@ -312,6 +281,7 @@ export function makeRequest<T>(
     requestInfo.errorHandler,
     requestInfo.timeout,
     requestInfo.progressCallback,
-    pool
+    requestFactory,
+    retry
   );
 }

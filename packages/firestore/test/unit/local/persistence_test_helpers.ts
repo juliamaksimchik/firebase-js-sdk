@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,17 +16,19 @@
  */
 
 import { User } from '../../../src/auth/user';
-import { DatabaseId, DatabaseInfo } from '../../../src/core/database_info';
+import { DatabaseId } from '../../../src/core/database_info';
 import { SequenceNumberSyncer } from '../../../src/core/listen_sequence';
 import {
   BatchId,
-  MutationBatchState,
-  OnlineState,
   TargetId,
   ListenSequenceNumber
 } from '../../../src/core/types';
-
-import { IndexedDbPersistence } from '../../../src/local/indexeddb_persistence';
+import {
+  indexedDbStoragePrefix,
+  indexedDbClearPersistence,
+  IndexedDbPersistence,
+  MAIN_DATABASE
+} from '../../../src/local/indexeddb_persistence';
 import { LocalSerializer } from '../../../src/local/local_serializer';
 import { LruParams } from '../../../src/local/lru_garbage_collector';
 import {
@@ -38,40 +40,28 @@ import {
   ClientId,
   WebStorageSharedClientState
 } from '../../../src/local/shared_client_state';
-import {
-  QueryTargetState,
-  SharedClientStateSyncer
-} from '../../../src/local/shared_client_state_syncer';
 import { SimpleDb } from '../../../src/local/simple_db';
-import { PlatformSupport } from '../../../src/platform/platform';
+import { getDocument, getWindow } from '../../../src/platform/dom';
 import { JsonProtoSerializer } from '../../../src/remote/serializer';
 import { AsyncQueue } from '../../../src/util/async_queue';
-import { FirestoreError } from '../../../src/util/error';
+import { newAsyncQueue } from '../../../src/util/async_queue_impl';
 import { AutoId } from '../../../src/util/misc';
-
-/** The prefix used by the keys that Firestore writes to Local Storage. */
-const LOCAL_STORAGE_PREFIX = 'firestore_';
-
+import { WindowLike } from '../../../src/util/types';
 export const MOCK_SEQUENCE_NUMBER_SYNCER: SequenceNumberSyncer = {
   sequenceNumberHandler: null,
   writeSequenceNumber: (sequenceNumber: ListenSequenceNumber) => void {}
 };
 
 /** The Database ID used by most tests that use a serializer. */
-export const TEST_DATABASE_ID = new DatabaseId('test-project');
-
-/** The DatabaseInfo used by tests that need a serializer. */
-const TEST_DATABASE_INFO = new DatabaseInfo(
-  TEST_DATABASE_ID,
-  '[PersistenceTestHelpers]',
-  'host',
-  /*ssl=*/ false,
-  /*forceLongPolling=*/ false
-);
+export const TEST_PROJECT = 'test-project';
+export const TEST_DATABASE_ID = new DatabaseId(TEST_PROJECT);
+export const TEST_PERSISTENCE_KEY = '[PersistenceTestHelpers]';
+export const TEST_APP_ID = 'test-app-id';
 
 /** The persistence prefix used for testing in IndexedBD and LocalStorage. */
-export const TEST_PERSISTENCE_PREFIX = IndexedDbPersistence.buildStoragePrefix(
-  TEST_DATABASE_INFO
+export const TEST_PERSISTENCE_PREFIX = indexedDbStoragePrefix(
+  TEST_DATABASE_ID,
+  TEST_PERSISTENCE_KEY
 );
 
 /**
@@ -80,12 +70,13 @@ export const TEST_PERSISTENCE_PREFIX = IndexedDbPersistence.buildStoragePrefix(
  * `TEST_DATABASE_ID`.
  */
 export const INDEXEDDB_TEST_DATABASE_NAME =
-  IndexedDbPersistence.buildStoragePrefix(TEST_DATABASE_INFO) +
-  IndexedDbPersistence.MAIN_DATABASE;
+  indexedDbStoragePrefix(TEST_DATABASE_ID, TEST_PERSISTENCE_KEY) +
+  MAIN_DATABASE;
 
-const JSON_SERIALIZER = new JsonProtoSerializer(TEST_DATABASE_ID, {
-  useProto3Json: true
-});
+export const JSON_SERIALIZER = new JsonProtoSerializer(
+  TEST_DATABASE_ID,
+  /* useProto3Json= */ true
+);
 
 /**
  * IndexedDb serializer that uses `TEST_DATABASE_ID` as its database
@@ -102,78 +93,58 @@ export async function testIndexedDbPersistence(
     dontPurgeData?: boolean;
     synchronizeTabs?: boolean;
     queue?: AsyncQueue;
+    schemaVersion?: number;
   } = {},
   lruParams: LruParams = LruParams.DEFAULT
 ): Promise<IndexedDbPersistence> {
-  const queue = options.queue || new AsyncQueue();
+  const queue = options.queue || newAsyncQueue();
   const clientId = AutoId.newId();
   const prefix = `${TEST_PERSISTENCE_PREFIX}/`;
   if (!options.dontPurgeData) {
-    await SimpleDb.delete(prefix + IndexedDbPersistence.MAIN_DATABASE);
+    await SimpleDb.delete(prefix + MAIN_DATABASE);
   }
-  const platform = PlatformSupport.getPlatform();
-  return IndexedDbPersistence.createIndexedDbPersistence({
-    allowTabSynchronization: !!options.synchronizeTabs,
-    persistenceKey: TEST_PERSISTENCE_PREFIX,
+  const persistence = new IndexedDbPersistence(
+    !!options.synchronizeTabs,
+    TEST_PERSISTENCE_PREFIX,
     clientId,
-    platform,
-    queue,
-    serializer: JSON_SERIALIZER,
     lruParams,
-    sequenceNumberSyncer: MOCK_SEQUENCE_NUMBER_SYNCER
-  });
+    queue,
+    getWindow(),
+    getDocument(),
+    JSON_SERIALIZER,
+    MOCK_SEQUENCE_NUMBER_SYNCER,
+    /** forceOwningTab= */ false,
+    options.schemaVersion
+  );
+  await persistence.start();
+  return persistence;
 }
 
 /** Creates and starts a MemoryPersistence instance for testing. */
 export async function testMemoryEagerPersistence(): Promise<MemoryPersistence> {
-  return new MemoryPersistence(AutoId.newId(), p => new MemoryEagerDelegate(p));
+  return new MemoryPersistence(MemoryEagerDelegate.factory, JSON_SERIALIZER);
 }
 
 export async function testMemoryLruPersistence(
   params: LruParams = LruParams.DEFAULT
 ): Promise<MemoryPersistence> {
   return new MemoryPersistence(
-    AutoId.newId(),
-    p => new MemoryLruDelegate(p, params)
+    p => new MemoryLruDelegate(p, params),
+    JSON_SERIALIZER
   );
 }
 
 /** Clears the persistence in tests */
 export function clearTestPersistence(): Promise<void> {
-  return IndexedDbPersistence.clearPersistence(TEST_PERSISTENCE_PREFIX);
+  return indexedDbClearPersistence(TEST_PERSISTENCE_PREFIX);
 }
 
-class NoOpSharedClientStateSyncer implements SharedClientStateSyncer {
-  constructor(private readonly activeClients: ClientId[]) {}
-  async applyBatchState(
-    batchId: BatchId,
-    state: MutationBatchState,
-    error?: FirestoreError
-  ): Promise<void> {}
-  async applySuccessfulWrite(batchId: BatchId): Promise<void> {}
-  async rejectFailedWrite(
-    batchId: BatchId,
-    err: FirestoreError
-  ): Promise<void> {}
-  async getActiveClients(): Promise<ClientId[]> {
-    return this.activeClients;
-  }
-  async applyTargetState(
-    targetId: TargetId,
-    state: QueryTargetState,
-    error?: FirestoreError
-  ): Promise<void> {}
-  async applyActiveTargetsChange(
-    added: TargetId[],
-    removed: TargetId[]
-  ): Promise<void> {}
-  applyOnlineStateChange(onlineState: OnlineState): void {}
-}
 /**
- * Populates Web Storage with instance data from a pre-existing client.
+ * Populates Web Storage with instance data from a preexisting client.
  */
 export async function populateWebStorage(
   user: User,
+  window: WindowLike,
   existingClientId: ClientId,
   existingMutationBatchIds: BatchId[],
   existingQueryTargetIds: TargetId[]
@@ -181,38 +152,17 @@ export async function populateWebStorage(
   // HACK: Create a secondary client state to seed data into LocalStorage.
   // NOTE: We don't call shutdown() on it because that would delete the data.
   const secondaryClientState = new WebStorageSharedClientState(
-    new AsyncQueue(),
-    PlatformSupport.getPlatform(),
+    window,
+    newAsyncQueue(),
     TEST_PERSISTENCE_PREFIX,
     existingClientId,
     user
   );
-
-  secondaryClientState.syncEngine = new NoOpSharedClientStateSyncer([
-    existingClientId
-  ]);
-  secondaryClientState.onlineStateHandler = () => {};
-  await secondaryClientState.start();
-
   for (const batchId of existingMutationBatchIds) {
     secondaryClientState.addPendingMutation(batchId);
   }
 
   for (const targetId of existingQueryTargetIds) {
     secondaryClientState.addLocalQueryTarget(targetId);
-  }
-}
-
-/**
- * Removes Firestore data (by prefix match) from Local Storage.
- */
-export function clearWebStorage(): void {
-  for (let i = 0; ; ++i) {
-    const key = window.localStorage.key(i);
-    if (key === null) {
-      break;
-    } else if (key.startsWith(LOCAL_STORAGE_PREFIX)) {
-      window.localStorage.removeItem(key);
-    }
   }
 }

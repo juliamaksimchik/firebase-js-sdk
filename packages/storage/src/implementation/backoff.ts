@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,14 +24,24 @@ type id = (p1: boolean) => void;
 export { id };
 
 /**
- * @param f May be invoked
- *     before the function returns.
- * @param callback Get all the arguments passed to the function
- *     passed to f, including the initial boolean.
+ * Accepts a callback for an action to perform (`doRequest`),
+ * and then a callback for when the backoff has completed (`backoffCompleteCb`).
+ * The callback sent to start requires an argument to call (`onRequestComplete`).
+ * When `start` calls `doRequest`, it passes a callback for when the request has
+ * completed, `onRequestComplete`. Based on this, the backoff continues, with
+ * another call to `doRequest` and the above loop continues until the timeout
+ * is hit, or a successful response occurs.
+ * @description
+ * @param doRequest Callback to perform request
+ * @param backoffCompleteCb Callback to call when backoff has been completed
  */
 export function start(
-  f: (p1: (success: boolean) => void, canceled: boolean) => void,
-  callback: Function,
+  doRequest: (
+    onRequestComplete: (success: boolean) => void,
+    canceled: boolean
+  ) => void,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  backoffCompleteCb: (...args: any[]) => unknown,
   timeout: number
 ): id {
   // TODO(andysoto): make this code cleaner (probably refactor into an actual
@@ -40,7 +50,9 @@ export function start(
   // Would type this as "number" but that doesn't work for Node so ¯\_(ツ)_/¯
   // TODO: find a way to exclude Node type definition for storage because storage only works in browser
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let timeoutId: any = null;
+  let retryTimeoutId: any = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let globalTimeoutId: any = null;
   let hitTimeout = false;
   let cancelState = 0;
 
@@ -49,36 +61,39 @@ export function start(
   }
   let triggeredCallback = false;
 
-  // TODO: This disable can be removed and the 'ignoreRestArgs' option added to
-  // the no-explicit-any rule when ESlint releases it.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   function triggerCallback(...args: any[]): void {
     if (!triggeredCallback) {
       triggeredCallback = true;
-      callback.apply(null, args);
+      backoffCompleteCb.apply(null, args);
     }
   }
 
   function callWithDelay(millis: number): void {
-    timeoutId = setTimeout(() => {
-      timeoutId = null;
-      f(handler, canceled());
+    retryTimeoutId = setTimeout(() => {
+      retryTimeoutId = null;
+      doRequest(responseHandler, canceled());
     }, millis);
   }
 
-  // TODO: This disable can be removed and the 'ignoreRestArgs' option added to
-  // the no-explicit-any rule when ESlint releases it.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  function handler(success: boolean, ...args: any[]): void {
+  function clearGlobalTimeout(): void {
+    if (globalTimeoutId) {
+      clearTimeout(globalTimeoutId);
+    }
+  }
+
+  function responseHandler(success: boolean, ...args: any[]): void {
     if (triggeredCallback) {
+      clearGlobalTimeout();
       return;
     }
     if (success) {
+      clearGlobalTimeout();
       triggerCallback.call(null, success, ...args);
       return;
     }
     const mustStop = canceled() || hitTimeout;
     if (mustStop) {
+      clearGlobalTimeout();
       triggerCallback.call(null, success, ...args);
       return;
     }
@@ -102,14 +117,15 @@ export function start(
       return;
     }
     stopped = true;
+    clearGlobalTimeout();
     if (triggeredCallback) {
       return;
     }
-    if (timeoutId !== null) {
+    if (retryTimeoutId !== null) {
       if (!wasTimeout) {
         cancelState = 2;
       }
-      clearTimeout(timeoutId);
+      clearTimeout(retryTimeoutId);
       callWithDelay(0);
     } else {
       if (!wasTimeout) {
@@ -118,7 +134,7 @@ export function start(
     }
   }
   callWithDelay(0);
-  setTimeout(() => {
+  globalTimeoutId = setTimeout(() => {
     hitTimeout = true;
     stop(true);
   }, timeout);

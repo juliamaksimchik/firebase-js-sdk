@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,49 +19,61 @@
 // these in any integration test, where we expect working Firestore object.
 
 import {
-  CollectionReference,
   DocumentReference,
-  DocumentSnapshot,
+  ensureFirestoreConfigured,
   Firestore,
   Query,
-  QuerySnapshot
-} from '../../src/api/database';
-import { IndexedDbPersistenceProvider } from '../../src/local/indexeddb_persistence';
-import { Query as InternalQuery } from '../../src/core/query';
+  CollectionReference,
+  QuerySnapshot,
+  DocumentSnapshot,
+  SnapshotMetadata
+} from '../../src';
+import {
+  EmptyAppCheckTokenProvider,
+  EmptyAuthCredentialsProvider
+} from '../../src/api/credentials';
+import { ExpUserDataWriter } from '../../src/api/reference_impl';
+import { DatabaseId } from '../../src/core/database_info';
+import { newQueryForPath, Query as InternalQuery } from '../../src/core/query';
 import {
   ChangeType,
   DocumentViewChange,
   ViewSnapshot
 } from '../../src/core/view_snapshot';
 import { DocumentKeySet } from '../../src/model/collections';
-import { Document } from '../../src/model/document';
 import { DocumentSet } from '../../src/model/document_set';
-import { JsonObject } from '../../src/model/field_value';
+import { JsonObject } from '../../src/model/object_value';
+import { TEST_PROJECT } from '../unit/local/persistence_test_helpers';
+
 import { doc, key, path as pathFrom } from './helpers';
-import { Provider, ComponentContainer } from '@firebase/component';
 
 /**
  * A mock Firestore. Will not work for integration test.
  */
-export const FIRESTORE = new Firestore(
-  {
-    projectId: 'projectid',
-    database: 'database'
-  },
-  new Provider('auth-internal', new ComponentContainer('default')),
-  new IndexedDbPersistenceProvider()
-);
+export const FIRESTORE = newTestFirestore(TEST_PROJECT);
 
 export function firestore(): Firestore {
   return FIRESTORE;
 }
 
+export function newTestFirestore(projectId = 'new-project'): Firestore {
+  return new Firestore(
+    new EmptyAuthCredentialsProvider(),
+    new EmptyAppCheckTokenProvider(),
+    new DatabaseId(projectId)
+  );
+}
+
 export function collectionReference(path: string): CollectionReference {
-  return new CollectionReference(pathFrom(path), firestore());
+  const db = firestore();
+  ensureFirestoreConfigured(db);
+  return new CollectionReference(db, /* converter= */ null, pathFrom(path));
 }
 
 export function documentReference(path: string): DocumentReference {
-  return new DocumentReference(key(path), firestore());
+  const db = firestore();
+  ensureFirestoreConfigured(db);
+  return new DocumentReference(db, /* converter= */ null, key(path));
 }
 
 export function documentSnapshot(
@@ -69,41 +81,48 @@ export function documentSnapshot(
   data: JsonObject<unknown> | null,
   fromCache: boolean
 ): DocumentSnapshot {
+  const db = firestore();
+  const userDataWriter = new ExpUserDataWriter(db);
   if (data) {
     return new DocumentSnapshot(
-      firestore(),
+      db,
+      userDataWriter,
       key(path),
       doc(path, 1, data),
-      fromCache,
-      /* hasPendingWrites= */ false
+      new SnapshotMetadata(/* hasPendingWrites= */ false, fromCache),
+      /* converter= */ null
     );
   } else {
     return new DocumentSnapshot(
-      firestore(),
+      db,
+      userDataWriter,
       key(path),
       null,
-      fromCache,
-      /* hasPendingWrites= */ false
+      new SnapshotMetadata(/* hasPendingWrites= */ false, fromCache),
+      /* converter= */ null
     );
   }
 }
 
 export function query(path: string): Query {
-  return new Query(InternalQuery.atPath(pathFrom(path)), firestore());
+  const db = firestore();
+  return new Query(db, /* converter= */ null, newQueryForPath(pathFrom(path)));
 }
 
 /**
  * A convenience method for creating a particular query snapshot for tests.
  *
- * @param path To be used in constructing the query.
- * @param oldDocs Provides the prior set of documents in the QuerySnapshot. Each entry maps to a
- *     document, with the key being the document id, and the value being the document contents.
- * @param docsToAdd Specifies data to be added into the query snapshot as of now. Each entry maps
- *     to a document, with the key being the document id, and the value being the document contents.
- * @param mutatedKeys The list of document with pending writes.
- * @param fromCache Whether the query snapshot is cache result.
- * @param syncStateChanged Whether the sync state has changed.
- * @return A query snapshot that consists of both sets of documents.
+ * @param path - To be used in constructing the query.
+ * @param oldDocs - Provides the prior set of documents in the QuerySnapshot.
+ * Each entry maps to a document, with the key being the document id, and the
+ * value being the document contents.
+ * @param docsToAdd - Specifies data to be added into the query snapshot as of
+ * now. Each entry maps to a document, with the key being the document id, and
+ * the value being the document contents.
+ * @param mutatedKeys - The list of document with pending writes.
+ * @param fromCache - Whether the query snapshot is cache result.
+ * @param syncStateChanged - Whether the sync state has changed.
+ * @returns A query snapshot that consists of both sets of documents.
  */
 export function querySnapshot(
   path: string,
@@ -111,9 +130,10 @@ export function querySnapshot(
   docsToAdd: { [key: string]: JsonObject<unknown> },
   mutatedKeys: DocumentKeySet,
   fromCache: boolean,
-  syncStateChanged: boolean
+  syncStateChanged: boolean,
+  hasCachedResults?: boolean
 ): QuerySnapshot {
-  const query: InternalQuery = InternalQuery.atPath(pathFrom(path));
+  const query: InternalQuery = newQueryForPath(pathFrom(path));
   let oldDocuments: DocumentSet = new DocumentSet();
   Object.keys(oldDocs).forEach(key => {
     oldDocuments = oldDocuments.add(doc(path + '/' + key, 1, oldDocs[key]));
@@ -121,7 +141,7 @@ export function querySnapshot(
   let newDocuments: DocumentSet = new DocumentSet();
   const documentChanges: DocumentViewChange[] = [];
   Object.keys(docsToAdd).forEach(key => {
-    const docToAdd: Document = doc(path + '/' + key, 1, docsToAdd[key]);
+    const docToAdd = doc(path + '/' + key, 1, docsToAdd[key]);
     newDocuments = newDocuments.add(docToAdd);
     documentChanges.push({ type: ChangeType.Added, doc: docToAdd });
   });
@@ -133,7 +153,14 @@ export function querySnapshot(
     mutatedKeys,
     fromCache,
     syncStateChanged,
-    false
+    false,
+    hasCachedResults ?? false
   );
-  return new QuerySnapshot(firestore(), query, viewSnapshot);
+  const db = firestore();
+  return new QuerySnapshot(
+    db,
+    new ExpUserDataWriter(db),
+    new Query(db, /* converter= */ null, query),
+    viewSnapshot
+  );
 }

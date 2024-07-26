@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,14 +15,14 @@
  * limitations under the License.
  */
 
+import { DocumentKeySet } from '../model/collections';
 import { Document } from '../model/document';
 import { DocumentKey } from '../model/document_key';
 import { DocumentSet } from '../model/document_set';
 import { fail } from '../util/assert';
 import { SortedMap } from '../util/sorted_map';
 
-import { DocumentKeySet } from '../model/collections';
-import { Query } from './query';
+import { Query, queryEquals } from './query';
 
 export const enum ChangeType {
   Added,
@@ -146,7 +146,8 @@ export class ViewSnapshot {
     readonly mutatedKeys: DocumentKeySet,
     readonly fromCache: boolean,
     readonly syncStateChanged: boolean,
-    readonly excludesMetadataChanges: boolean
+    readonly excludesMetadataChanges: boolean,
+    readonly hasCachedResults: boolean
   ) {}
 
   /** Returns a view snapshot as if all documents in the snapshot were added. */
@@ -154,7 +155,8 @@ export class ViewSnapshot {
     query: Query,
     documents: DocumentSet,
     mutatedKeys: DocumentKeySet,
-    fromCache: boolean
+    fromCache: boolean,
+    hasCachedResults: boolean
   ): ViewSnapshot {
     const changes: DocumentViewChange[] = [];
     documents.forEach(doc => {
@@ -169,7 +171,8 @@ export class ViewSnapshot {
       mutatedKeys,
       fromCache,
       /* syncStateChanged= */ true,
-      /* excludesMetadataChanges= */ false
+      /* excludesMetadataChanges= */ false,
+      hasCachedResults
     );
   }
 
@@ -180,9 +183,10 @@ export class ViewSnapshot {
   isEqual(other: ViewSnapshot): boolean {
     if (
       this.fromCache !== other.fromCache ||
+      this.hasCachedResults !== other.hasCachedResults ||
       this.syncStateChanged !== other.syncStateChanged ||
       !this.mutatedKeys.isEqual(other.mutatedKeys) ||
-      !this.query.isEqual(other.query) ||
+      !queryEquals(this.query, other.query) ||
       !this.docs.isEqual(other.docs) ||
       !this.oldDocs.isEqual(other.oldDocs)
     ) {

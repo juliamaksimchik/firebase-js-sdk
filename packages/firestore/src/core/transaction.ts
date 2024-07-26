@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,8 @@
  * limitations under the License.
  */
 
-import { ParsedSetData, ParsedUpdateData } from '../api/user_data_converter';
-import { documentVersionMap } from '../model/collections';
-import { Document, NoDocument, MaybeDocument } from '../model/document';
-
+import { ParsedSetData, ParsedUpdateData } from '../lite-api/user_data_reader';
+import { Document } from '../model/document';
 import { DocumentKey } from '../model/document_key';
 import {
   DeleteMutation,
@@ -26,9 +24,14 @@ import {
   Precondition,
   VerifyMutation
 } from '../model/mutation';
-import { Datastore } from '../remote/datastore';
-import { fail, assert } from '../util/assert';
+import {
+  Datastore,
+  invokeBatchGetDocumentsRpc,
+  invokeCommitRpc
+} from '../remote/datastore';
+import { fail, debugAssert } from '../util/assert';
 import { Code, FirestoreError } from '../util/error';
+
 import { SnapshotVersion } from './snapshot_version';
 
 /**
@@ -37,7 +40,7 @@ import { SnapshotVersion } from './snapshot_version';
  */
 export class Transaction {
   // The version of each document that was read during this transaction.
-  private readVersions = documentVersionMap();
+  private readVersions = new Map</* path */ string, SnapshotVersion>();
   private mutations: Mutation[] = [];
   private committed = false;
 
@@ -45,7 +48,7 @@ export class Transaction {
    * A deferred usage error that occurred previously in this transaction that
    * will cause the transaction to fail once it actually commits.
    */
-  private lastWriteError: FirestoreError | null = null;
+  private lastTransactionError: FirestoreError | null = null;
 
   /**
    * Set of documents that have been written in the transaction.
@@ -53,83 +56,79 @@ export class Transaction {
    * When there's more than one write to the same key in a transaction, any
    * writes after the first are handled differently.
    */
-  private writtenDocs: Set<DocumentKey> = new Set();
+  private writtenDocs: Set</* path= */ string> = new Set();
 
   constructor(private datastore: Datastore) {}
 
-  async lookup(keys: DocumentKey[]): Promise<MaybeDocument[]> {
+  async lookup(keys: DocumentKey[]): Promise<Document[]> {
     this.ensureCommitNotCalled();
 
     if (this.mutations.length > 0) {
-      throw new FirestoreError(
+      this.lastTransactionError = new FirestoreError(
         Code.INVALID_ARGUMENT,
         'Firestore transactions require all reads to be executed before all writes.'
       );
+      throw this.lastTransactionError;
     }
-    const docs = await this.datastore.lookup(keys);
-    docs.forEach(doc => {
-      if (doc instanceof NoDocument || doc instanceof Document) {
-        this.recordVersion(doc);
-      } else {
-        fail('Document in a transaction was a ' + doc.constructor.name);
-      }
-    });
+    const docs = await invokeBatchGetDocumentsRpc(this.datastore, keys);
+    docs.forEach(doc => this.recordVersion(doc));
     return docs;
   }
 
   set(key: DocumentKey, data: ParsedSetData): void {
-    this.write(data.toMutations(key, this.precondition(key)));
-    this.writtenDocs.add(key);
+    this.write(data.toMutation(key, this.precondition(key)));
+    this.writtenDocs.add(key.toString());
   }
 
   update(key: DocumentKey, data: ParsedUpdateData): void {
     try {
-      this.write(data.toMutations(key, this.preconditionForUpdate(key)));
+      this.write(data.toMutation(key, this.preconditionForUpdate(key)));
     } catch (e) {
-      this.lastWriteError = e;
+      this.lastTransactionError = e as FirestoreError | null;
     }
-    this.writtenDocs.add(key);
+    this.writtenDocs.add(key.toString());
   }
 
   delete(key: DocumentKey): void {
-    this.write([new DeleteMutation(key, this.precondition(key))]);
-    this.writtenDocs.add(key);
+    this.write(new DeleteMutation(key, this.precondition(key)));
+    this.writtenDocs.add(key.toString());
   }
 
   async commit(): Promise<void> {
     this.ensureCommitNotCalled();
 
-    if (this.lastWriteError) {
-      throw this.lastWriteError;
+    if (this.lastTransactionError) {
+      throw this.lastTransactionError;
     }
-    let unwritten = this.readVersions;
+    const unwritten = this.readVersions;
     // For each mutation, note that the doc was written.
     this.mutations.forEach(mutation => {
-      unwritten = unwritten.remove(mutation.key);
+      unwritten.delete(mutation.key.toString());
     });
     // For each document that was read but not written to, we want to perform
     // a `verify` operation.
-    unwritten.forEach((key, _version) => {
+    unwritten.forEach((_, path) => {
+      const key = DocumentKey.fromPath(path);
       this.mutations.push(new VerifyMutation(key, this.precondition(key)));
     });
-    await this.datastore.commit(this.mutations);
+    await invokeCommitRpc(this.datastore, this.mutations);
     this.committed = true;
   }
 
-  private recordVersion(doc: MaybeDocument): void {
+  private recordVersion(doc: Document): void {
     let docVersion: SnapshotVersion;
 
-    if (doc instanceof Document) {
+    if (doc.isFoundDocument()) {
       docVersion = doc.version;
-    } else if (doc instanceof NoDocument) {
-      // For deleted docs, we must use baseVersion 0 when we overwrite them.
-      docVersion = SnapshotVersion.forDeletedDoc();
+    } else if (doc.isNoDocument()) {
+      // Represent a deleted doc using SnapshotVersion.min().
+      docVersion = SnapshotVersion.min();
     } else {
       throw fail('Document in a transaction was a ' + doc.constructor.name);
     }
 
-    const existingVersion = this.readVersions.get(doc.key);
-    if (existingVersion !== null) {
+    const existingVersion = this.readVersions.get(doc.key.toString());
+    if (existingVersion) {
       if (!docVersion.isEqual(existingVersion)) {
         // This transaction will fail no matter what.
         throw new FirestoreError(
@@ -138,7 +137,7 @@ export class Transaction {
         );
       }
     } else {
-      this.readVersions = this.readVersions.insert(doc.key, docVersion);
+      this.readVersions.set(doc.key.toString(), docVersion);
     }
   }
 
@@ -147,11 +146,15 @@ export class Transaction {
    * as a precondition, or no precondition if it was not read.
    */
   private precondition(key: DocumentKey): Precondition {
-    const version = this.readVersions.get(key);
-    if (!this.writtenDocs.has(key) && version) {
-      return Precondition.updateTime(version);
+    const version = this.readVersions.get(key.toString());
+    if (!this.writtenDocs.has(key.toString()) && version) {
+      if (version.isEqual(SnapshotVersion.min())) {
+        return Precondition.exists(false);
+      } else {
+        return Precondition.updateTime(version);
+      }
     } else {
-      return Precondition.NONE;
+      return Precondition.none();
     }
   }
 
@@ -159,11 +162,11 @@ export class Transaction {
    * Returns the precondition for a document if the operation is an update.
    */
   private preconditionForUpdate(key: DocumentKey): Precondition {
-    const version = this.readVersions.get(key);
+    const version = this.readVersions.get(key.toString());
     // The first time a document is written, we want to take into account the
     // read time and existence
-    if (!this.writtenDocs.has(key) && version) {
-      if (version.isEqual(SnapshotVersion.forDeletedDoc())) {
+    if (!this.writtenDocs.has(key.toString()) && version) {
+      if (version.isEqual(SnapshotVersion.min())) {
         // The document doesn't exist, so fail the transaction.
 
         // This has to be validated locally because you can't send a
@@ -189,13 +192,13 @@ export class Transaction {
     }
   }
 
-  private write(mutations: Mutation[]): void {
+  private write(mutation: Mutation): void {
     this.ensureCommitNotCalled();
-    this.mutations = this.mutations.concat(mutations);
+    this.mutations.push(mutation);
   }
 
   private ensureCommitNotCalled(): void {
-    assert(
+    debugAssert(
       !this.committed,
       'A transaction object cannot be used after its update callback has been invoked.'
     );

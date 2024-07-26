@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,45 +15,48 @@
  * limitations under the License.
  */
 
-import { Deferred } from '../util/promise';
-import { TimerId, AsyncQueue } from '../util/async_queue';
 import { ExponentialBackoff } from '../remote/backoff';
-import { Transaction } from './transaction';
-import { RemoteStore } from '../remote/remote_store';
-import { isNullOrUndefined } from '../util/types';
+import { Datastore } from '../remote/datastore';
 import { isPermanentError } from '../remote/rpc_error';
+import { AsyncQueue, TimerId } from '../util/async_queue';
 import { FirestoreError } from '../util/error';
+import { Deferred } from '../util/promise';
+import { isNullOrUndefined } from '../util/types';
 
-const RETRY_COUNT = 5;
+import { Transaction } from './transaction';
+import { TransactionOptions } from './transaction_options';
 
 /**
  * TransactionRunner encapsulates the logic needed to run and retry transactions
  * with backoff.
  */
 export class TransactionRunner<T> {
-  private retries = RETRY_COUNT;
+  private attemptsRemaining: number;
   private backoff: ExponentialBackoff;
 
   constructor(
     private readonly asyncQueue: AsyncQueue,
-    private readonly remoteStore: RemoteStore,
+    private readonly datastore: Datastore,
+    private readonly options: TransactionOptions,
     private readonly updateFunction: (transaction: Transaction) => Promise<T>,
     private readonly deferred: Deferred<T>
   ) {
+    this.attemptsRemaining = options.maxAttempts;
     this.backoff = new ExponentialBackoff(
       this.asyncQueue,
-      TimerId.RetryTransaction
+      TimerId.TransactionRetry
     );
   }
 
   /** Runs the transaction and sets the result on deferred. */
   run(): void {
+    this.attemptsRemaining -= 1;
     this.runWithBackOff();
   }
 
   private runWithBackOff(): void {
     this.backoff.backoffAndRun(async () => {
-      const transaction = this.remoteStore.createTransaction();
+      const transaction = new Transaction(this.datastore);
       const userPromise = this.tryRunUpdateFunction(transaction);
       if (userPromise) {
         userPromise
@@ -92,14 +95,14 @@ export class TransactionRunner<T> {
       return userPromise;
     } catch (error) {
       // Do not retry errors thrown by user provided updateFunction.
-      this.deferred.reject(error);
+      this.deferred.reject(error as Error);
       return null;
     }
   }
 
   private handleTransactionError(error: Error): void {
-    if (this.retries > 0 && this.isRetryableTransactionError(error)) {
-      this.retries -= 1;
+    if (this.attemptsRemaining > 0 && this.isRetryableTransactionError(error)) {
+      this.attemptsRemaining -= 1;
       this.asyncQueue.enqueueAndForget(() => {
         this.runWithBackOff();
         return Promise.resolve();
@@ -117,6 +120,7 @@ export class TransactionRunner<T> {
       return (
         code === 'aborted' ||
         code === 'failed-precondition' ||
+        code === 'already-exists' ||
         !isPermanentError(code)
       );
     }

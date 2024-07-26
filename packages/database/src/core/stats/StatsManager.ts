@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,33 +15,32 @@
  * limitations under the License.
  */
 
-import { StatsCollection } from './StatsCollection';
 import { RepoInfo } from '../RepoInfo';
 
-export class StatsManager {
-  private static collections_: { [k: string]: StatsCollection } = {};
-  private static reporters_: { [k: string]: unknown } = {};
+import { StatsCollection } from './StatsCollection';
 
-  static getCollection(repoInfo: RepoInfo): StatsCollection {
-    const hashString = repoInfo.toString();
+const collections: { [k: string]: StatsCollection } = {};
+const reporters: { [k: string]: unknown } = {};
 
-    if (!this.collections_[hashString]) {
-      this.collections_[hashString] = new StatsCollection();
-    }
+export function statsManagerGetCollection(repoInfo: RepoInfo): StatsCollection {
+  const hashString = repoInfo.toString();
 
-    return this.collections_[hashString];
+  if (!collections[hashString]) {
+    collections[hashString] = new StatsCollection();
   }
 
-  static getOrCreateReporter<T>(
-    repoInfo: RepoInfo,
-    creatorFunction: () => T
-  ): T {
-    const hashString = repoInfo.toString();
+  return collections[hashString];
+}
 
-    if (!this.reporters_[hashString]) {
-      this.reporters_[hashString] = creatorFunction();
-    }
+export function statsManagerGetOrCreateReporter<T>(
+  repoInfo: RepoInfo,
+  creatorFunction: () => T
+): T {
+  const hashString = repoInfo.toString();
 
-    return this.reporters_[hashString] as T;
+  if (!reporters[hashString]) {
+    reporters[hashString] = creatorFunction();
   }
+
+  return reporters[hashString] as T;
 }

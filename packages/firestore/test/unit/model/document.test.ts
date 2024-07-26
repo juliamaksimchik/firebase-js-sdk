@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,14 @@
  */
 
 import { expect } from 'chai';
-import { expectEqual, expectNotEqual, doc, field } from '../../util/helpers';
+
+import {
+  doc,
+  expectEqual,
+  expectNotEqual,
+  field,
+  wrap
+} from '../../util/helpers';
 
 describe('Document', () => {
   it('can be constructed', () => {
@@ -26,11 +33,13 @@ describe('Document', () => {
     };
     const document = doc('rooms/Eros', 1, data);
 
-    const value = document.value();
-    expect(value).to.deep.equal({
-      desc: 'Discuss all the project related stuff',
-      owner: 'Jonny'
-    });
+    const value = document.data;
+    expect(value.value).to.deep.equal(
+      wrap({
+        desc: 'Discuss all the project related stuff',
+        owner: 'Jonny'
+      })
+    );
     expect(value).not.to.equal(data);
     expect(document.hasLocalMutations).to.equal(false);
   });
@@ -40,13 +49,13 @@ describe('Document', () => {
       desc: 'Discuss all the project related stuff',
       owner: { name: 'Jonny', title: 'scallywag' }
     };
-    const document = doc('rooms/Eros', 1, data, { hasLocalMutations: true });
+    const document = doc('rooms/Eros', 1, data).setHasLocalMutations();
 
-    expect(document.field(field('desc'))!.value()).to.deep.equal(
-      'Discuss all the project related stuff'
+    expect(document.data.field(field('desc'))).to.deep.equal(
+      wrap('Discuss all the project related stuff')
     );
-    expect(document.field(field('owner.title'))!.value()).to.deep.equal(
-      'scallywag'
+    expect(document.data.field(field('owner.title'))).to.deep.equal(
+      wrap('scallywag')
     );
     expect(document.hasLocalMutations).to.equal(true);
   });
@@ -67,8 +76,8 @@ describe('Document', () => {
     );
     expectNotEqual(doc('a/b', 1, { foo: 'bar' }), doc('a/b', 1, { foo: 100 }));
     expectNotEqual(
-      doc('a/b', 1, { foo: 'bar' }, { hasLocalMutations: true }),
-      doc('a/b', 1, { foo: 'bar' }, { hasLocalMutations: false })
+      doc('a/b', 1, { foo: 'bar' }).setHasLocalMutations(),
+      doc('a/b', 1, { foo: 'bar' })
     );
   });
 });

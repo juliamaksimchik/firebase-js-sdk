@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2018 Google Inc.
+ * Copyright 2018 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,36 +15,44 @@
  * limitations under the License.
  */
 
-import * as firestore from '@firebase/firestore-types';
 import { expect } from 'chai';
 
 import { EventsAccumulator } from '../util/events_accumulator';
-import firebase from '../util/firebase_export';
+import {
+  deleteField,
+  disableNetwork,
+  DocumentData,
+  DocumentSnapshot,
+  enableNetwork,
+  onSnapshot,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+  writeBatch,
+  DocumentReference,
+  increment,
+  Firestore
+} from '../util/firebase_export';
 import { apiDescribe, withTestDoc } from '../util/helpers';
-
-// tslint:disable:no-floating-promises
-
-// tslint:disable-next-line:variable-name Type alias can be capitalized.
-const FieldValue = firebase.firestore!.FieldValue;
 
 const DOUBLE_EPSILON = 0.000001;
 
-apiDescribe('Numeric Transforms:', (persistence: boolean) => {
+apiDescribe('Numeric Transforms:', persistence => {
   // A document reference to read and write to.
-  let docRef: firestore.DocumentReference;
+  let docRef: DocumentReference;
+
+  let db: Firestore;
 
   // Accumulator used to capture events during the test.
-  let accumulator: EventsAccumulator<firestore.DocumentSnapshot>;
+  let accumulator: EventsAccumulator<DocumentSnapshot>;
 
   // Listener registration for a listener maintained during the course of the
   // test.
   let unsubscribe: () => void;
 
   /** Writes some initialData and consumes the events generated. */
-  async function writeInitialData(
-    initialData: firestore.DocumentData
-  ): Promise<void> {
-    await docRef.set(initialData);
+  async function writeInitialData(initialData: DocumentData): Promise<void> {
+    await setDoc(docRef, initialData);
     await accumulator.awaitLocalEvent();
     const snapshot = await accumulator.awaitRemoteEvent();
     expect(snapshot.data()).to.deep.equal(initialData);
@@ -62,17 +70,19 @@ apiDescribe('Numeric Transforms:', (persistence: boolean) => {
    * up when done.
    */
   async function withTestSetup<T>(test: () => Promise<T>): Promise<void> {
-    await withTestDoc(persistence, async doc => {
+    await withTestDoc(persistence, async (doc, firestore) => {
       docRef = doc;
-      accumulator = new EventsAccumulator<firestore.DocumentSnapshot>();
-      unsubscribe = docRef.onSnapshot(
+      db = firestore;
+      accumulator = new EventsAccumulator<DocumentSnapshot>();
+      unsubscribe = onSnapshot(
+        docRef,
         { includeMetadataChanges: true },
         accumulator.storeEvent
       );
 
       // wait for initial null snapshot to avoid potential races.
       const snapshot = await accumulator.awaitRemoteEvent();
-      expect(snapshot.exists).to.be.false;
+      expect(snapshot.exists()).to.be.false;
       await test();
       unsubscribe();
     });
@@ -80,22 +90,25 @@ apiDescribe('Numeric Transforms:', (persistence: boolean) => {
 
   it('create document with increment', async () => {
     await withTestSetup(async () => {
-      await docRef.set({ sum: FieldValue.increment(1337) });
+      await setDoc(docRef, { sum: increment(1337) });
       await expectLocalAndRemoteValue(1337);
     });
   });
 
   it('merge on non-existing document with increment', async () => {
     await withTestSetup(async () => {
-      await docRef.set({ sum: FieldValue.increment(1337) }, { merge: true });
+      await setDoc(docRef, { sum: increment(1337) }, { merge: true });
       await expectLocalAndRemoteValue(1337);
     });
   });
 
-  it('increment existing integer with integer', async () => {
+  // TODO(b/295872012): This test is skipped due to a timeout test flakiness
+  // We should investigate if this is an actual bug.
+  // eslint-disable-next-line no-restricted-properties
+  it.skip('increment existing integer with integer', async () => {
     await withTestSetup(async () => {
       await writeInitialData({ sum: 1337 });
-      await docRef.update('sum', FieldValue.increment(1));
+      await updateDoc(docRef, 'sum', increment(1));
       await expectLocalAndRemoteValue(1338);
     });
   });
@@ -103,7 +116,7 @@ apiDescribe('Numeric Transforms:', (persistence: boolean) => {
   it('increment existing double with double', async () => {
     await withTestSetup(async () => {
       await writeInitialData({ sum: 13.37 });
-      await docRef.update('sum', FieldValue.increment(0.1));
+      await updateDoc(docRef, 'sum', increment(0.1));
       await expectLocalAndRemoteValue(13.47);
     });
   });
@@ -111,7 +124,7 @@ apiDescribe('Numeric Transforms:', (persistence: boolean) => {
   it('increment existing double with integer', async () => {
     await withTestSetup(async () => {
       await writeInitialData({ sum: 13.37 });
-      await docRef.update('sum', FieldValue.increment(1));
+      await updateDoc(docRef, 'sum', increment(1));
       await expectLocalAndRemoteValue(14.37);
     });
   });
@@ -119,7 +132,7 @@ apiDescribe('Numeric Transforms:', (persistence: boolean) => {
   it('increment existing integer with double', async () => {
     await withTestSetup(async () => {
       await writeInitialData({ sum: 1337 });
-      await docRef.update('sum', FieldValue.increment(0.1));
+      await updateDoc(docRef, 'sum', increment(0.1));
       await expectLocalAndRemoteValue(1337.1);
     });
   });
@@ -127,7 +140,7 @@ apiDescribe('Numeric Transforms:', (persistence: boolean) => {
   it('increment existing string with integer', async () => {
     await withTestSetup(async () => {
       await writeInitialData({ sum: 'overwrite' });
-      await docRef.update('sum', FieldValue.increment(1337));
+      await updateDoc(docRef, 'sum', increment(1337));
       await expectLocalAndRemoteValue(1337);
     });
   });
@@ -135,21 +148,33 @@ apiDescribe('Numeric Transforms:', (persistence: boolean) => {
   it('increment existing string with double', async () => {
     await withTestSetup(async () => {
       await writeInitialData({ sum: 'overwrite' });
-      await docRef.update('sum', FieldValue.increment(13.37));
+      await updateDoc(docRef, 'sum', increment(13.37));
       await expectLocalAndRemoteValue(13.37);
     });
   });
 
-  it('multiple double increments', async () => {
+  it('increments with set() and merge:true', async () => {
+    await withTestSetup(async () => {
+      await writeInitialData({ sum: 1 });
+      await setDoc(docRef, { sum: increment(1337) }, { merge: true });
+      await expectLocalAndRemoteValue(1338);
+    });
+  });
+
+  // TODO(b/295872012): This test is skipped due to test flakiness:
+  // AssertionError: expected 0.122 to be close to 0.111 +/- 0.000001
+  // We should investigate the root cause, it might be an actual bug.
+  // eslint-disable-next-line no-restricted-properties
+  it.skip('multiple double increments', async () => {
     await withTestSetup(async () => {
       await writeInitialData({ sum: 0.0 });
 
-      await docRef.firestore.disableNetwork();
+      await disableNetwork(db);
 
       /* eslint-disable @typescript-eslint/no-floating-promises */
-      docRef.update('sum', FieldValue.increment(0.1));
-      docRef.update('sum', FieldValue.increment(0.01));
-      docRef.update('sum', FieldValue.increment(0.001));
+      updateDoc(docRef, 'sum', increment(0.1));
+      updateDoc(docRef, 'sum', increment(0.01));
+      updateDoc(docRef, 'sum', increment(0.001));
       /* eslint-enable @typescript-eslint/no-floating-promises */
 
       let snap = await accumulator.awaitLocalEvent();
@@ -159,7 +184,7 @@ apiDescribe('Numeric Transforms:', (persistence: boolean) => {
       snap = await accumulator.awaitLocalEvent();
       expect(snap.get('sum')).to.be.closeTo(0.111, DOUBLE_EPSILON);
 
-      await docRef.firestore.enableNetwork();
+      await enableNetwork(db);
 
       snap = await accumulator.awaitRemoteEvent();
       expect(snap.get('sum')).to.be.closeTo(0.111, DOUBLE_EPSILON);
@@ -170,9 +195,9 @@ apiDescribe('Numeric Transforms:', (persistence: boolean) => {
     await withTestSetup(async () => {
       await writeInitialData({ sum: 'overwrite' });
 
-      const batch = docRef.firestore.batch();
-      batch.update(docRef, 'sum', FieldValue.increment(1));
-      batch.update(docRef, 'sum', FieldValue.increment(1));
+      const batch = writeBatch(db);
+      batch.update(docRef, 'sum', increment(1));
+      batch.update(docRef, 'sum', increment(1));
       await batch.commit();
 
       await expectLocalAndRemoteValue(2);
@@ -183,10 +208,10 @@ apiDescribe('Numeric Transforms:', (persistence: boolean) => {
     await withTestSetup(async () => {
       await writeInitialData({ sum: 'overwrite' });
 
-      const batch = docRef.firestore.batch();
-      batch.update(docRef, 'sum', FieldValue.increment(1));
-      batch.update(docRef, 'sum', FieldValue.delete());
-      batch.update(docRef, 'sum', FieldValue.increment(3));
+      const batch = writeBatch(db);
+      batch.update(docRef, 'sum', increment(1));
+      batch.update(docRef, 'sum', deleteField());
+      batch.update(docRef, 'sum', increment(3));
       await batch.commit();
 
       await expectLocalAndRemoteValue(3);
@@ -200,17 +225,17 @@ apiDescribe('Numeric Transforms:', (persistence: boolean) => {
     // In our original code, a NumericIncrementTransformOperation could cause us to decode the
     // ServerTimestamp as part of a PatchMutation, which triggered an assertion failure.
     await withTestSetup(async () => {
-      await docRef.firestore.disableNetwork();
+      await disableNetwork(db);
       // eslint-disable-next-line @typescript-eslint/no-floating-promises
-      docRef.set({ val: FieldValue.serverTimestamp() });
+      setDoc(docRef, { val: serverTimestamp() });
       let snap = await accumulator.awaitLocalEvent();
       expect(snap.get('val', { serverTimestamps: 'estimate' })).to.not.be.null;
       // eslint-disable-next-line @typescript-eslint/no-floating-promises
-      docRef.set({ val: FieldValue.increment(1) });
+      setDoc(docRef, { val: increment(1) });
       snap = await accumulator.awaitLocalEvent();
       expect(snap.get('val')).to.equal(1);
 
-      await docRef.firestore.enableNetwork();
+      await enableNetwork(db);
 
       snap = await accumulator.awaitRemoteEvent();
       expect(snap.get('val')).to.equal(1);

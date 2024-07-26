@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
  */
 
 import { expect } from 'chai';
+
 import { FieldPath, ResourcePath } from '../../../src/model/path';
 import { addEqualityMatcher } from '../../util/equality_matcher';
 import { path } from '../../util/helpers';
@@ -68,12 +69,9 @@ describe('Path', () => {
     expect(path.popFirst().popFirst()).to.deep.equal(
       new ResourcePath(['messages'])
     );
-    expect(
-      path
-        .popFirst()
-        .popFirst()
-        .popFirst()
-    ).to.deep.equal(new ResourcePath([]));
+    expect(path.popFirst().popFirst().popFirst()).to.deep.equal(
+      new ResourcePath([])
+    );
     expect(path.popFirst(0)).to.deep.equal(
       new ResourcePath(['rooms', 'Eros', 'messages'])
     );
@@ -91,12 +89,7 @@ describe('Path', () => {
 
     expect(path.lastSegment()).to.equal('messages');
     expect(path.popLast().lastSegment()).to.equal('Eros');
-    expect(
-      path
-        .popLast()
-        .popLast()
-        .lastSegment()
-    ).to.equal('rooms');
+    expect(path.popLast().popLast().lastSegment()).to.equal('rooms');
   });
 
   it('can create child path', () => {
@@ -113,12 +106,9 @@ describe('Path', () => {
 
     expect(path.popLast()).to.deep.equal(new ResourcePath(['rooms', 'Eros']));
     expect(path.popLast().popLast()).to.deep.equal(new ResourcePath(['rooms']));
-    expect(
-      path
-        .popLast()
-        .popLast()
-        .popLast()
-    ).to.deep.equal(new ResourcePath([]));
+    expect(path.popLast().popLast().popLast()).to.deep.equal(
+      new ResourcePath([])
+    );
 
     // original remains unmodified
     expect(path).to.deep.equal(new ResourcePath(['rooms', 'Eros', 'messages']));
@@ -169,6 +159,11 @@ describe('Path', () => {
     expect(abc.isPrefixOf(empty)).to.equal(false);
     expect(abc.isPrefixOf(b)).to.equal(false);
     expect(abc.isPrefixOf(ba)).to.equal(false);
+  });
+
+  it('escapes FieldPath with segments', () => {
+    const path = new FieldPath(['\\foo\\.`bar`']);
+    expect(path.canonicalString()).to.equal('`\\\\foo\\\\.\\`bar\\``');
   });
 
   it('can be constructed from field path.', () => {

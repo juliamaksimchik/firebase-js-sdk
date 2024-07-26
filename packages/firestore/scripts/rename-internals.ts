@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2020 Google Inc.
+ * Copyright 2020 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,10 @@
  * limitations under the License.
  */
 
-// eslint-disable-next-line import/no-extraneous-dependencies
 import * as ts from 'typescript';
 
 // `undefined` is treated as an identifier by TSC, but not part of any externs.
-const blacklist = ['undefined'];
+const ignoredIdentifiers = ['undefined'];
 
 /**
  * Processes TypeScript source files and renames all identifiers that do not
@@ -47,9 +46,11 @@ class RenameInternals {
       const name = node.escapedText.toString();
       if (
         !this.publicApi.has(name) &&
-        blacklist.indexOf(node.escapedText.toString()) === -1
+        ignoredIdentifiers.indexOf(node.escapedText.toString()) === -1
       ) {
-        return ts.createIdentifier(this.prefix + name);
+        const newIdentifier = ts.createIdentifier(this.prefix + name);
+        ts.setSourceMapRange(newIdentifier, ts.getSourceMapRange(node));
+        return newIdentifier;
       }
     }
 
@@ -64,7 +65,7 @@ export interface SDKMinifierOptions {
   publicIdentifiers: Set<string>;
   /**
    * A prefix to append to all identifiers that are not referencing the Public
-   * API. Defauls to '_'.
+   * API. Defaults to '_'.
    */
   prefix?: string;
 }

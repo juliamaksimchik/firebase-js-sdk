@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2018 Google Inc.
+ * Copyright 2018 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,28 +19,37 @@
 import { spawn } from 'child-process-promise';
 import { ChildProcess } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
-import * as request from 'request';
+import fetch from 'node-fetch';
 // @ts-ignore
 import * as tmp from 'tmp';
-
-export interface ChildProcessPromise extends Promise<void> {
-  childProcess: ChildProcess;
-}
 
 export abstract class Emulator {
   binaryPath: string | null = null;
   emulator: ChildProcess | null = null;
 
+  cacheDirectory: string;
+  cacheBinaryPath: string;
+
   constructor(
     private binaryName: string,
     private binaryUrl: string,
-    public port: number
-  ) {}
+    public readonly port: number
+  ) {
+    this.cacheDirectory = path.join(os.homedir(), `.cache/firebase-js-sdk`);
+    this.cacheBinaryPath = path.join(this.cacheDirectory, binaryName);
+  }
 
   download(): Promise<void> {
+    if (fs.existsSync(this.cacheBinaryPath)) {
+      console.log(`Emulator found in cache: ${this.cacheBinaryPath}`);
+      this.binaryPath = this.cacheBinaryPath;
+      return Promise.resolve();
+    }
+
     return new Promise<void>((resolve, reject) => {
-      tmp.dir((err: Error, dir: string) => {
+      tmp.dir((err: Error | null, dir: string) => {
         if (err) reject(err);
 
         console.log(`Created temporary directory at [${dir}].`);
@@ -48,21 +57,29 @@ export abstract class Emulator {
         const writeStream: fs.WriteStream = fs.createWriteStream(filepath);
 
         console.log(`Downloading emulator from [${this.binaryUrl}] ...`);
-        request(this.binaryUrl)
-          .pipe(writeStream)
-          .on('finish', () => {
-            console.log(`Saved emulator binary file to [${filepath}].`);
-            // Change emulator binary file permission to 'rwxr-xr-x'.
-            // The execute permission is required for it to be able to start
-            // with 'java -jar'.
-            fs.chmod(filepath, 0o755, err => {
-              if (err) reject(err);
-              console.log(`Changed emulator file permissions to 'rwxr-xr-x'.`);
-              this.binaryPath = filepath;
-              resolve();
-            });
-          })
-          .on('error', reject);
+        fetch(this.binaryUrl).then(resp => {
+          resp.body
+            .pipe(writeStream)
+            .on('finish', () => {
+              console.log(`Saved emulator binary file to [${filepath}].`);
+              // Change emulator binary file permission to 'rwxr-xr-x'.
+              // The execute permission is required for it to be able to start
+              // with 'java -jar'.
+              fs.chmod(filepath, 0o755, err => {
+                if (err) reject(err);
+                console.log(
+                  `Changed emulator file permissions to 'rwxr-xr-x'.`
+                );
+                this.binaryPath = filepath;
+
+                if (this.copyToCache()) {
+                  console.log(`Cached emulator at ${this.cacheBinaryPath}`);
+                }
+                resolve();
+              });
+            })
+            .on('error', reject);
+        });
       });
     });
   }
@@ -72,9 +89,14 @@ export abstract class Emulator {
       if (!this.binaryPath) {
         throw new Error('You must call download() before setUp()');
       }
-      const promise: ChildProcessPromise = spawn(
+      const promise = spawn(
         'java',
-        ['-jar', path.basename(this.binaryPath), '--port', this.port],
+        [
+          '-jar',
+          path.basename(this.binaryPath),
+          '--port',
+          this.port.toString()
+        ],
         {
           cwd: path.dirname(this.binaryPath),
           stdio: 'inherit'
@@ -97,20 +119,18 @@ export abstract class Emulator {
         if (elapsed > timeout) {
           reject(`Emulator not ready after ${timeout}s. Exiting ...`);
         } else {
-          console.log(`Ping emulator at [http://localhost:${this.port}] ...`);
-          request(`http://localhost:${this.port}`, (error, response) => {
-            if (error && error.code === 'ECONNREFUSED') {
-              setTimeout(wait, 1000, resolve, reject);
-            } else if (response) {
+          console.log(`Ping emulator at [http://127.0.0.1:${this.port}] ...`);
+          fetch(`http://127.0.0.1:${this.port}`).then(
+            () => {
               // Database and Firestore emulators will return 400 and 200 respectively.
               // As long as we get a response back, it means the emulator is ready.
               console.log(`Emulator has started up after ${elapsed}s!`);
               resolve();
-            } else {
-              // This should not happen.
-              reject({ error, response });
+            },
+            error => {
+              setTimeout(wait, 1000, resolve, reject);
             }
-          });
+          );
         }
       };
       setTimeout(wait, 1000, resolve, reject);
@@ -122,5 +142,29 @@ export abstract class Emulator {
       console.log(`Shutting down emulator, pid: [${this.emulator.pid}] ...`);
       this.emulator.kill();
     }
+
+    if (this.binaryPath) {
+      console.log(`Deleting the emulator jar at ${this.binaryPath}`);
+      fs.unlinkSync(this.binaryPath);
+    }
+  }
+
+  private copyToCache(): boolean {
+    if (!this.binaryPath) {
+      return false;
+    }
+
+    try {
+      if (!fs.existsSync(this.cacheDirectory)) {
+        fs.mkdirSync(this.cacheDirectory, { recursive: true });
+      }
+      fs.copyFileSync(this.binaryPath, this.cacheBinaryPath);
+
+      return true;
+    } catch (e) {
+      console.warn(`Unable to cache ${this.binaryName}`, e);
+    }
+
+    return false;
   }
 }

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-import { assert, fail } from '../util/assert';
+import { debugAssert, fail } from '../util/assert';
 import { Code, FirestoreError } from '../util/error';
 
 export const DOCUMENT_KEY_NAME = '__name__';
@@ -90,7 +90,10 @@ abstract class BasePath<B extends BasePath<B>> {
 
   popFirst(size?: number): B {
     size = size === undefined ? 1 : size;
-    assert(this.length >= size, "Can't call popFirst() with less segments");
+    debugAssert(
+      this.length >= size,
+      "Can't call popFirst() with less segments"
+    );
     return this.construct(
       this.segments,
       this.offset + size,
@@ -99,21 +102,22 @@ abstract class BasePath<B extends BasePath<B>> {
   }
 
   popLast(): B {
-    assert(!this.isEmpty(), "Can't call popLast() on empty path");
+    debugAssert(!this.isEmpty(), "Can't call popLast() on empty path");
     return this.construct(this.segments, this.offset, this.length - 1);
   }
 
   firstSegment(): string {
-    assert(!this.isEmpty(), "Can't call firstSegment() on empty path");
+    debugAssert(!this.isEmpty(), "Can't call firstSegment() on empty path");
     return this.segments[this.offset];
   }
 
   lastSegment(): string {
+    debugAssert(!this.isEmpty(), "Can't call lastSegment() on empty path");
     return this.get(this.length - 1);
   }
 
   get(index: number): string {
-    assert(index < this.length, 'Index out of range');
+    debugAssert(index < this.length, 'Index out of range');
     return this.segments[this.offset + index];
   }
 
@@ -187,6 +191,8 @@ abstract class BasePath<B extends BasePath<B>> {
 /**
  * A slash-separated path for navigating resources (documents and collections)
  * within Firestore.
+ *
+ * @internal
  */
 export class ResourcePath extends BasePath<ResourcePath> {
   protected construct(
@@ -210,33 +216,50 @@ export class ResourcePath extends BasePath<ResourcePath> {
   }
 
   /**
-   * Creates a resource path from the given slash-delimited string.
+   * Returns a string representation of this path
+   * where each path segment has been encoded with
+   * `encodeURIComponent`.
    */
-  static fromString(path: string): ResourcePath {
+  toUriEncodedString(): string {
+    return this.toArray().map(encodeURIComponent).join('/');
+  }
+
+  /**
+   * Creates a resource path from the given slash-delimited string. If multiple
+   * arguments are provided, all components are combined. Leading and trailing
+   * slashes from all components are ignored.
+   */
+  static fromString(...pathComponents: string[]): ResourcePath {
     // NOTE: The client is ignorant of any path segments containing escape
     // sequences (e.g. __id123__) and just passes them through raw (they exist
     // for legacy reasons and should not be used frequently).
 
-    if (path.indexOf('//') >= 0) {
-      throw new FirestoreError(
-        Code.INVALID_ARGUMENT,
-        `Invalid path (${path}). Paths must not contain // in them.`
-      );
+    const segments: string[] = [];
+    for (const path of pathComponents) {
+      if (path.indexOf('//') >= 0) {
+        throw new FirestoreError(
+          Code.INVALID_ARGUMENT,
+          `Invalid segment (${path}). Paths must not contain // in them.`
+        );
+      }
+      // Strip leading and trailing slashed.
+      segments.push(...path.split('/').filter(segment => segment.length > 0));
     }
-
-    // We may still have an empty segment at the beginning or end if they had a
-    // leading or trailing slash (which we allow).
-    const segments = path.split('/').filter(segment => segment.length > 0);
 
     return new ResourcePath(segments);
   }
 
-  static EMPTY_PATH = new ResourcePath([]);
+  static emptyPath(): ResourcePath {
+    return new ResourcePath([]);
+  }
 }
 
 const identifierRegExp = /^[_a-zA-Z][_a-zA-Z0-9]*$/;
 
-/** A dot-separated path for navigating sub-objects within a document. */
+/**
+ * A dot-separated path for navigating sub-objects within a document.
+ * @internal
+ */
 export class FieldPath extends BasePath<FieldPath> {
   protected construct(
     segments: string[],
@@ -257,7 +280,7 @@ export class FieldPath extends BasePath<FieldPath> {
   canonicalString(): string {
     return this.toArray()
       .map(str => {
-        str = str.replace('\\', '\\\\').replace('`', '\\`');
+        str = str.replace(/\\/g, '\\\\').replace(/`/g, '\\`');
         if (!FieldPath.isValidIdentifier(str)) {
           str = '`' + str + '`';
         }
@@ -354,5 +377,7 @@ export class FieldPath extends BasePath<FieldPath> {
     return new FieldPath(segments);
   }
 
-  static EMPTY_PATH = new FieldPath([]);
+  static emptyPath(): FieldPath {
+    return new FieldPath([]);
+  }
 }

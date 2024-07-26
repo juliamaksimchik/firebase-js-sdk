@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2020 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 import { stub, useFakeTimers, SinonFakeTimers, SinonStub } from 'sinon';
 import { expect } from 'chai';
 import { SettingsService } from './settings_service';
@@ -21,30 +22,45 @@ import { CONFIG_EXPIRY_LOCAL_STORAGE_KEY } from '../constants';
 import { setupApi, Api } from './api_service';
 import * as iidService from './iid_service';
 import { getConfig } from './remote_config_service';
-import { FirebaseApp } from '@firebase/app-types';
+import { FirebaseApp } from '@firebase/app';
 import '../../test/setup';
+import { FirebaseInstallations } from '@firebase/installations-types';
+import { PerformanceController } from '../controllers/perf';
 
 describe('Performance Monitoring > remote_config_service', () => {
   const IID = 'asd123';
   const AUTH_TOKEN = 'auth_token';
   const LOG_URL = 'https://firebaselogging.test.com';
+  const TRANSPORT_KEY = 'pseudo-transport-key';
   const LOG_SOURCE = 2;
-  const NETWORK_SAMPLIG_RATE = 0.25;
+  const NETWORK_SAMPLING_RATE = 0.25;
   const TRACE_SAMPLING_RATE = 0.5;
   const GLOBAL_CLOCK_NOW = 1556524895326;
   const STRINGIFIED_CONFIG = `{"entries":{"fpr_enabled":"true",\
-"fpr_log_endpoint_url":"https://firebaselogging.test.com",\
-"fpr_log_source":"2","fpr_vc_network_request_sampling_rate":"0.250000",\
-"fpr_vc_session_sampling_rate":"0.250000","fpr_vc_trace_sampling_rate":"0.500000"},\
-"state":"UPDATE"}`;
+  "fpr_log_endpoint_url":"https://firebaselogging.test.com",\
+  "fpr_log_transport_key":"pseudo-transport-key",\
+  "fpr_log_source":"2","fpr_vc_network_request_sampling_rate":"0.250000",\
+  "fpr_vc_session_sampling_rate":"0.250000","fpr_vc_trace_sampling_rate":"0.500000"},\
+  "state":"UPDATE"}`;
   const PROJECT_ID = 'project1';
   const APP_ID = '1:23r:web:fewq';
   const API_KEY = 'asdfghjk';
+  const NOT_VALID_CONFIG = 'not a valid config and should not be used';
 
   let clock: SinonFakeTimers;
 
   setupApi(self);
   const ApiInstance = Api.getInstance();
+
+  const fakeFirebaseApp = {
+    options: { projectId: PROJECT_ID, appId: APP_ID, apiKey: API_KEY }
+  } as unknown as FirebaseApp;
+
+  const fakeInstallations = {} as unknown as FirebaseInstallations;
+  const performanceController = new PerformanceController(
+    fakeFirebaseApp,
+    fakeInstallations
+  );
 
   function storageGetItemFakeFactory(
     expiry: string,
@@ -72,7 +88,7 @@ describe('Performance Monitoring > remote_config_service', () => {
     fetchConfig?: { reject: boolean; value?: Response }
   ): {
     storageGetItemStub: SinonStub<[string], string | null>;
-    fetchStub: SinonStub<[RequestInfo, RequestInit?], Promise<Response>>;
+    fetchStub: SinonStub<[RequestInfo | URL, RequestInit?], Promise<Response>>;
   } {
     const fetchStub = stub(self, 'fetch');
 
@@ -87,9 +103,6 @@ describe('Performance Monitoring > remote_config_service', () => {
     );
 
     clock = useFakeTimers(GLOBAL_CLOCK_NOW);
-    SettingsService.prototype.firebaseAppInstance = ({
-      options: { projectId: PROJECT_ID, appId: APP_ID, apiKey: API_KEY }
-    } as unknown) as FirebaseApp;
 
     // we need to stub the entire localStorage, because storage can't be stubbed in Firefox and IE.
     // stubbing on self(window) seems to only work the first time (at least in Firefox), the subsequent
@@ -122,15 +135,18 @@ describe('Performance Monitoring > remote_config_service', () => {
         config: STRINGIFIED_CONFIG
       });
 
-      await getConfig(IID);
+      await getConfig(performanceController, IID);
 
       expect(getItemStub).to.be.called;
       expect(SettingsService.getInstance().loggingEnabled).to.be.true;
       expect(SettingsService.getInstance().logEndPointUrl).to.equal(LOG_URL);
+      expect(SettingsService.getInstance().transportKey).to.equal(
+        TRANSPORT_KEY
+      );
       expect(SettingsService.getInstance().logSource).to.equal(LOG_SOURCE);
       expect(
         SettingsService.getInstance().networkRequestsSamplingRate
-      ).to.equal(NETWORK_SAMPLIG_RATE);
+      ).to.equal(NETWORK_SAMPLING_RATE);
       expect(SettingsService.getInstance().tracesSamplingRate).to.equal(
         TRACE_SAMPLING_RATE
       );
@@ -145,7 +161,7 @@ describe('Performance Monitoring > remote_config_service', () => {
         config: STRINGIFIED_CONFIG
       });
 
-      await getConfig(IID);
+      await getConfig(performanceController, IID);
 
       expect(fetchStub).not.to.be.called;
     });
@@ -159,15 +175,18 @@ describe('Performance Monitoring > remote_config_service', () => {
         { reject: false, value: new Response(STRINGIFIED_CONFIG) }
       );
 
-      await getConfig(IID);
+      await getConfig(performanceController, IID);
 
       expect(getItemStub).to.be.calledOnce;
       expect(SettingsService.getInstance().loggingEnabled).to.be.true;
       expect(SettingsService.getInstance().logEndPointUrl).to.equal(LOG_URL);
+      expect(SettingsService.getInstance().transportKey).to.equal(
+        TRANSPORT_KEY
+      );
       expect(SettingsService.getInstance().logSource).to.equal(LOG_SOURCE);
       expect(
         SettingsService.getInstance().networkRequestsSamplingRate
-      ).to.equal(NETWORK_SAMPLIG_RATE);
+      ).to.equal(NETWORK_SAMPLING_RATE);
       expect(SettingsService.getInstance().tracesSamplingRate).to.equal(
         TRACE_SAMPLING_RATE
       );
@@ -180,12 +199,12 @@ describe('Performance Monitoring > remote_config_service', () => {
       setup(
         {
           expiry: EXPIRY_LOCAL_STORAGE_VALUE,
-          config: 'not a valid config and should not be used'
+          config: NOT_VALID_CONFIG
         },
         { reject: true }
       );
 
-      await getConfig(IID);
+      await getConfig(performanceController, IID);
 
       expect(SettingsService.getInstance().loggingEnabled).to.equal(false);
     });
@@ -201,12 +220,12 @@ describe('Performance Monitoring > remote_config_service', () => {
       setup(
         {
           expiry: EXPIRY_LOCAL_STORAGE_VALUE,
-          config: 'not a valid config and should not be used'
+          config: NOT_VALID_CONFIG
         },
         { reject: false, value: new Response(STRINGIFIED_PARTIAL_CONFIG) }
       );
 
-      await getConfig(IID);
+      await getConfig(performanceController, IID);
 
       expect(SettingsService.getInstance().loggingEnabled).to.be.true;
     });
@@ -214,18 +233,52 @@ describe('Performance Monitoring > remote_config_service', () => {
     it('uses secondary configs if the response does not have any fields', async () => {
       // Expired local config.
       const EXPIRY_LOCAL_STORAGE_VALUE = '1556524895320';
-      const STRINGIFIED_PARTIAL_CONFIG = '{"state":"NO TEMPLATE"}';
+      const STRINGIFIED_PARTIAL_CONFIG = '{"state":"NO_TEMPLATE"}';
 
       setup(
         {
           expiry: EXPIRY_LOCAL_STORAGE_VALUE,
-          config: 'not a valid config and should not be used'
+          config: NOT_VALID_CONFIG
         },
         { reject: false, value: new Response(STRINGIFIED_PARTIAL_CONFIG) }
       );
-      await getConfig(IID);
+      await getConfig(performanceController, IID);
 
       expect(SettingsService.getInstance().loggingEnabled).to.be.true;
+    });
+
+    it('gets the config from RC even with deprecated transport flag', async () => {
+      // Expired local config.
+      const EXPIRY_LOCAL_STORAGE_VALUE = '1556524895320';
+      const STRINGIFIED_CUSTOM_CONFIG = `{"entries":{\
+        "fpr_vc_network_request_sampling_rate":"0.250000",\
+        "fpr_log_transport_web_percent":"100.0",\
+        "fpr_vc_session_sampling_rate":"0.250000","fpr_vc_trace_sampling_rate":"0.500000"},\
+        "state":"UPDATE"}`;
+
+      const { storageGetItemStub: getItemStub } = setup(
+        {
+          expiry: EXPIRY_LOCAL_STORAGE_VALUE,
+          config: STRINGIFIED_CUSTOM_CONFIG
+        },
+        { reject: false, value: new Response(STRINGIFIED_CONFIG) }
+      );
+
+      await getConfig(performanceController, IID);
+
+      expect(getItemStub).to.be.calledOnce;
+      expect(SettingsService.getInstance().loggingEnabled).to.be.true;
+      expect(SettingsService.getInstance().logEndPointUrl).to.equal(LOG_URL);
+      expect(SettingsService.getInstance().transportKey).to.equal(
+        TRANSPORT_KEY
+      );
+      expect(SettingsService.getInstance().logSource).to.equal(LOG_SOURCE);
+      expect(
+        SettingsService.getInstance().networkRequestsSamplingRate
+      ).to.equal(NETWORK_SAMPLING_RATE);
+      expect(SettingsService.getInstance().tracesSamplingRate).to.equal(
+        TRACE_SAMPLING_RATE
+      );
     });
   });
 });

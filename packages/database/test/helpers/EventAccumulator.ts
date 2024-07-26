@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,28 @@
  */
 
 export const EventAccumulatorFactory = {
+  // TODO: Convert to use generics to take the most advantage of types.
   waitsForCount: maxCount => {
+    // Note: This should be used sparingly as it can result in more events being raised than expected
     let count = 0;
     const condition = () => count >= maxCount;
+    const ea = new EventAccumulator(condition);
+    ea.onReset(() => {
+      count = 0;
+    });
+    ea.onEvent(() => {
+      count++;
+    });
+    return ea;
+  },
+  waitsForExactCount: maxCount => {
+    let count = 0;
+    const condition = () => {
+      if (count > maxCount) {
+        throw new Error('Received more events than expected');
+      }
+      return count === maxCount;
+    };
     const ea = new EventAccumulator(condition);
     ea.onReset(() => {
       count = 0;
@@ -31,12 +50,14 @@ export const EventAccumulatorFactory = {
 };
 
 export class EventAccumulator {
+  // TODO: make these typesafe
   eventData = [];
   promise;
   resolve;
   reject;
   private onResetFxn;
   private onEventFxn;
+  // eslint-disable-next-line @typescript-eslint/ban-types
   constructor(public condition: Function) {
     this.promise = new Promise((resolve, reject) => {
       this.resolve = resolve;
@@ -52,6 +73,7 @@ export class EventAccumulator {
       this.resolve(this.eventData);
     }
   }
+  // eslint-disable-next-line @typescript-eslint/ban-types
   reset(condition?: Function) {
     this.eventData = [];
     this.promise = new Promise((resolve, reject) => {
@@ -65,9 +87,11 @@ export class EventAccumulator {
       this.condition = condition;
     }
   }
+  // eslint-disable-next-line @typescript-eslint/ban-types
   onEvent(cb: Function) {
     this.onEventFxn = cb;
   }
+  // eslint-disable-next-line @typescript-eslint/ban-types
   onReset(cb: Function) {
     this.onResetFxn = cb;
   }

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,123 +14,142 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+import { FirebaseError } from '@firebase/util';
+
 import { CONFIG_STORAGE_BUCKET_KEY } from './constants';
 
-export class FirebaseStorageError implements Error {
-  private code_: string;
-  private message_: string;
-  private serverResponse_: string | null;
-  private name_: string;
+/**
+ * An error returned by the Firebase Storage SDK.
+ * @public
+ */
+export class StorageError extends FirebaseError {
+  private readonly _baseMessage: string;
+  /**
+   * Stores custom error data unique to the `StorageError`.
+   */
+  customData: { serverResponse: string | null } = { serverResponse: null };
 
-  constructor(code: Code, message: string) {
-    this.code_ = prependCode(code);
-    this.message_ = 'Firebase Storage: ' + message;
-    this.serverResponse_ = null;
-    this.name_ = 'FirebaseError';
+  /**
+   * @param code - A `StorageErrorCode` string to be prefixed with 'storage/' and
+   *  added to the end of the message.
+   * @param message  - Error message.
+   * @param status_ - Corresponding HTTP Status Code
+   */
+  constructor(code: StorageErrorCode, message: string, private status_ = 0) {
+    super(
+      prependCode(code),
+      `Firebase Storage: ${message} (${prependCode(code)})`
+    );
+    this._baseMessage = this.message;
+    // Without this, `instanceof StorageError`, in tests for example,
+    // returns false.
+    Object.setPrototypeOf(this, StorageError.prototype);
   }
 
-  codeProp(): string {
-    return this.code;
+  get status(): number {
+    return this.status_;
   }
 
-  codeEquals(code: Code): boolean {
-    return prependCode(code) === this.codeProp();
+  set status(status: number) {
+    this.status_ = status;
   }
 
-  serverResponseProp(): string | null {
-    return this.serverResponse_;
+  /**
+   * Compares a `StorageErrorCode` against this error's code, filtering out the prefix.
+   */
+  _codeEquals(code: StorageErrorCode): boolean {
+    return prependCode(code) === this.code;
   }
 
-  setServerResponseProp(serverResponse: string | null): void {
-    this.serverResponse_ = serverResponse;
-  }
-
-  get name(): string {
-    return this.name_;
-  }
-
-  get code(): string {
-    return this.code_;
-  }
-
-  get message(): string {
-    return this.message_;
-  }
-
+  /**
+   * Optional response message that was added by the server.
+   */
   get serverResponse(): null | string {
-    return this.serverResponse_;
+    return this.customData.serverResponse;
+  }
+
+  set serverResponse(serverResponse: string | null) {
+    this.customData.serverResponse = serverResponse;
+    if (this.customData.serverResponse) {
+      this.message = `${this._baseMessage}\n${this.customData.serverResponse}`;
+    } else {
+      this.message = this._baseMessage;
+    }
   }
 }
 
 export const errors = {};
 
 /**
- * @enum {string}
+ * @public
+ * Error codes that can be attached to `StorageError` objects.
  */
-export type Code = string;
-export const Code = {
+export enum StorageErrorCode {
   // Shared between all platforms
-  UNKNOWN: 'unknown',
-  OBJECT_NOT_FOUND: 'object-not-found',
-  BUCKET_NOT_FOUND: 'bucket-not-found',
-  PROJECT_NOT_FOUND: 'project-not-found',
-  QUOTA_EXCEEDED: 'quota-exceeded',
-  UNAUTHENTICATED: 'unauthenticated',
-  UNAUTHORIZED: 'unauthorized',
-  RETRY_LIMIT_EXCEEDED: 'retry-limit-exceeded',
-  INVALID_CHECKSUM: 'invalid-checksum',
-  CANCELED: 'canceled',
+  UNKNOWN = 'unknown',
+  OBJECT_NOT_FOUND = 'object-not-found',
+  BUCKET_NOT_FOUND = 'bucket-not-found',
+  PROJECT_NOT_FOUND = 'project-not-found',
+  QUOTA_EXCEEDED = 'quota-exceeded',
+  UNAUTHENTICATED = 'unauthenticated',
+  UNAUTHORIZED = 'unauthorized',
+  UNAUTHORIZED_APP = 'unauthorized-app',
+  RETRY_LIMIT_EXCEEDED = 'retry-limit-exceeded',
+  INVALID_CHECKSUM = 'invalid-checksum',
+  CANCELED = 'canceled',
   // JS specific
-  INVALID_EVENT_NAME: 'invalid-event-name',
-  INVALID_URL: 'invalid-url',
-  INVALID_DEFAULT_BUCKET: 'invalid-default-bucket',
-  NO_DEFAULT_BUCKET: 'no-default-bucket',
-  CANNOT_SLICE_BLOB: 'cannot-slice-blob',
-  SERVER_FILE_WRONG_SIZE: 'server-file-wrong-size',
-  NO_DOWNLOAD_URL: 'no-download-url',
-  INVALID_ARGUMENT: 'invalid-argument',
-  INVALID_ARGUMENT_COUNT: 'invalid-argument-count',
-  APP_DELETED: 'app-deleted',
-  INVALID_ROOT_OPERATION: 'invalid-root-operation',
-  INVALID_FORMAT: 'invalid-format',
-  INTERNAL_ERROR: 'internal-error'
-};
+  INVALID_EVENT_NAME = 'invalid-event-name',
+  INVALID_URL = 'invalid-url',
+  INVALID_DEFAULT_BUCKET = 'invalid-default-bucket',
+  NO_DEFAULT_BUCKET = 'no-default-bucket',
+  CANNOT_SLICE_BLOB = 'cannot-slice-blob',
+  SERVER_FILE_WRONG_SIZE = 'server-file-wrong-size',
+  NO_DOWNLOAD_URL = 'no-download-url',
+  INVALID_ARGUMENT = 'invalid-argument',
+  INVALID_ARGUMENT_COUNT = 'invalid-argument-count',
+  APP_DELETED = 'app-deleted',
+  INVALID_ROOT_OPERATION = 'invalid-root-operation',
+  INVALID_FORMAT = 'invalid-format',
+  INTERNAL_ERROR = 'internal-error',
+  UNSUPPORTED_ENVIRONMENT = 'unsupported-environment'
+}
 
-export function prependCode(code: Code): string {
+export function prependCode(code: StorageErrorCode): string {
   return 'storage/' + code;
 }
 
-export function unknown(): FirebaseStorageError {
+export function unknown(): StorageError {
   const message =
     'An unknown error occurred, please check the error payload for ' +
     'server response.';
-  return new FirebaseStorageError(Code.UNKNOWN, message);
+  return new StorageError(StorageErrorCode.UNKNOWN, message);
 }
 
-export function objectNotFound(path: string): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.OBJECT_NOT_FOUND,
+export function objectNotFound(path: string): StorageError {
+  return new StorageError(
+    StorageErrorCode.OBJECT_NOT_FOUND,
     "Object '" + path + "' does not exist."
   );
 }
 
-export function bucketNotFound(bucket: string): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.BUCKET_NOT_FOUND,
+export function bucketNotFound(bucket: string): StorageError {
+  return new StorageError(
+    StorageErrorCode.BUCKET_NOT_FOUND,
     "Bucket '" + bucket + "' does not exist."
   );
 }
 
-export function projectNotFound(project: string): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.PROJECT_NOT_FOUND,
+export function projectNotFound(project: string): StorageError {
+  return new StorageError(
+    StorageErrorCode.PROJECT_NOT_FOUND,
     "Project '" + project + "' does not exist."
   );
 }
 
-export function quotaExceeded(bucket: string): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.QUOTA_EXCEEDED,
+export function quotaExceeded(bucket: string): StorageError {
+  return new StorageError(
+    StorageErrorCode.QUOTA_EXCEEDED,
     "Quota for bucket '" +
       bucket +
       "' exceeded, please view quota on " +
@@ -138,23 +157,30 @@ export function quotaExceeded(bucket: string): FirebaseStorageError {
   );
 }
 
-export function unauthenticated(): FirebaseStorageError {
+export function unauthenticated(): StorageError {
   const message =
     'User is not authenticated, please authenticate using Firebase ' +
     'Authentication and try again.';
-  return new FirebaseStorageError(Code.UNAUTHENTICATED, message);
+  return new StorageError(StorageErrorCode.UNAUTHENTICATED, message);
 }
 
-export function unauthorized(path: string): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.UNAUTHORIZED,
+export function unauthorizedApp(): StorageError {
+  return new StorageError(
+    StorageErrorCode.UNAUTHORIZED_APP,
+    'This app does not have permission to access Firebase Storage on this project.'
+  );
+}
+
+export function unauthorized(path: string): StorageError {
+  return new StorageError(
+    StorageErrorCode.UNAUTHORIZED,
     "User does not have permission to access '" + path + "'."
   );
 }
 
-export function retryLimitExceeded(): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.RETRY_LIMIT_EXCEEDED,
+export function retryLimitExceeded(): StorageError {
+  return new StorageError(
+    StorageErrorCode.RETRY_LIMIT_EXCEEDED,
     'Max retry time for operation exceeded, please try again.'
   );
 }
@@ -163,9 +189,9 @@ export function invalidChecksum(
   path: string,
   checksum: string,
   calculated: string
-): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.INVALID_CHECKSUM,
+): StorageError {
+  return new StorageError(
+    StorageErrorCode.INVALID_CHECKSUM,
     "Uploaded/downloaded object '" +
       path +
       "' has checksum '" +
@@ -176,37 +202,37 @@ export function invalidChecksum(
   );
 }
 
-export function canceled(): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.CANCELED,
+export function canceled(): StorageError {
+  return new StorageError(
+    StorageErrorCode.CANCELED,
     'User canceled the upload/download.'
   );
 }
 
-export function invalidEventName(name: string): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.INVALID_EVENT_NAME,
+export function invalidEventName(name: string): StorageError {
+  return new StorageError(
+    StorageErrorCode.INVALID_EVENT_NAME,
     "Invalid event name '" + name + "'."
   );
 }
 
-export function invalidUrl(url: string): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.INVALID_URL,
+export function invalidUrl(url: string): StorageError {
+  return new StorageError(
+    StorageErrorCode.INVALID_URL,
     "Invalid URL '" + url + "'."
   );
 }
 
-export function invalidDefaultBucket(bucket: string): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.INVALID_DEFAULT_BUCKET,
+export function invalidDefaultBucket(bucket: string): StorageError {
+  return new StorageError(
+    StorageErrorCode.INVALID_DEFAULT_BUCKET,
     "Invalid default bucket '" + bucket + "'."
   );
 }
 
-export function noDefaultBucket(): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.NO_DEFAULT_BUCKET,
+export function noDefaultBucket(): StorageError {
+  return new StorageError(
+    StorageErrorCode.NO_DEFAULT_BUCKET,
     'No default bucket ' +
       "found. Did you set the '" +
       CONFIG_STORAGE_BUCKET_KEY +
@@ -214,36 +240,39 @@ export function noDefaultBucket(): FirebaseStorageError {
   );
 }
 
-export function cannotSliceBlob(): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.CANNOT_SLICE_BLOB,
+export function cannotSliceBlob(): StorageError {
+  return new StorageError(
+    StorageErrorCode.CANNOT_SLICE_BLOB,
     'Cannot slice blob for upload. Please retry the upload.'
   );
 }
 
-export function serverFileWrongSize(): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.SERVER_FILE_WRONG_SIZE,
+export function serverFileWrongSize(): StorageError {
+  return new StorageError(
+    StorageErrorCode.SERVER_FILE_WRONG_SIZE,
     'Server recorded incorrect upload file size, please retry the upload.'
   );
 }
 
-export function noDownloadURL(): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.NO_DOWNLOAD_URL,
+export function noDownloadURL(): StorageError {
+  return new StorageError(
+    StorageErrorCode.NO_DOWNLOAD_URL,
     'The given file does not have any download URLs.'
   );
 }
 
-export function invalidArgument(
-  index: number,
-  fnName: string,
-  message: string
-): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.INVALID_ARGUMENT,
-    'Invalid argument in `' + fnName + '` at index ' + index + ': ' + message
+export function missingPolyFill(polyFill: string): StorageError {
+  return new StorageError(
+    StorageErrorCode.UNSUPPORTED_ENVIRONMENT,
+    `${polyFill} is missing. Make sure to install the required polyfills. See https://firebase.google.com/docs/web/environments-js-sdk#polyfills for more information.`
   );
+}
+
+/**
+ * @internal
+ */
+export function invalidArgument(message: string): StorageError {
+  return new StorageError(StorageErrorCode.INVALID_ARGUMENT, message);
 }
 
 export function invalidArgumentCount(
@@ -251,7 +280,7 @@ export function invalidArgumentCount(
   argMax: number,
   fnName: string,
   real: number
-): FirebaseStorageError {
+): StorageError {
   let countPart;
   let plural;
   if (argMin === argMax) {
@@ -261,8 +290,8 @@ export function invalidArgumentCount(
     countPart = 'between ' + argMin + ' and ' + argMax;
     plural = 'arguments';
   }
-  return new FirebaseStorageError(
-    Code.INVALID_ARGUMENT_COUNT,
+  return new StorageError(
+    StorageErrorCode.INVALID_ARGUMENT_COUNT,
     'Invalid argument count in `' +
       fnName +
       '`: Expected ' +
@@ -275,19 +304,21 @@ export function invalidArgumentCount(
   );
 }
 
-export function appDeleted(): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.APP_DELETED,
+export function appDeleted(): StorageError {
+  return new StorageError(
+    StorageErrorCode.APP_DELETED,
     'The Firebase app was deleted.'
   );
 }
 
 /**
- * @param name The name of the operation that was invalid.
+ * @param name - The name of the operation that was invalid.
+ *
+ * @internal
  */
-export function invalidRootOperation(name: string): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.INVALID_ROOT_OPERATION,
+export function invalidRootOperation(name: string): StorageError {
+  return new StorageError(
+    StorageErrorCode.INVALID_ROOT_OPERATION,
     "The operation '" +
       name +
       "' cannot be performed on a root reference, create a non-root " +
@@ -296,25 +327,29 @@ export function invalidRootOperation(name: string): FirebaseStorageError {
 }
 
 /**
- * @param format The format that was not valid.
- * @param message A message describing the format violation.
+ * @param format - The format that was not valid.
+ * @param message - A message describing the format violation.
  */
-export function invalidFormat(
-  format: string,
-  message: string
-): FirebaseStorageError {
-  return new FirebaseStorageError(
-    Code.INVALID_FORMAT,
+export function invalidFormat(format: string, message: string): StorageError {
+  return new StorageError(
+    StorageErrorCode.INVALID_FORMAT,
     "String does not match format '" + format + "': " + message
   );
 }
 
 /**
- * @param message A message describing the internal error.
+ * @param message - A message describing the internal error.
  */
-export function internalError(message: string): FirebaseStorageError {
-  throw new FirebaseStorageError(
-    Code.INTERNAL_ERROR,
+export function unsupportedEnvironment(message: string): StorageError {
+  throw new StorageError(StorageErrorCode.UNSUPPORTED_ENVIRONMENT, message);
+}
+
+/**
+ * @param message - A message describing the internal error.
+ */
+export function internalError(message: string): StorageError {
+  throw new StorageError(
+    StorageErrorCode.INTERNAL_ERROR,
     'Internal error: ' + message
   );
 }

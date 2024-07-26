@@ -1,4 +1,4 @@
-// Copyright 2019 Google LLC.
+// Copyright 2021 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,15 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//
 
 syntax = "proto3";
 
 package google.firestore.v1;
 
-import "google/api/annotations.proto";
 import "google/firestore/v1/document.proto";
 import "google/protobuf/wrappers.proto";
+import "google/api/annotations.proto";
 
 option csharp_namespace = "Google.Cloud.Firestore.V1";
 option go_package = "google.golang.org/genproto/googleapis/firestore/v1;firestore";
@@ -28,7 +27,7 @@ option java_outer_classname = "QueryProto";
 option java_package = "com.google.firestore.v1";
 option objc_class_prefix = "GCFS";
 option php_namespace = "Google\\Cloud\\Firestore\\V1";
-
+option ruby_package = "Google::Cloud::Firestore::V1";
 
 // A Firestore query.
 message StructuredQuery {
@@ -66,8 +65,11 @@ message StructuredQuery {
       // Unspecified. This value must not be used.
       OPERATOR_UNSPECIFIED = 0;
 
-      // The results are required to satisfy each of the combined filters.
+      // Documents are required to satisfy all of the combined filters.
       AND = 1;
+
+      // Documents are required to satisfy at least one of the combined filters.
+      OR = 2;
     }
 
     // The operator for combining multiple filters.
@@ -85,32 +87,74 @@ message StructuredQuery {
       // Unspecified. This value must not be used.
       OPERATOR_UNSPECIFIED = 0;
 
-      // Less than. Requires that the field come first in `order_by`.
+      // The given `field` is less than the given `value`.
+      //
+      // Requires:
+      //
+      // * That `field` come first in `order_by`.
       LESS_THAN = 1;
 
-      // Less than or equal. Requires that the field come first in `order_by`.
+      // The given `field` is less than or equal to the given `value`.
+      //
+      // Requires:
+      //
+      // * That `field` come first in `order_by`.
       LESS_THAN_OR_EQUAL = 2;
 
-      // Greater than. Requires that the field come first in `order_by`.
+      // The given `field` is greater than the given `value`.
+      //
+      // Requires:
+      //
+      // * That `field` come first in `order_by`.
       GREATER_THAN = 3;
 
-      // Greater than or equal. Requires that the field come first in
-      // `order_by`.
+      // The given `field` is greater than or equal to the given `value`.
+      //
+      // Requires:
+      //
+      // * That `field` come first in `order_by`.
       GREATER_THAN_OR_EQUAL = 4;
 
-      // Equal.
+      // The given `field` is equal to the given `value`.
       EQUAL = 5;
 
-      // Contains. Requires that the field is an array.
+      // The given `field` is not equal to the given `value`.
+      //
+      // Requires:
+      //
+      // * No other `NOT_EQUAL`, `NOT_IN`, `IS_NOT_NULL`, or `IS_NOT_NAN`.
+      // * That `field` comes first in the `order_by`.
+      NOT_EQUAL = 6;
+
+      // The given `field` is an array that contains the given `value`.
       ARRAY_CONTAINS = 7;
 
-      // In. Requires that `value` is a non-empty ArrayValue with at most 10
-      // values.
+      // The given `field` is equal to at least one value in the given array.
+      //
+      // Requires:
+      //
+      // * That `value` is a non-empty `ArrayValue` with at most 10 values.
+      // * No other `IN` or `ARRAY_CONTAINS_ANY` or `NOT_IN`.
       IN = 8;
 
-      // Contains any. Requires that the field is an array and
-      // `value` is a non-empty ArrayValue with at most 10 values.
+      // The given `field` is an array that contains any of the values in the
+      // given array.
+      //
+      // Requires:
+      //
+      // * That `value` is a non-empty `ArrayValue` with at most 10 values.
+      // * No other `IN` or `ARRAY_CONTAINS_ANY` or `NOT_IN`.
       ARRAY_CONTAINS_ANY = 9;
+
+      // The value of the `field` is not in the given array.
+      //
+      // Requires:
+      //
+      // * That `value` is a non-empty `ArrayValue` with at most 10 values.
+      // * No other `IN`, `ARRAY_CONTAINS_ANY`, `NOT_IN`, `NOT_EQUAL`,
+      //   `IS_NOT_NULL`, or `IS_NOT_NAN`.
+      // * That `field` comes first in the `order_by`.
+      NOT_IN = 10;
     }
 
     // The field to filter by.
@@ -130,11 +174,27 @@ message StructuredQuery {
       // Unspecified. This value must not be used.
       OPERATOR_UNSPECIFIED = 0;
 
-      // Test if a field is equal to NaN.
+      // The given `field` is equal to `NaN`.
       IS_NAN = 2;
 
-      // Test if an exprestion evaluates to Null.
+      // The given `field` is equal to `NULL`.
       IS_NULL = 3;
+
+      // The given `field` is not equal to `NaN`.
+      //
+      // Requires:
+      //
+      // * No other `NOT_EQUAL`, `NOT_IN`, `IS_NOT_NULL`, or `IS_NOT_NAN`.
+      // * That `field` comes first in the `order_by`.
+      IS_NOT_NAN = 4;
+
+      // The given `field` is not equal to `NULL`.
+      //
+      // Requires:
+      //
+      // * A single `NOT_EQUAL`, `NOT_IN`, `IS_NOT_NULL`, or `IS_NOT_NAN`.
+      // * That `field` comes first in the `order_by`.
+      IS_NOT_NULL = 5;
     }
 
     // The unary operator to apply.
@@ -228,6 +288,94 @@ message StructuredQuery {
   // Applies after all other constraints.
   // Must be >= 0 if specified.
   google.protobuf.Int32Value limit = 5;
+}
+
+message StructuredAggregationQuery {
+  // Defines a aggregation that produces a single result.
+  message Aggregation {
+    // Count of documents that match the query.
+    //
+    // The `COUNT(*)` aggregation function operates on the entire document
+    // so it does not require a field reference.
+    message Count {
+      // Optional. Optional constraint on the maximum number of documents to count.
+      //
+      // This provides a way to set an upper bound on the number of documents
+      // to scan, limiting latency and cost.
+      //
+      // High-Level Example:
+      //
+      // ```
+      // SELECT COUNT_UP_TO(1000) FROM ( SELECT * FROM k );
+      // ```
+      //
+      // Requires:
+      //
+      // * Must be greater than zero when present.
+      google.protobuf.Int64Value up_to = 1;
+    }
+
+    // Sum of the values of the requested field.
+    //
+    // * Only numeric values will be aggregated. All non-numeric values
+    // including `NULL` are skipped.
+    //
+    // * If the aggregated values contain `NaN`, returns `NaN`.
+    //
+    // * If the aggregated value set is empty, returns 0.
+    //
+    // * Returns a 64-bit integer if the sum result is an integer value and does
+    // not overflow or underflow. Otherwise, the result is returned as a double.
+    message Sum {
+      // The field to aggregate on.
+      StructuredQuery.FieldReference field = 1;
+    }
+
+    // Average of the values of the requested field.
+    //
+    // * Only numeric values will be aggregated. All non-numeric values
+    // including `NULL` are skipped.
+    //
+    // * If the aggregated values contain `NaN`, returns `NaN`.
+    //
+    // * If the aggregated value set is empty, returns `NULL`.
+    //
+    // * Always returns the result as a double.
+    message Avg {
+      // The field to aggregate on.
+      StructuredQuery.FieldReference field = 1;
+    }
+
+    // The type of aggregation to perform, required.
+    oneof operator {
+      // Count aggregator.
+      Count count = 1;
+
+      // Sum aggregator.
+      Sum sum = 2;
+
+      // Average aggregator.
+      Avg avg = 3;
+    }
+
+    // Required. The name of the field to store the result of the aggregation into.
+    //
+    // Requires:
+    //
+    // * Must be present.
+    // * Must be unique across all aggregation aliases.
+    // * Conform to existing [document field name][google.firestore.v1.Document.fields] limitations.
+    string alias = 7;
+  }
+
+  // The base query to aggregate over.
+  oneof query_type {
+    // Nested structured query.
+    StructuredQuery structured_query = 1;
+  }
+
+  // Optional. Series of aggregations to apply on top of the `structured_query`.
+  repeated Aggregation aggregations = 3;
 }
 
 // A position in a query result set.

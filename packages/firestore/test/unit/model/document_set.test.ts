@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
  */
 
 import { expect } from 'chai';
+
 import { Document } from '../../../src/model/document';
 import { DocumentSet } from '../../../src/model/document_set';
 import {
@@ -54,7 +55,7 @@ describe('DocumentSet', () => {
   });
 
   it('adds and deletes elements', () => {
-    const set = new DocumentSet(Document.compareByKey)
+    const set = new DocumentSet() // Compares by key by default
       .add(d1)
       .add(d2)
       .add(d3)
@@ -67,10 +68,7 @@ describe('DocumentSet', () => {
 
   it('updates documents', () => {
     const comp = DocComparator.byField('sort');
-    let set = new DocumentSet(comp)
-      .add(d1)
-      .add(d2)
-      .add(d3);
+    let set = new DocumentSet(comp).add(d1).add(d2).add(d3);
     expect(set.size).to.equal(3);
 
     const d2prime = doc('docs/2', 2, { sort: 9 });

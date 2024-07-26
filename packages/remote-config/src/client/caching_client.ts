@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -75,13 +75,11 @@ export class CachingClient implements RemoteConfigFetchClient {
 
   async fetch(request: FetchRequest): Promise<FetchResponse> {
     // Reads from persisted storage to avoid cache miss if callers don't wait on initialization.
-    const [
-      lastSuccessfulFetchTimestampMillis,
-      lastSuccessfulFetchResponse
-    ] = await Promise.all([
-      this.storage.getLastSuccessfulFetchTimestampMillis(),
-      this.storage.getLastSuccessfulFetchResponse()
-    ]);
+    const [lastSuccessfulFetchTimestampMillis, lastSuccessfulFetchResponse] =
+      await Promise.all([
+        this.storage.getLastSuccessfulFetchTimestampMillis(),
+        this.storage.getLastSuccessfulFetchResponse()
+      ]);
 
     // Exits early on cache hit.
     if (

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,10 +17,23 @@
 
 const path = require('path');
 const webpack = require('webpack');
+const NodePolyfillPlugin = require('node-polyfill-webpack-plugin');
+
+/**
+ * A regular expression used to replace Firestore's and Storage's platform-
+ * specific modules, which are located under
+ * 'packages/(component)/src/platform/'.
+ */
+const PLATFORM_RE = /^(.*)\/platform\/([^.\/]*)(\.ts)?$/;
 
 module.exports = {
   mode: 'development',
   devtool: 'source-map',
+  optimization: {
+    runtimeChunk: false,
+    splitChunks: false,
+    minimize: false
+  },
   module: {
     rules: [
       {
@@ -31,7 +44,7 @@ module.exports = {
           options: {
             compilerOptions: {
               module: 'commonjs',
-              target: 'es5',
+              target: 'es2017',
               downlevelIteration: true,
               resolveJsonModule: true
             }
@@ -68,18 +81,43 @@ module.exports = {
             ]
           }
         }
+      },
+      /**
+       * Transform firebase packages to cjs, so they can be stubbed in tests
+       */
+      {
+        test: /\.js$/,
+        include: function (modulePath) {
+          const match = /node_modules\/@firebase.*/.test(modulePath);
+          return match;
+        },
+        use: {
+          loader: 'babel-loader',
+          options: {
+            plugins: ['@babel/plugin-transform-modules-commonjs']
+          }
+        }
       }
     ]
   },
   resolve: {
     modules: ['node_modules', path.resolve(__dirname, '../../node_modules')],
-    mainFields: ['browser', 'main', 'module'],
-    extensions: ['.js', '.ts']
+    mainFields: ['browser', 'module', 'main'],
+    extensions: ['.js', '.ts'],
+    symlinks: true
   },
   plugins: [
-    new webpack.EnvironmentPlugin([
-      'RTDB_EMULATOR_PORT',
-      'RTDB_EMULATOR_NAMESPACE'
-    ])
+    new webpack.NormalModuleReplacementPlugin(PLATFORM_RE, resource => {
+      const targetPlatform = process.env.TEST_PLATFORM || 'browser';
+      resource.request = resource.request.replace(
+        PLATFORM_RE,
+        `$1/platform/${targetPlatform}/$2.ts`
+      );
+    }),
+    new NodePolyfillPlugin(),
+    new webpack.EnvironmentPlugin({
+      'RTDB_EMULATOR_PORT': false,
+      'RTDB_EMULATOR_NAMESPACE': false
+    })
   ]
 };

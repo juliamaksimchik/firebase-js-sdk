@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,33 +15,38 @@
  * limitations under the License.
  */
 
-import * as chaiAsPromised from 'chai-as-promised';
-
+import { deleteApp } from '@firebase/app';
 import { expect, use } from 'chai';
+import chaiAsPromised from 'chai-as-promised';
 
-import { apiDescribe, withTestDoc } from '../util/helpers';
-import { SimpleDb } from '../../../src/local/simple_db';
 import { User } from '../../../src/auth/user';
+import { SimpleDb } from '../../../src/local/simple_db';
+import {
+  clearIndexedDbPersistence,
+  disableNetwork,
+  doc,
+  setDoc,
+  waitForPendingWrites
+} from '../util/firebase_export';
+import { apiDescribe, withTestDoc } from '../util/helpers';
 import { withMockCredentialProviderTestDb } from '../util/internal_helpers';
 
-// tslint:disable:no-floating-promises
 use(chaiAsPromised);
 
-apiDescribe('Database (with internal API)', (persistence: boolean) => {
+apiDescribe('Database (with internal API)', persistence => {
   // eslint-disable-next-line no-restricted-properties
-  (persistence ? it : it.skip)(
+  (persistence.storage === 'indexeddb' ? it : it.skip)(
     'will reject the promise if clear persistence fails',
     async () => {
-      await withTestDoc(persistence, async docRef => {
+      await withTestDoc(persistence, async (docRef, firestore) => {
         const oldDelete = SimpleDb.delete;
         try {
           SimpleDb.delete = (name: string): Promise<void> => {
             return Promise.reject('Failed to delete the database.');
           };
-          const firestore = docRef.firestore;
-          await firestore.app.delete();
+          await deleteApp(firestore.app);
           await expect(
-            firestore.clearPersistence()
+            clearIndexedDbPersistence(firestore)
           ).to.eventually.be.rejectedWith('Failed to delete the database.');
         } finally {
           SimpleDb.delete = oldDelete;
@@ -55,10 +60,9 @@ apiDescribe('Database (with internal API)', (persistence: boolean) => {
       persistence,
       async (db, mockCredentialsProvider) => {
         // Prevent pending writes receiving acknowledgement.
-        await db.disableNetwork();
-        // eslint-disable-next-line @typescript-eslint/no-floating-promises
-        db.doc('abc/123').set({ foo: 'bar' });
-        const awaitPendingWrite = db.waitForPendingWrites();
+        await disableNetwork(db);
+        void setDoc(doc(db, 'abc/123'), { foo: 'bar' });
+        const awaitPendingWrite = waitForPendingWrites(db);
 
         mockCredentialsProvider.triggerUserChange(new User('user_1'));
 
@@ -71,12 +75,12 @@ apiDescribe('Database (with internal API)', (persistence: boolean) => {
 
   it('app delete leads to instance termination', async () => {
     await withTestDoc(persistence, async docRef => {
-      await docRef.set({ foo: 'bar' });
+      await setDoc(docRef, { foo: 'bar' });
       const app = docRef.firestore.app;
-      await app.delete();
+      await deleteApp(app);
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      expect((docRef.firestore as any)._isTerminated).to.be.true;
+      expect((docRef.firestore as any)._terminated).to.be.true;
     });
   });
 });

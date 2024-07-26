@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,9 +29,6 @@ export abstract class EventEmitter {
     }>;
   } = {};
 
-  /**
-   * @param {!Array.<string>} allowedEvents_
-   */
   constructor(private allowedEvents_: string[]) {
     assert(
       Array.isArray(allowedEvents_) && allowedEvents_.length > 0,
@@ -43,15 +40,12 @@ export abstract class EventEmitter {
    * To be overridden by derived classes in order to fire an initial event when
    * somebody subscribes for data.
    *
-   * @param {!string} eventType
-   * @return {Array.<*>} Array of parameters to trigger initial event with.
+   * @returns {Array.<*>} Array of parameters to trigger initial event with.
    */
   abstract getInitialEvent(eventType: string): unknown[];
 
   /**
    * To be called by derived classes to trigger events.
-   * @param {!string} eventType
-   * @param {...*} varArgs
    */
   protected trigger(eventType: string, ...varArgs: unknown[]) {
     if (Array.isArray(this.listeners_[eventType])) {

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,14 +15,10 @@
  * limitations under the License.
  */
 
-import { Path } from '../Path';
 import { RepoInfo } from '../../RepoInfo';
+import { Path } from '../Path';
 import { warnIfPageIsSecure, warn, fatal } from '../util';
 
-/**
- * @param {!string} pathString
- * @return {string}
- */
 function decodePath(pathString: string): string {
   let pathStringDecoded = '';
   const pieces = pathString.split('/');
@@ -39,8 +35,7 @@ function decodePath(pathString: string): string {
 }
 
 /**
- * @param {!string} queryString
- * @return {!{[key:string]:string}} key value hash
+ * @returns key value hash
  */
 function decodeQuery(queryString: string): { [key: string]: string } {
   const results = {};
@@ -61,18 +56,14 @@ function decodeQuery(queryString: string): { [key: string]: string } {
   return results;
 }
 
-/**
- *
- * @param {!string} dataURL
- * @return {{repoInfo: !RepoInfo, path: !Path}}
- */
-export const parseRepoInfo = function(
-  dataURL: string
+export const parseRepoInfo = function (
+  dataURL: string,
+  nodeAdmin: boolean
 ): { repoInfo: RepoInfo; path: Path } {
   const parsedUrl = parseDatabaseURL(dataURL),
     namespace = parsedUrl.namespace;
 
-  if (parsedUrl.domain === 'firebase') {
+  if (parsedUrl.domain === 'firebase.com') {
     fatal(
       parsedUrl.host +
         ' is no longer supported. ' +
@@ -102,6 +93,7 @@ export const parseRepoInfo = function(
       parsedUrl.secure,
       namespace,
       webSocketOnly,
+      nodeAdmin,
       /*persistenceKey=*/ '',
       /*includeNamespaceInQueryParams=*/ namespace !== parsedUrl.subdomain
     ),
@@ -109,14 +101,7 @@ export const parseRepoInfo = function(
   };
 };
 
-/**
- *
- * @param {!string} dataURL
- * @return {{host: string, port: number, domain: string, subdomain: string, secure: boolean, scheme: string, pathString: string, namespace: string}}
- */
-export const parseDatabaseURL = function(
-  dataURL: string
-): {
+export const parseDatabaseURL = function (dataURL: string): {
   host: string;
   port: number;
   domain: string;
@@ -171,20 +156,21 @@ export const parseDatabaseURL = function(
       secure = scheme === 'https' || scheme === 'wss';
       port = parseInt(host.substring(colonInd + 1), 10);
     } else {
-      colonInd = dataURL.length;
+      colonInd = host.length;
     }
 
-    const parts = host.split('.');
-    if (parts.length === 3) {
-      // Normalize namespaces to lowercase to share storage / connection.
-      domain = parts[1];
-      subdomain = parts[0].toLowerCase();
-      // We interpret the subdomain of a 3 component URL as the namespace name.
-      namespace = subdomain;
-    } else if (parts.length === 2) {
-      domain = parts[0];
-    } else if (parts[0].slice(0, colonInd).toLowerCase() === 'localhost') {
+    const hostWithoutPort = host.slice(0, colonInd);
+    if (hostWithoutPort.toLowerCase() === 'localhost') {
       domain = 'localhost';
+    } else if (hostWithoutPort.split('.').length <= 2) {
+      domain = hostWithoutPort;
+    } else {
+      // Interpret the subdomain of a 3 or more component URL as the namespace name.
+      const dotInd = host.indexOf('.');
+      subdomain = host.substring(0, dotInd).toLowerCase();
+      domain = host.substring(dotInd + 1);
+      // Normalize namespaces to lowercase to share storage / connection.
+      namespace = subdomain;
     }
     // Always treat the value of the `ns` as the namespace name if it is present.
     if ('ns' in queryParams) {

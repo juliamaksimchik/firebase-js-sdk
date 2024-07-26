@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-import { AppConfig } from '../interfaces/app-config';
+import { AppConfig } from '../interfaces/installation-impl';
 
 /** Returns a string key that can be used to identify the app. */
 export function getKey(appConfig: AppConfig): string {

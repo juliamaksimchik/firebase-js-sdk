@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,30 +16,33 @@
  */
 
 import { SnapshotVersion } from '../core/snapshot_version';
+import { canonifyTarget, Target, targetEquals } from '../core/target';
 import { TargetIdGenerator } from '../core/target_id_generator';
 import { ListenSequenceNumber, TargetId } from '../core/types';
 import { DocumentKeySet } from '../model/collections';
 import { DocumentKey } from '../model/document_key';
-import { assert, fail } from '../util/assert';
+import { debugAssert } from '../util/assert';
 import { ObjectMap } from '../util/obj_map';
 
 import { ActiveTargets } from './lru_garbage_collector';
-import { MemoryPersistence } from './memory_persistence';
-import { PersistenceTransaction } from './persistence';
+import { Persistence } from './persistence';
 import { PersistencePromise } from './persistence_promise';
+import { PersistenceTransaction } from './persistence_transaction';
 import { ReferenceSet } from './reference_set';
 import { TargetCache } from './target_cache';
 import { TargetData } from './target_data';
-import { Target } from '../core/target';
 
 export class MemoryTargetCache implements TargetCache {
   /**
    * Maps a target to the data about that target
    */
-  private targets = new ObjectMap<Target, TargetData>(t => t.canonicalId());
+  private targets = new ObjectMap<Target, TargetData>(
+    t => canonifyTarget(t),
+    targetEquals
+  );
 
   /** The last received snapshot version. */
-  private lastRemoteSnapshotVersion = SnapshotVersion.MIN;
+  private lastRemoteSnapshotVersion = SnapshotVersion.min();
   /** The highest numbered target ID encountered. */
   private highestTargetId: TargetId = 0;
   /** The highest sequence number encountered. */
@@ -54,7 +57,7 @@ export class MemoryTargetCache implements TargetCache {
 
   private targetIdGenerator = TargetIdGenerator.forTargetCache();
 
-  constructor(private readonly persistence: MemoryPersistence) {}
+  constructor(private readonly persistence: Persistence) {}
 
   forEachTarget(
     txn: PersistenceTransaction,
@@ -79,9 +82,8 @@ export class MemoryTargetCache implements TargetCache {
   allocateTargetId(
     transaction: PersistenceTransaction
   ): PersistencePromise<TargetId> {
-    const nextTargetId = this.targetIdGenerator.after(this.highestTargetId);
-    this.highestTargetId = nextTargetId;
-    return PersistencePromise.resolve(nextTargetId);
+    this.highestTargetId = this.targetIdGenerator.next();
+    return PersistencePromise.resolve(this.highestTargetId);
   }
 
   setTargetsMetadata(
@@ -102,6 +104,7 @@ export class MemoryTargetCache implements TargetCache {
     this.targets.set(targetData.target, targetData);
     const targetId = targetData.targetId;
     if (targetId > this.highestTargetId) {
+      this.targetIdGenerator = new TargetIdGenerator(targetId);
       this.highestTargetId = targetId;
     }
     if (targetData.sequenceNumber > this.highestSequenceNumber) {
@@ -113,7 +116,7 @@ export class MemoryTargetCache implements TargetCache {
     transaction: PersistenceTransaction,
     targetData: TargetData
   ): PersistencePromise<void> {
-    assert(
+    debugAssert(
       !this.targets.has(targetData.target),
       'Adding a target that already exists'
     );
@@ -126,9 +129,9 @@ export class MemoryTargetCache implements TargetCache {
     transaction: PersistenceTransaction,
     targetData: TargetData
   ): PersistencePromise<void> {
-    assert(
+    debugAssert(
       this.targets.has(targetData.target),
-      'Updating a non-existent target'
+      'Updating a nonexistent target'
     );
     this.saveTargetData(targetData);
     return PersistencePromise.resolve();
@@ -138,10 +141,10 @@ export class MemoryTargetCache implements TargetCache {
     transaction: PersistenceTransaction,
     targetData: TargetData
   ): PersistencePromise<void> {
-    assert(this.targetCount > 0, 'Removing a target from an empty cache');
-    assert(
+    debugAssert(this.targetCount > 0, 'Removing a target from an empty cache');
+    debugAssert(
       this.targets.has(targetData.target),
-      'Removing a non-existent target from the cache'
+      'Removing a nonexistent target from the cache'
     );
     this.targets.delete(targetData.target);
     this.references.removeReferencesForId(targetData.targetId);
@@ -185,29 +188,13 @@ export class MemoryTargetCache implements TargetCache {
     return PersistencePromise.resolve(targetData);
   }
 
-  getTargetDataForTarget(
-    transaction: PersistenceTransaction,
-    targetId: TargetId
-  ): never {
-    // This method is only needed for multi-tab and we can't implement it
-    // efficiently without additional data structures.
-    return fail('Not yet implemented.');
-  }
-
   addMatchingKeys(
     txn: PersistenceTransaction,
     keys: DocumentKeySet,
     targetId: TargetId
   ): PersistencePromise<void> {
     this.references.addReferences(keys, targetId);
-    const referenceDelegate = this.persistence.referenceDelegate;
-    const promises: Array<PersistencePromise<void>> = [];
-    if (referenceDelegate) {
-      keys.forEach(key => {
-        promises.push(referenceDelegate.addReference(txn, key));
-      });
-    }
-    return PersistencePromise.waitFor(promises);
+    return PersistencePromise.resolve();
   }
 
   removeMatchingKeys(
@@ -220,7 +207,7 @@ export class MemoryTargetCache implements TargetCache {
     const promises: Array<PersistencePromise<void>> = [];
     if (referenceDelegate) {
       keys.forEach(key => {
-        promises.push(referenceDelegate.removeReference(txn, key));
+        promises.push(referenceDelegate.markPotentiallyOrphaned(txn, key));
       });
     }
     return PersistencePromise.waitFor(promises);

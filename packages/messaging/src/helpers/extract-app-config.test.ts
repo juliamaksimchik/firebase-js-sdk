@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,13 @@
  * limitations under the License.
  */
 
-import { expect } from 'chai';
-import { AppConfig } from '../interfaces/app-config';
-import { getFakeApp } from '../testing/fakes/firebase-dependencies';
 import '../testing/setup';
+
+import { AppConfig } from '../interfaces/app-config';
+import { FirebaseApp } from '@firebase/app';
+import { expect } from 'chai';
 import { extractAppConfig } from './extract-app-config';
-import { FirebaseApp } from '@firebase/app-types';
+import { getFakeApp } from '../testing/fakes/firebase-dependencies';
 
 describe('extractAppConfig', () => {
   it('returns AppConfig if the argument is a FirebaseApp object that includes an appId', () => {
@@ -37,7 +38,7 @@ describe('extractAppConfig', () => {
 
   it('throws if a necessary value is missing', () => {
     expect(() =>
-      extractAppConfig((undefined as unknown) as FirebaseApp)
+      extractAppConfig(undefined as unknown as FirebaseApp)
     ).to.throw('Missing App configuration value: "App Configuration Object"');
 
     let firebaseApp = getFakeApp();

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,9 @@
  * limitations under the License.
  */
 
-import { Query } from '../../../src/core/query';
-import { doc, path } from '../../util/helpers';
-
 import { TimerId } from '../../../src/util/async_queue';
+import { doc, query } from '../../util/helpers';
+
 import { describeSpec, specTest } from './describe_spec';
 import { client, spec } from './spec_builder';
 
@@ -42,28 +41,18 @@ describeSpec('Persistence:', [], () => {
     'Persisted local mutations are visible to listeners',
     ['durable-persistence'],
     () => {
-      const query = Query.atPath(path('collection'));
+      const query1 = query('collection');
       return (
         spec()
           .userSets('collection/key1', { foo: 'bar' })
           .userSets('collection/key2', { baz: 'quu' })
           .restart()
           // It should be visible to listens.
-          .userListens(query)
-          .expectEvents(query, {
+          .userListens(query1)
+          .expectEvents(query1, {
             added: [
-              doc(
-                'collection/key1',
-                0,
-                { foo: 'bar' },
-                { hasLocalMutations: true }
-              ),
-              doc(
-                'collection/key2',
-                0,
-                { baz: 'quu' },
-                { hasLocalMutations: true }
-              )
+              doc('collection/key1', 0, { foo: 'bar' }).setHasLocalMutations(),
+              doc('collection/key2', 0, { baz: 'quu' }).setHasLocalMutations()
             ],
             fromCache: true,
             hasPendingWrites: true
@@ -73,51 +62,48 @@ describeSpec('Persistence:', [], () => {
   );
 
   specTest('Remote documents are persisted', ['durable-persistence'], () => {
-    const query = Query.atPath(path('collection'));
+    const query1 = query('collection');
     const doc1 = doc('collection/key', 1000, { foo: 'bar' });
     return spec()
-      .userListens(query)
-      .watchAcksFull(query, 1000, doc1)
-      .expectEvents(query, { added: [doc1] })
+      .userListens(query1)
+      .watchAcksFull(query1, 1000, doc1)
+      .expectEvents(query1, { added: [doc1] })
       .restart()
-      .userListens(query, 'resume-token-1000')
-      .expectEvents(query, { added: [doc1], fromCache: true });
+      .userListens(query1, { resumeToken: 'resume-token-1000' })
+      .expectEvents(query1, { added: [doc1], fromCache: true });
   });
 
   specTest("Remote documents from watch are not GC'd", [], () => {
-    const query = Query.atPath(path('collection'));
+    const query1 = query('collection');
     const doc1 = doc('collection/key', 1000, { foo: 'bar' });
     return (
       spec()
-        .withGCEnabled(false)
-        .userListens(query)
-        .watchAcksFull(query, 1000, doc1)
-        .expectEvents(query, { added: [doc1] })
+        .ensureManualLruGC()
+        .userListens(query1)
+        .watchAcksFull(query1, 1000, doc1)
+        .expectEvents(query1, { added: [doc1] })
         // Normally this would clear the cached remote documents.
-        .userUnlistens(query)
-        .userListens(query, 'resume-token-1000')
-        .expectEvents(query, { added: [doc1], fromCache: true })
+        .userUnlistens(query1)
+        .userListens(query1, { resumeToken: 'resume-token-1000' })
+        .expectEvents(query1, { added: [doc1], fromCache: true })
     );
   });
 
   specTest("Remote documents from user sets are not GC'd", [], () => {
-    const query = Query.atPath(path('collection'));
+    const query1 = query('collection');
     return (
       spec()
-        .withGCEnabled(false)
+        .ensureManualLruGC()
         .userSets('collection/key', { foo: 'bar' })
         // Normally the write would get GC'd from remote documents here.
         .writeAcks('collection/key', 1000)
-        .userListens(query)
+        .userListens(query1)
         // Version is 0 since we never received a server version via watch.
-        .expectEvents(query, {
+        .expectEvents(query1, {
           added: [
-            doc(
-              'collection/key',
-              1000,
-              { foo: 'bar' },
-              { hasCommittedMutations: true }
-            )
+            doc('collection/key', 1000, {
+              foo: 'bar'
+            }).setHasCommittedMutations()
           ],
           fromCache: true
         })
@@ -163,35 +149,29 @@ describeSpec('Persistence:', [], () => {
   );
 
   specTest('Visible mutations reflect uid switches', [], () => {
-    const query = Query.atPath(path('users'));
+    const query1 = query('users');
     const existingDoc = doc('users/existing', 0, { uid: 'existing' });
-    const anonDoc = doc(
-      'users/anon',
-      0,
-      { uid: 'anon' },
-      { hasLocalMutations: true }
-    );
-    const user1Doc = doc(
-      'users/user1',
-      0,
-      { uid: 'user1' },
-      { hasLocalMutations: true }
-    );
+    const anonDoc = doc('users/anon', 0, {
+      uid: 'anon'
+    }).setHasLocalMutations();
+    const user1Doc = doc('users/user1', 0, {
+      uid: 'user1'
+    }).setHasLocalMutations();
     return (
       spec()
-        .userListens(query)
-        .watchAcksFull(query, 500, existingDoc)
-        .expectEvents(query, { added: [existingDoc] })
+        .userListens(query1)
+        .watchAcksFull(query1, 500, existingDoc)
+        .expectEvents(query1, { added: [existingDoc] })
         .userSets('users/anon', { uid: 'anon' })
-        .expectEvents(query, { added: [anonDoc], hasPendingWrites: true })
+        .expectEvents(query1, { added: [anonDoc], hasPendingWrites: true })
         .changeUser('user1')
         // A user change will re-send the query with the current resume token
-        .expectActiveTargets({ query, resumeToken: 'resume-token-500' })
-        .expectEvents(query, { removed: [anonDoc] })
+        .expectActiveTargets({ query: query1, resumeToken: 'resume-token-500' })
+        .expectEvents(query1, { removed: [anonDoc] })
         .userSets('users/user1', { uid: 'user1' })
-        .expectEvents(query, { added: [user1Doc], hasPendingWrites: true })
+        .expectEvents(query1, { added: [user1Doc], hasPendingWrites: true })
         .changeUser(null)
-        .expectEvents(query, {
+        .expectEvents(query1, {
           removed: [user1Doc],
           added: [anonDoc],
           hasPendingWrites: true

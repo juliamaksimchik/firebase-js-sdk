@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,27 +15,36 @@
  * limitations under the License.
  */
 
+import { DatabaseId } from '../core/database_info';
 import { SnapshotVersion } from '../core/snapshot_version';
+import { targetIsDocumentTarget } from '../core/target';
 import { TargetId } from '../core/types';
 import { ChangeType } from '../core/view_snapshot';
 import { TargetData, TargetPurpose } from '../local/target_data';
 import {
   documentKeySet,
   DocumentKeySet,
-  maybeDocumentMap
+  mutableDocumentMap
 } from '../model/collections';
-import { Document, MaybeDocument, NoDocument } from '../model/document';
+import { MutableDocument } from '../model/document';
 import { DocumentKey } from '../model/document_key';
-import { assert, fail } from '../util/assert';
+import { normalizeByteString } from '../model/normalize';
+import { debugAssert, fail, hardAssert } from '../util/assert';
+import { Base64DecodeError } from '../util/base64_decode_error';
+import { ByteString } from '../util/byte_string';
 import { FirestoreError } from '../util/error';
-import { debug } from '../util/log';
+import { logDebug, logWarn } from '../util/log';
 import { primitiveComparator } from '../util/misc';
-import * as objUtils from '../util/obj';
 import { SortedMap } from '../util/sorted_map';
 import { SortedSet } from '../util/sorted_set';
+import {
+  testingHooksSpi,
+  ExistenceFilterMismatchInfo as TestingHooksExistenceFilterMismatchInfo
+} from '../util/testing_hooks_spi';
+
+import { BloomFilter, BloomFilterError } from './bloom_filter';
 import { ExistenceFilter } from './existence_filter';
 import { RemoteEvent, TargetChange } from './remote_event';
-import { ByteString } from '../util/byte_string';
 
 /**
  * Internal representation of the watcher API protocol buffers.
@@ -63,7 +72,7 @@ export class DocumentWatchChange {
      * The new document or NoDocument if it was deleted. Is null if the
      * document went out of view without the server sending a new document.
      */
-    public newDoc: MaybeDocument | null
+    public newDoc: MutableDocument | null
   ) {}
 }
 
@@ -82,6 +91,11 @@ export const enum WatchTargetChangeState {
   Reset
 }
 
+const enum BloomFilterApplicationStatus {
+  Success,
+  Skipped,
+  FalsePositive
+}
 export class WatchTargetChange {
   constructor(
     /** What kind of change occurred to the watch target. */
@@ -114,10 +128,8 @@ class TargetState {
    * These changes are continuously updated as we receive document updates and
    * always reflect the current set of changes against the last issued snapshot.
    */
-  private documentChanges: SortedMap<
-    DocumentKey,
-    ChangeType
-  > = snapshotChangesMap();
+  private documentChanges: SortedMap<DocumentKey, ChangeType> =
+    snapshotChangesMap();
 
   /** See public getters for explanations of these fields. */
   private _resumeToken: ByteString = ByteString.EMPTY_BYTE_STRING;
@@ -228,6 +240,13 @@ class TargetState {
 
   recordTargetResponse(): void {
     this.pendingResponses -= 1;
+    hardAssert(
+      this.pendingResponses >= 0,
+      '`pendingResponses` is less than 0. Actual value: ' +
+        this.pendingResponses +
+        '. This indicates that the SDK received more target acks from the ' +
+        'server than expected. The SDK should not continue to operate.'
+    );
   }
 
   markCurrent(): void {
@@ -252,6 +271,11 @@ export interface TargetMetadataProvider {
    * has become inactive
    */
   getTargetDataForTarget(targetId: TargetId): TargetData | null;
+
+  /**
+   * Returns the database ID of the Firestore instance.
+   */
+  getDatabaseId(): DatabaseId;
 }
 
 const LOG_TAG = 'WatchChangeAggregator';
@@ -263,29 +287,31 @@ export class WatchChangeAggregator {
   constructor(private metadataProvider: TargetMetadataProvider) {}
 
   /** The internal state of all tracked targets. */
-  private targetStates: { [targetId: number]: TargetState } = {};
+  private targetStates = new Map<TargetId, TargetState>();
 
   /** Keeps track of the documents to update since the last raised snapshot. */
-  private pendingDocumentUpdates = maybeDocumentMap();
+  private pendingDocumentUpdates = mutableDocumentMap();
 
   /** A mapping of document keys to their set of target IDs. */
   private pendingDocumentTargetMapping = documentTargetMap();
 
   /**
-   * A list of targets with existence filter mismatches. These targets are
+   * A map of targets with existence filter mismatches. These targets are
    * known to be inconsistent and their listens needs to be re-established by
    * RemoteStore.
    */
-  private pendingTargetResets = new SortedSet<TargetId>(primitiveComparator);
+  private pendingTargetResets = new SortedMap<TargetId, TargetPurpose>(
+    primitiveComparator
+  );
 
   /**
    * Processes and adds the DocumentWatchChange to the current set of changes.
    */
   handleDocumentChange(docChange: DocumentWatchChange): void {
     for (const targetId of docChange.updatedTargetIds) {
-      if (docChange.newDoc instanceof Document) {
+      if (docChange.newDoc && docChange.newDoc.isFoundDocument()) {
         this.addDocumentToTarget(targetId, docChange.newDoc);
-      } else if (docChange.newDoc instanceof NoDocument) {
+      } else {
         this.removeDocumentFromTarget(
           targetId,
           docChange.key,
@@ -330,7 +356,7 @@ export class WatchChangeAggregator {
           if (!targetState.isPending) {
             this.removeTarget(targetId);
           }
-          assert(
+          debugAssert(
             !targetChange.cause,
             'WatchChangeAggregator does not handle errored targets'
           );
@@ -368,7 +394,11 @@ export class WatchChangeAggregator {
     if (targetChange.targetIds.length > 0) {
       targetChange.targetIds.forEach(fn);
     } else {
-      objUtils.forEachNumber(this.targetStates, fn);
+      this.targetStates.forEach((_, targetId) => {
+        if (this.isActiveTarget(targetId)) {
+          fn(targetId);
+        }
+      });
     }
   }
 
@@ -384,7 +414,7 @@ export class WatchChangeAggregator {
     const targetData = this.targetDataForActiveTarget(targetId);
     if (targetData) {
       const target = targetData.target;
-      if (target.isDocumentQuery()) {
+      if (targetIsDocumentTarget(target)) {
         if (expectedCount === 0) {
           // The existence filter told us the document does not exist. We deduce
           // that this document does not exist and apply a deleted document to
@@ -396,24 +426,152 @@ export class WatchChangeAggregator {
           this.removeDocumentFromTarget(
             targetId,
             key,
-            new NoDocument(key, SnapshotVersion.forDeletedDoc())
+            MutableDocument.newNoDocument(key, SnapshotVersion.min())
           );
         } else {
-          assert(
+          hardAssert(
             expectedCount === 1,
             'Single document existence filter with count: ' + expectedCount
           );
         }
       } else {
         const currentSize = this.getCurrentDocumentCountForTarget(targetId);
+        // Existence filter mismatch. Mark the documents as being in limbo, and
+        // raise a snapshot with `isFromCache:true`.
         if (currentSize !== expectedCount) {
-          // Existence filter mismatch: We reset the mapping and raise a new
-          // snapshot with `isFromCache:true`.
-          this.resetTarget(targetId);
-          this.pendingTargetResets = this.pendingTargetResets.add(targetId);
+          // Apply bloom filter to identify and mark removed documents.
+          const bloomFilter = this.parseBloomFilter(watchChange);
+          const status = bloomFilter
+            ? this.applyBloomFilter(bloomFilter, watchChange, currentSize)
+            : BloomFilterApplicationStatus.Skipped;
+
+          if (status !== BloomFilterApplicationStatus.Success) {
+            // If bloom filter application fails, we reset the mapping and
+            // trigger re-run of the query.
+            this.resetTarget(targetId);
+
+            const purpose: TargetPurpose =
+              status === BloomFilterApplicationStatus.FalsePositive
+                ? TargetPurpose.ExistenceFilterMismatchBloom
+                : TargetPurpose.ExistenceFilterMismatch;
+            this.pendingTargetResets = this.pendingTargetResets.insert(
+              targetId,
+              purpose
+            );
+          }
+          testingHooksSpi?.notifyOnExistenceFilterMismatch(
+            createExistenceFilterMismatchInfoForTestingHooks(
+              currentSize,
+              watchChange.existenceFilter,
+              this.metadataProvider.getDatabaseId(),
+              bloomFilter,
+              status
+            )
+          );
         }
       }
     }
+  }
+
+  /**
+   * Parse the bloom filter from the "unchanged_names" field of an existence
+   * filter.
+   */
+  private parseBloomFilter(
+    watchChange: ExistenceFilterChange
+  ): BloomFilter | null {
+    const unchangedNames = watchChange.existenceFilter.unchangedNames;
+    if (!unchangedNames || !unchangedNames.bits) {
+      return null;
+    }
+
+    const {
+      bits: { bitmap = '', padding = 0 },
+      hashCount = 0
+    } = unchangedNames;
+
+    let normalizedBitmap: Uint8Array;
+    try {
+      normalizedBitmap = normalizeByteString(bitmap).toUint8Array();
+    } catch (err) {
+      if (err instanceof Base64DecodeError) {
+        logWarn(
+          'Decoding the base64 bloom filter in existence filter failed (' +
+            err.message +
+            '); ignoring the bloom filter and falling back to full re-query.'
+        );
+        return null;
+      } else {
+        throw err;
+      }
+    }
+
+    let bloomFilter: BloomFilter;
+    try {
+      // BloomFilter throws error if the inputs are invalid.
+      bloomFilter = new BloomFilter(normalizedBitmap, padding, hashCount);
+    } catch (err) {
+      if (err instanceof BloomFilterError) {
+        logWarn('BloomFilter error: ', err);
+      } else {
+        logWarn('Applying bloom filter failed: ', err);
+      }
+      return null;
+    }
+
+    if (bloomFilter.bitCount === 0) {
+      return null;
+    }
+
+    return bloomFilter;
+  }
+
+  /**
+   * Apply bloom filter to remove the deleted documents, and return the
+   * application status.
+   */
+  private applyBloomFilter(
+    bloomFilter: BloomFilter,
+    watchChange: ExistenceFilterChange,
+    currentCount: number
+  ): BloomFilterApplicationStatus {
+    const expectedCount = watchChange.existenceFilter.count;
+
+    const removedDocumentCount = this.filterRemovedDocuments(
+      bloomFilter,
+      watchChange.targetId
+    );
+
+    return expectedCount === currentCount - removedDocumentCount
+      ? BloomFilterApplicationStatus.Success
+      : BloomFilterApplicationStatus.FalsePositive;
+  }
+
+  /**
+   * Filter out removed documents based on bloom filter membership result and
+   * return number of documents removed.
+   */
+  private filterRemovedDocuments(
+    bloomFilter: BloomFilter,
+    targetId: number
+  ): number {
+    const existingKeys = this.metadataProvider.getRemoteKeysForTarget(targetId);
+    let removalCount = 0;
+
+    existingKeys.forEach(key => {
+      const databaseId = this.metadataProvider.getDatabaseId();
+      const documentPath =
+        `projects/${databaseId.projectId}` +
+        `/databases/${databaseId.database}` +
+        `/documents/${key.path.canonicalString()}`;
+
+      if (!bloomFilter.mightContain(documentPath)) {
+        this.removeDocumentFromTarget(targetId, key, /*updatedDocument=*/ null);
+        removalCount++;
+      }
+    });
+
+    return removalCount;
   }
 
   /**
@@ -421,12 +579,12 @@ export class WatchChangeAggregator {
    * provided snapshot version. Resets the accumulated changes before returning.
    */
   createRemoteEvent(snapshotVersion: SnapshotVersion): RemoteEvent {
-    const targetChanges: { [targetId: number]: TargetChange } = {};
+    const targetChanges = new Map<TargetId, TargetChange>();
 
-    objUtils.forEachNumber(this.targetStates, (targetId, targetState) => {
+    this.targetStates.forEach((targetState, targetId) => {
       const targetData = this.targetDataForActiveTarget(targetId);
       if (targetData) {
-        if (targetState.current && targetData.target.isDocumentQuery()) {
+        if (targetState.current && targetIsDocumentTarget(targetData.target)) {
           // Document queries for document that don't exist can produce an empty
           // result set. To update our local cache, we synthesize a document
           // delete if we have not previously received the document. This
@@ -444,13 +602,13 @@ export class WatchChangeAggregator {
             this.removeDocumentFromTarget(
               targetId,
               key,
-              new NoDocument(key, snapshotVersion)
+              MutableDocument.newNoDocument(key, snapshotVersion)
             );
           }
         }
 
         if (targetState.hasPendingChanges) {
-          targetChanges[targetId] = targetState.toTargetChange();
+          targetChanges.set(targetId, targetState.toTargetChange());
           targetState.clearPendingChanges();
         }
       }
@@ -484,6 +642,10 @@ export class WatchChangeAggregator {
       }
     });
 
+    this.pendingDocumentUpdates.forEach((_, doc) =>
+      doc.setReadTime(snapshotVersion)
+    );
+
     const remoteEvent = new RemoteEvent(
       snapshotVersion,
       targetChanges,
@@ -492,9 +654,11 @@ export class WatchChangeAggregator {
       resolvedLimboDocuments
     );
 
-    this.pendingDocumentUpdates = maybeDocumentMap();
+    this.pendingDocumentUpdates = mutableDocumentMap();
     this.pendingDocumentTargetMapping = documentTargetMap();
-    this.pendingTargetResets = new SortedSet<TargetId>(primitiveComparator);
+    this.pendingTargetResets = new SortedMap<TargetId, TargetPurpose>(
+      primitiveComparator
+    );
 
     return remoteEvent;
   }
@@ -504,7 +668,7 @@ export class WatchChangeAggregator {
    * its document key to the given target's mapping.
    */
   // Visible for testing.
-  addDocumentToTarget(targetId: TargetId, document: MaybeDocument): void {
+  addDocumentToTarget(targetId: TargetId, document: MutableDocument): void {
     if (!this.isActiveTarget(targetId)) {
       return;
     }
@@ -521,10 +685,11 @@ export class WatchChangeAggregator {
       document
     );
 
-    this.pendingDocumentTargetMapping = this.pendingDocumentTargetMapping.insert(
-      document.key,
-      this.ensureDocumentTargetMapping(document.key).add(targetId)
-    );
+    this.pendingDocumentTargetMapping =
+      this.pendingDocumentTargetMapping.insert(
+        document.key,
+        this.ensureDocumentTargetMapping(document.key).add(targetId)
+      );
   }
 
   /**
@@ -538,7 +703,7 @@ export class WatchChangeAggregator {
   removeDocumentFromTarget(
     targetId: TargetId,
     key: DocumentKey,
-    updatedDocument: MaybeDocument | null
+    updatedDocument: MutableDocument | null
   ): void {
     if (!this.isActiveTarget(targetId)) {
       return;
@@ -553,10 +718,11 @@ export class WatchChangeAggregator {
       targetState.removeDocumentChange(key);
     }
 
-    this.pendingDocumentTargetMapping = this.pendingDocumentTargetMapping.insert(
-      key,
-      this.ensureDocumentTargetMapping(key).delete(targetId)
-    );
+    this.pendingDocumentTargetMapping =
+      this.pendingDocumentTargetMapping.insert(
+        key,
+        this.ensureDocumentTargetMapping(key).delete(targetId)
+      );
 
     if (updatedDocument) {
       this.pendingDocumentUpdates = this.pendingDocumentUpdates.insert(
@@ -567,7 +733,7 @@ export class WatchChangeAggregator {
   }
 
   removeTarget(targetId: TargetId): void {
-    delete this.targetStates[targetId];
+    this.targetStates.delete(targetId);
   }
 
   /**
@@ -596,11 +762,12 @@ export class WatchChangeAggregator {
   }
 
   private ensureTargetState(targetId: TargetId): TargetState {
-    if (!this.targetStates[targetId]) {
-      this.targetStates[targetId] = new TargetState();
+    let result = this.targetStates.get(targetId);
+    if (!result) {
+      result = new TargetState();
+      this.targetStates.set(targetId, result);
     }
-
-    return this.targetStates[targetId];
+    return result;
   }
 
   private ensureDocumentTargetMapping(key: DocumentKey): SortedSet<TargetId> {
@@ -608,10 +775,8 @@ export class WatchChangeAggregator {
 
     if (!targetMapping) {
       targetMapping = new SortedSet<TargetId>(primitiveComparator);
-      this.pendingDocumentTargetMapping = this.pendingDocumentTargetMapping.insert(
-        key,
-        targetMapping
-      );
+      this.pendingDocumentTargetMapping =
+        this.pendingDocumentTargetMapping.insert(key, targetMapping);
     }
 
     return targetMapping;
@@ -625,7 +790,7 @@ export class WatchChangeAggregator {
   protected isActiveTarget(targetId: TargetId): boolean {
     const targetActive = this.targetDataForActiveTarget(targetId) !== null;
     if (!targetActive) {
-      debug(LOG_TAG, 'Detected inactive target', targetId);
+      logDebug(LOG_TAG, 'Detected inactive target', targetId);
     }
     return targetActive;
   }
@@ -635,7 +800,7 @@ export class WatchChangeAggregator {
    * is still interested in that has no outstanding target change requests).
    */
   protected targetDataForActiveTarget(targetId: TargetId): TargetData | null {
-    const targetState = this.targetStates[targetId];
+    const targetState = this.targetStates.get(targetId);
     return targetState && targetState.isPending
       ? null
       : this.metadataProvider.getTargetDataForTarget(targetId);
@@ -647,11 +812,11 @@ export class WatchChangeAggregator {
    * from all documents).
    */
   private resetTarget(targetId: TargetId): void {
-    assert(
-      !this.targetStates[targetId].isPending,
+    debugAssert(
+      !this.targetStates.get(targetId)!.isPending,
       'Should only reset active targets'
     );
-    this.targetStates[targetId] = new TargetState();
+    this.targetStates.set(targetId, new TargetState());
 
     // Trigger removal for any documents currently mapped to this target.
     // These removals will be part of the initial snapshot if Watch does not
@@ -682,4 +847,33 @@ function documentTargetMap(): SortedMap<DocumentKey, SortedSet<TargetId>> {
 
 function snapshotChangesMap(): SortedMap<DocumentKey, ChangeType> {
   return new SortedMap<DocumentKey, ChangeType>(DocumentKey.comparator);
+}
+
+function createExistenceFilterMismatchInfoForTestingHooks(
+  localCacheCount: number,
+  existenceFilter: ExistenceFilter,
+  databaseId: DatabaseId,
+  bloomFilter: BloomFilter | null,
+  bloomFilterStatus: BloomFilterApplicationStatus
+): TestingHooksExistenceFilterMismatchInfo {
+  const result: TestingHooksExistenceFilterMismatchInfo = {
+    localCacheCount,
+    existenceFilterCount: existenceFilter.count,
+    databaseId: databaseId.database,
+    projectId: databaseId.projectId
+  };
+
+  const unchangedNames = existenceFilter.unchangedNames;
+  if (unchangedNames) {
+    result.bloomFilter = {
+      applied: bloomFilterStatus === BloomFilterApplicationStatus.Success,
+      hashCount: unchangedNames?.hashCount ?? 0,
+      bitmapLength: unchangedNames?.bits?.bitmap?.length ?? 0,
+      padding: unchangedNames?.bits?.padding ?? 0,
+      mightContain: (value: string): boolean =>
+        bloomFilter?.mightContain(value) ?? false
+    };
+  }
+
+  return result;
 }

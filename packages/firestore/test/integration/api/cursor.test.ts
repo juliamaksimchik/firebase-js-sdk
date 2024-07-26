@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,9 +15,26 @@
  * limitations under the License.
  */
 
+import { Timestamp as TimestampInstance } from '@firebase/firestore-types';
 import { expect } from 'chai';
 
-import firebase from '../util/firebase_export';
+import {
+  collection,
+  doc,
+  documentId,
+  endAt,
+  endBefore,
+  getDoc,
+  getDocs,
+  limit,
+  orderBy,
+  query,
+  setDoc,
+  startAfter,
+  startAt,
+  Timestamp,
+  where
+} from '../util/firebase_export';
 import {
   apiDescribe,
   toDataArray,
@@ -26,12 +43,8 @@ import {
   withTestDb,
   withTestDbs
 } from '../util/helpers';
-import { Timestamp as TimestampInstance } from '@firebase/firestore-types';
 
-const Timestamp = firebase.firestore!.Timestamp;
-const FieldPath = firebase.firestore!.FieldPath;
-
-apiDescribe('Cursors', (persistence: boolean) => {
+apiDescribe('Cursors', persistence => {
   it('can page through items', () => {
     const testDocs = {
       a: { v: 'a' },
@@ -42,16 +55,11 @@ apiDescribe('Cursors', (persistence: boolean) => {
       f: { v: 'f' }
     };
     return withTestCollection(persistence, testDocs, coll => {
-      return coll
-        .limit(2)
-        .get()
+      return getDocs(query(coll, limit(2)))
         .then(docs => {
           expect(toDataArray(docs)).to.deep.equal([{ v: 'a' }, { v: 'b' }]);
           const lastDoc = docs.docs[docs.docs.length - 1];
-          return coll
-            .limit(3)
-            .startAfter(lastDoc)
-            .get();
+          return getDocs(query(coll, limit(3), startAfter(lastDoc)));
         })
         .then(docs => {
           expect(toDataArray(docs)).to.deep.equal([
@@ -60,18 +68,12 @@ apiDescribe('Cursors', (persistence: boolean) => {
             { v: 'e' }
           ]);
           const lastDoc = docs.docs[docs.docs.length - 1];
-          return coll
-            .limit(1)
-            .startAfter(lastDoc)
-            .get();
+          return getDocs(query(coll, limit(1), startAfter(lastDoc)));
         })
         .then(docs => {
           expect(toDataArray(docs)).to.deep.equal([{ v: 'f' }]);
           const lastDoc = docs.docs[docs.docs.length - 1];
-          return coll
-            .limit(3)
-            .startAfter(lastDoc)
-            .get();
+          return getDocs(query(coll, limit(3), startAfter(lastDoc)));
         })
         .then(docs => {
           expect(toDataArray(docs)).to.deep.equal([]);
@@ -89,22 +91,17 @@ apiDescribe('Cursors', (persistence: boolean) => {
       f: { k: 'f', nosort: 1 } // should not show up
     };
     return withTestCollection(persistence, testDocs, coll => {
-      const query = coll.orderBy('sort');
-      return coll
-        .doc('c')
-        .get()
+      const sortedQuery = query(coll, orderBy('sort'));
+      return getDoc(doc(coll, 'c'))
         .then(doc => {
           expect(doc.data()).to.deep.equal({ k: 'c', sort: 2 });
-          return query
-            .startAt(doc)
-            .get()
-            .then(docs => {
-              expect(toDataArray(docs)).to.deep.equal([
-                { k: 'c', sort: 2 },
-                { k: 'd', sort: 2 }
-              ]);
-              return query.endBefore(doc).get();
-            });
+          return getDocs(query(sortedQuery, startAt(doc))).then(docs => {
+            expect(toDataArray(docs)).to.deep.equal([
+              { k: 'c', sort: 2 },
+              { k: 'd', sort: 2 }
+            ]);
+            return getDocs(query(sortedQuery, endBefore(doc)));
+          });
         })
         .then(docs => {
           expect(toDataArray(docs)).to.deep.equal([
@@ -126,17 +123,15 @@ apiDescribe('Cursors', (persistence: boolean) => {
       f: { k: 'f', nosort: 1 } // should not show up
     };
     return withTestCollection(persistence, testDocs, coll => {
-      const query = coll.orderBy('sort');
-      return query
-        .startAt(2)
-        .get()
+      const sortedQuery = query(coll, orderBy('sort'));
+      return getDocs(query(sortedQuery, startAt(2)))
         .then(docs => {
           expect(toDataArray(docs)).to.deep.equal([
             { k: 'b', sort: 2 },
             { k: 'c', sort: 2 },
             { k: 'd', sort: 2 }
           ]);
-          return query.endBefore(2).get();
+          return getDocs(query(sortedQuery, endBefore(2)));
         })
         .then(docs => {
           expect(toDataArray(docs)).to.deep.equal([
@@ -158,24 +153,27 @@ apiDescribe('Cursors', (persistence: boolean) => {
     return withTestDbs(persistence, 2, ([reader, writer]) => {
       // Create random subcollection with documents pre-filled. Note that
       // we use subcollections to test the relative nature of __id__.
-      const writerCollection = writer
-        .collection('parent-collection')
-        .doc()
-        .collection('sub-collection');
-      const readerCollection = reader.collection(writerCollection.path);
+      const writerCollection = collection(
+        doc(collection(writer, 'parent-collection')),
+        'sub-collection'
+      );
+      const readerCollection = collection(reader, writerCollection.path);
       const sets: Array<Promise<void>> = [];
       Object.keys(testDocs).forEach((key: string) => {
-        sets.push(writerCollection.doc(key).set(testDocs[key]));
+        sets.push(setDoc(doc(writerCollection, key), testDocs[key]));
       });
 
       return Promise.all(sets)
-        .then(() => {
-          return readerCollection
-            .orderBy(FieldPath.documentId())
-            .startAt('b')
-            .endBefore('d')
-            .get();
-        })
+        .then(() =>
+          getDocs(
+            query(
+              readerCollection,
+              orderBy(documentId()),
+              startAt('b'),
+              endBefore('d')
+            )
+          )
+        )
         .then(docs => {
           expect(toDataArray(docs)).to.deep.equal([{ k: 'b' }, { k: 'c' }]);
         });
@@ -186,25 +184,27 @@ apiDescribe('Cursors', (persistence: boolean) => {
     // We require a db to create reference values
     return withTestDb(persistence, db => {
       const testDocs = {
-        a: { k: '1a', ref: db.collection('1').doc('a') },
-        b: { k: '1b', ref: db.collection('1').doc('b') },
-        c: { k: '2a', ref: db.collection('2').doc('a') },
-        d: { k: '2b', ref: db.collection('2').doc('b') },
-        e: { k: '3a', ref: db.collection('3').doc('a') }
+        a: { k: '1a', ref: doc(db, '1', 'a') },
+        b: { k: '1b', ref: doc(db, '1', 'b') },
+        c: { k: '2a', ref: doc(db, '2', 'a') },
+        d: { k: '2b', ref: doc(db, '2', 'b') },
+        e: { k: '3a', ref: doc(db, '3', 'a') }
       };
       return withTestCollection(persistence, testDocs, coll => {
-        const query = coll.orderBy('ref');
-        return query
-          .startAfter(db.collection('1').doc('a'))
-          .endAt(db.collection('2').doc('b'))
-          .get()
-          .then(docs => {
-            expect(toDataArray(docs).map(v => v['k'])).to.deep.equal([
-              '1b',
-              '2a',
-              '2b'
-            ]);
-          });
+        const sortedQuery = query(coll, orderBy('ref'));
+        return getDocs(
+          query(
+            sortedQuery,
+            startAfter(doc(db, '1', 'a')),
+            endAt(doc(db, '2', 'b'))
+          )
+        ).then(docs => {
+          expect(toDataArray(docs).map(v => v['k'])).to.deep.equal([
+            '1b',
+            '2a',
+            '2b'
+          ]);
+        });
       });
     });
   });
@@ -219,13 +219,13 @@ apiDescribe('Cursors', (persistence: boolean) => {
       f: { k: 'f', nosort: 1 } // should not show up
     };
     return withTestCollection(persistence, testDocs, coll => {
-      const query = coll
-        .orderBy('sort', 'desc')
+      const sortedQuery = query(
+        coll,
+        orderBy('sort', 'desc'),
         // default indexes reverse the key ordering for descending sorts
-        .orderBy(FieldPath.documentId(), 'desc');
-      return query
-        .startAt(2)
-        .get()
+        orderBy(documentId(), 'desc')
+      );
+      return getDocs(query(sortedQuery, startAt(2)))
         .then(docs => {
           expect(toDataArray(docs)).to.deep.equal([
             { k: 'c', sort: 2 },
@@ -233,7 +233,7 @@ apiDescribe('Cursors', (persistence: boolean) => {
             { k: 'a', sort: 1 },
             { k: 'e', sort: 0 }
           ]);
-          return query.endBefore(2).get();
+          return getDocs(query(sortedQuery, endBefore(2)));
         })
         .then(docs => {
           expect(toDataArray(docs)).to.deep.equal([{ k: 'd', sort: 3 }]);
@@ -257,14 +257,16 @@ apiDescribe('Cursors', (persistence: boolean) => {
       f: { timestamp: makeTimestamp(100, 4) }
     };
     return withTestCollection(persistence, testDocs, coll => {
-      return coll
-        .orderBy('timestamp')
-        .startAfter(makeTimestamp(100, 2))
-        .endAt(makeTimestamp(100, 5))
-        .get()
-        .then(docs => {
-          expect(toIds(docs)).to.deep.equal(['c', 'f', 'b', 'e']);
-        });
+      return getDocs(
+        query(
+          coll,
+          orderBy('timestamp'),
+          startAfter(makeTimestamp(100, 2)),
+          endAt(makeTimestamp(100, 5))
+        )
+      ).then(docs => {
+        expect(toIds(docs)).to.deep.equal(['c', 'f', 'b', 'e']);
+      });
     });
   });
 
@@ -277,13 +279,15 @@ apiDescribe('Cursors', (persistence: boolean) => {
       e: { timestamp: makeTimestamp(100, 6) }
     };
     return withTestCollection(persistence, testDocs, coll => {
-      return coll
-        .where('timestamp', '>=', makeTimestamp(100, 5))
-        .where('timestamp', '<', makeTimestamp(100, 8))
-        .get()
-        .then(docs => {
-          expect(toIds(docs)).to.deep.equal(['d', 'e', 'a']);
-        });
+      return getDocs(
+        query(
+          coll,
+          where('timestamp', '>=', makeTimestamp(100, 5)),
+          where('timestamp', '<', makeTimestamp(100, 8))
+        )
+      ).then(docs => {
+        expect(toIds(docs)).to.deep.equal(['d', 'e', 'a']);
+      });
     });
   });
 
@@ -296,19 +300,17 @@ apiDescribe('Cursors', (persistence: boolean) => {
       a: { timestamp: nanos }
     };
     return withTestCollection(persistence, testDocs, coll => {
-      return coll
-        .where('timestamp', '==', nanos)
-        .get()
+      return getDocs(query(coll, where('timestamp', '==', nanos)))
         .then(docs => {
           expect(toIds(docs)).to.deep.equal(['a']);
-          return coll.where('timestamp', '==', micros).get();
+          return getDocs(query(coll, where('timestamp', '==', micros)));
         })
         .then(docs => {
           // Because Timestamp should have been truncated to microseconds, the
           // microsecond timestamp should be considered equal to the
           // nanosecond one.
           expect(toIds(docs)).to.deep.equal(['a']);
-          return coll.where('timestamp', '==', millis).get();
+          return getDocs(query(coll, where('timestamp', '==', millis)));
         })
         .then(docs => {
           // The truncation is just to the microseconds, however, so the

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,26 +16,23 @@
  */
 
 import { expect } from 'chai';
+
 import { User } from '../../../src/auth/user';
-import { Query } from '../../../src/core/query';
 import { IndexedDbPersistence } from '../../../src/local/indexeddb_persistence';
 import { Persistence } from '../../../src/local/persistence';
-import { ReferenceSet } from '../../../src/local/reference_set';
 import { documentKeySet } from '../../../src/model/collections';
 import { MutationBatch } from '../../../src/model/mutation_batch';
+import { addEqualityMatcher } from '../../util/equality_matcher';
 import {
   expectEqualArrays,
   key,
   patchMutation,
-  path,
-  setMutation,
-  byteStringFromString
+  query,
+  setMutation
 } from '../../util/helpers';
 
-import { addEqualityMatcher } from '../../util/equality_matcher';
 import * as persistenceHelpers from './persistence_test_helpers';
 import { TestMutationQueue } from './test_mutation_queue';
-import { ByteString } from '../../../src/util/byte_string';
 
 let persistence: Persistence;
 let mutationQueue: TestMutationQueue;
@@ -72,10 +69,12 @@ function genericMutationQueueTests(): void {
   addEqualityMatcher();
 
   beforeEach(() => {
-    persistence.referenceDelegate.setInMemoryPins(new ReferenceSet());
     mutationQueue = new TestMutationQueue(
       persistence,
-      persistence.getMutationQueue(new User('user'))
+      persistence.getMutationQueue(
+        new User('user'),
+        persistence.getIndexManager(new User('user'))
+      )
     );
   });
 
@@ -113,9 +112,9 @@ function genericMutationQueueTests(): void {
   /**
    * Removes the first n entries from the given batches and returns them.
    *
-   * @param n The number of batches to remove.
-   * @param batches The array to mutate, removing entries from it.
-   * @return A new array containing all the entries that were removed from
+   * @param n - The number of batches to remove.
+   * @param batches - The array to mutate, removing entries from it.
+   * @returns A new array containing all the entries that were removed from
    * batches.
    */
   async function removeFirstBatches(
@@ -150,18 +149,8 @@ function genericMutationQueueTests(): void {
     expect(await mutationQueue.countBatches()).to.equal(0);
   });
 
-  it('can acknowledge then remove', async () => {
-    const batch1 = await addMutationBatch();
-    expect(await mutationQueue.countBatches()).to.equal(1);
-
-    await mutationQueue.acknowledgeBatch(batch1, ByteString.EMPTY_BYTE_STRING);
-    await mutationQueue.removeMutationBatch(batch1);
-
-    expect(await mutationQueue.countBatches()).to.equal(0);
-  });
-
   it('can lookup mutation batch', async () => {
-    // Searching on an empty queue should not find a non-existent batch
+    // Searching on an empty queue should not find a nonexistent batch
     let notFound = await mutationQueue.lookupMutationBatch(42);
     expect(notFound).to.be.null;
 
@@ -180,7 +169,7 @@ function genericMutationQueueTests(): void {
       expect(found!.batchId).to.equal(batch.batchId);
     }
 
-    // Even on a nonempty queue searching should not find a non-existent batch
+    // Even on a nonempty queue searching should not find a nonexistent batch
     notFound = await mutationQueue.lookupMutationBatch(42);
     expect(notFound).to.be.null;
   });
@@ -236,9 +225,10 @@ function genericMutationQueueTests(): void {
       batches.push(batch);
     }
     const expected = [batches[1], batches[2]];
-    const matches = await mutationQueue.getAllMutationBatchesAffectingDocumentKey(
-      key('foo/bar')
-    );
+    const matches =
+      await mutationQueue.getAllMutationBatchesAffectingDocumentKey(
+        key('foo/bar')
+      );
     expectEqualArrays(matches, expected);
   });
 
@@ -258,11 +248,10 @@ function genericMutationQueueTests(): void {
       batches.push(batch);
     }
     const expected = [batches[1], batches[2], batches[4]];
-    const matches = await mutationQueue.getAllMutationBatchesAffectingDocumentKeys(
-      documentKeySet()
-        .add(key('foo/bar'))
-        .add(key('foo/baz'))
-    );
+    const matches =
+      await mutationQueue.getAllMutationBatchesAffectingDocumentKeys(
+        documentKeySet().add(key('foo/bar')).add(key('foo/baz'))
+      );
     expectEqualArrays(matches, expected);
   });
 
@@ -282,9 +271,9 @@ function genericMutationQueueTests(): void {
       batches.push(batch);
     }
     const expected = [batches[1], batches[2], batches[4]];
-    const query = Query.atPath(path('foo'));
+    const query1 = query('foo');
     const matches = await mutationQueue.getAllMutationBatchesAffectingQuery(
-      query
+      query1
     );
     expectEqualArrays(matches, expected);
   });
@@ -300,30 +289,11 @@ function genericMutationQueueTests(): void {
       setMutation('foo/baz', value)
     ]);
     const expected = [batch1, batch2];
-    const query = Query.atPath(path('foo'));
+    const query1 = query('foo');
     const matches = await mutationQueue.getAllMutationBatchesAffectingQuery(
-      query
+      query1
     );
     expectEqualArrays(matches, expected);
-  });
-
-  it('can save the last stream token', async () => {
-    const streamToken1 = byteStringFromString('token1');
-    const streamToken2 = byteStringFromString('token2');
-
-    await mutationQueue.setLastStreamToken(streamToken1);
-
-    const batch1 = await addMutationBatch();
-
-    expect(await mutationQueue.getLastStreamToken()).to.deep.equal(
-      streamToken1
-    );
-
-    await mutationQueue.acknowledgeBatch(batch1, streamToken2);
-
-    expect(await mutationQueue.getLastStreamToken()).to.deep.equal(
-      streamToken2
-    );
   });
 
   it('can removeMutationBatch()', async () => {

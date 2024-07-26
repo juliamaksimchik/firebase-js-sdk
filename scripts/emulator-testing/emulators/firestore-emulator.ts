@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2018 Google Inc.
+ * Copyright 2018 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,11 +22,11 @@ export class FirestoreEmulator extends Emulator {
 
   constructor(port: number, projectId = 'test-emulator') {
     super(
-      'firestore-emulator.jar',
+      'cloud-firestore-emulator-v1.18.1.jar',
       // Use locked version of emulator for test to be deterministic.
       // The latest version can be found from firestore emulator doc:
       // https://firebase.google.com/docs/firestore/security/test-rules-emulator
-      'https://storage.googleapis.com/firebase-preview-drop/emulator/cloud-firestore-emulator-v1.10.4.jar',
+      'https://storage.googleapis.com/firebase-preview-drop/emulator/cloud-firestore-emulator-v1.18.2.jar',
       port
     );
     this.projectId = projectId;

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,9 @@
  */
 
 import { expect } from 'chai';
-import { Code } from '../../../src/util/error';
+
 import { Timestamp } from '../../../src/api/timestamp';
+import { Code } from '../../../src/util/error';
 import { addEqualityMatcher } from '../../util/equality_matcher';
 
 describe('Timestamp', () => {
@@ -131,5 +132,26 @@ describe('Timestamp', () => {
     expect(t1 <= t2).to.be.true;
     expect(t1 > t2).to.be.false;
     expect(t1 >= t2).to.be.false;
+  });
+
+  it('handles decimal inputs in fromMillis()', () => {
+    const actual = Timestamp.fromMillis(1000.1);
+    const expected = new Timestamp(1, 100000);
+    expect(actual.isEqual(expected)).to.be.true;
+  });
+
+  it('serializes to JSON', () => {
+    expect(new Timestamp(123, 456).toJSON()).to.deep.equal({
+      seconds: 123,
+      nanoseconds: 456
+    });
+    expect(new Timestamp(0, 0).toJSON()).to.deep.equal({
+      seconds: 0,
+      nanoseconds: 0
+    });
+    expect(new Timestamp(-123, 456).toJSON()).to.deep.equal({
+      seconds: -123,
+      nanoseconds: 456
+    });
   });
 });

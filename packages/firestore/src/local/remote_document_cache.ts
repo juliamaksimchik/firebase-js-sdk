@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,91 +18,86 @@
 import { Query } from '../core/query';
 import {
   DocumentKeySet,
-  DocumentMap,
-  MaybeDocumentMap,
-  NullableMaybeDocumentMap
+  MutableDocumentMap,
+  OverlayMap
 } from '../model/collections';
-import { MaybeDocument } from '../model/document';
+import { MutableDocument } from '../model/document';
 import { DocumentKey } from '../model/document_key';
+import { IndexOffset } from '../model/field_index';
 
-import { PersistenceTransaction } from './persistence';
+import { IndexManager } from './index_manager';
 import { PersistencePromise } from './persistence_promise';
+import { PersistenceTransaction } from './persistence_transaction';
+import { QueryContext } from './query_context';
 import { RemoteDocumentChangeBuffer } from './remote_document_change_buffer';
-import { SnapshotVersion } from '../core/snapshot_version';
 
 /**
  * Represents cached documents received from the remote backend.
  *
- * The cache is keyed by DocumentKey and entries in the cache are MaybeDocument
- * instances, meaning we can cache both Document instances (an actual document
- * with data) as well as NoDocument instances (indicating that the document is
- * known to not exist).
+ * The cache is keyed by DocumentKey and entries in the cache are
+ * MutableDocuments, meaning we can cache both actual documents as well as
+ * documents that are known to not exist.
  */
 export interface RemoteDocumentCache {
+  /** Sets the index manager to use for managing the collectionGroup index. */
+  setIndexManager(indexManager: IndexManager): void;
+
   /**
    * Looks up an entry in the cache.
    *
-   * @param documentKey The key of the entry to look up.
-   * @return The cached Document or NoDocument entry, or null if we have nothing
-   * cached.
+   * @param documentKey - The key of the entry to look up.*
+   * @returns The cached document entry. Returns an invalid document if the
+   * document is not cached.
    */
   getEntry(
     transaction: PersistenceTransaction,
     documentKey: DocumentKey
-  ): PersistencePromise<MaybeDocument | null>;
+  ): PersistencePromise<MutableDocument>;
 
   /**
    * Looks up a set of entries in the cache.
    *
-   * @param documentKeys The keys of the entries to look up.
-   * @return The cached Document or NoDocument entries indexed by key. If an entry is not cached,
-   *     the corresponding key will be mapped to a null value.
+   * @param documentKeys - The keys of the entries to look up.
+   * @returns The cached document entries indexed by key. If an entry is not
+   * cached, the corresponding key will be mapped to an invalid document.
    */
   getEntries(
     transaction: PersistenceTransaction,
     documentKeys: DocumentKeySet
-  ): PersistencePromise<NullableMaybeDocumentMap>;
+  ): PersistencePromise<MutableDocumentMap>;
 
   /**
-   * Executes a query against the cached Document entries.
+   * Returns the documents matching the given query
    *
-   * Implementations may return extra documents if convenient. The results
-   * should be re-filtered by the consumer before presenting them to the user.
-   *
-   * Cached NoDocument entries have no bearing on query results.
-   *
-   * @param query The query to match documents against.
-   * @param sinceReadTime If not set to SnapshotVersion.MIN, return only
-   *     documents that have been read since this snapshot version (exclusive).
-   * @return The set of matching documents.
+   * @param query - The query to match documents against.
+   * @param offset - The offset to start the scan at (exclusive).
+   * @param context - A optional tracker to keep a record of important details
+   *   during database local query execution.
+   * @returns The set of matching documents.
    */
   getDocumentsMatchingQuery(
     transaction: PersistenceTransaction,
     query: Query,
-    sinceReadTime: SnapshotVersion
-  ): PersistencePromise<DocumentMap>;
+    offset: IndexOffset,
+    mutatedDocs: OverlayMap,
+    context?: QueryContext
+  ): PersistencePromise<MutableDocumentMap>;
 
   /**
-   * Returns the set of documents that have changed since the specified read
-   * time.
+   * Looks up the next `limit` documents for a collection group based on the
+   * provided offset. The ordering is based on the document's read time and key.
+   *
+   * @param collectionGroup - The collection group to scan.
+   * @param offset - The offset to start the scan at (exclusive).
+   * @param limit - The maximum number of results to return.
+   * @returns The set of matching documents.
    */
-  // PORTING NOTE: This is only used for multi-tab synchronization.
-  getNewDocumentChanges(
+  getAllFromCollectionGroup(
     transaction: PersistenceTransaction,
-    sinceReadTime: SnapshotVersion
-  ): PersistencePromise<{
-    changedDocs: MaybeDocumentMap;
-    readTime: SnapshotVersion;
-  }>;
-
-  /**
-   * Returns the read time of the most recently read document in the cache, or
-   * SnapshotVersion.MIN if not available.
-   */
-  // PORTING NOTE: This is only used for multi-tab synchronization.
-  getLastReadTime(
-    transaction: PersistenceTransaction
-  ): PersistencePromise<SnapshotVersion>;
+    collectionGroup: string,
+    offset: IndexOffset,
+    limit: number
+  ): PersistencePromise<MutableDocumentMap>;
 
   /**
    * Provides access to add or update the contents of the cache. The buffer
@@ -110,7 +105,7 @@ export interface RemoteDocumentCache {
    *
    * Multi-Tab Note: This should only be called by the primary client.
    *
-   * @param options.trackRemovals Whether to create sentinel entries for
+   * @param options - Specify `trackRemovals` to create sentinel entries for
    * removed documents, which allows removals to be tracked by
    * `getNewDocumentChanges()`.
    */

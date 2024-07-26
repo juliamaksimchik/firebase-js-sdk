@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2019 Google Inc.
+ * Copyright 2019 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 
 import { FirebaseError } from '@firebase/util';
 import { expect } from 'chai';
-import { AppConfig } from '../interfaces/app-config';
+import { AppConfig } from '../interfaces/installation-impl';
 import { getFakeApp } from '../testing/fake-generators';
 import '../testing/setup';
 import { extractAppConfig } from './extract-app-config';
@@ -38,11 +38,11 @@ describe('extractAppConfig', () => {
     expect(() => extractAppConfig(undefined as any)).to.throw(FirebaseError);
 
     let firebaseApp = getFakeApp();
-    delete firebaseApp.name;
+    delete (firebaseApp as any).name;
     expect(() => extractAppConfig(firebaseApp)).to.throw(FirebaseError);
 
     firebaseApp = getFakeApp();
-    delete firebaseApp.options;
+    delete (firebaseApp as any).options;
     expect(() => extractAppConfig(firebaseApp)).to.throw(FirebaseError);
 
     firebaseApp = getFakeApp();
